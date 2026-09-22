@@ -225,6 +225,16 @@ func TestNotReadyKeepsWaitingThenPasses(t *testing.T) {
 	h.world.set(func(w *world) { w.notReady[tA1] = false })
 	h.tick()
 	require.Equal(t, PhaseReady, h.phases(h.active("a"))[tA1])
+
+	// A target that never becomes ready halts with the readiness reason.
+	h2 := newHarness(t, testConfig, testTargets)
+	h2.prime()
+	h2.world.set(func(w *world) { w.notReady[tA1] = true })
+	h2.release(imgA, d2)
+	h2.ticks(3, 0)
+	h2.ticks(4, 20*time.Second)
+	require.Equal(t, Halted, h2.active("a").State)
+	require.Contains(t, h2.active("a").Reason, "a-1/cl not ready: still syncing within 50s")
 }
 
 func TestBudgetIsSharedAcrossGroupsAndNodesCountOnce(t *testing.T) {

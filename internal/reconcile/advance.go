@@ -150,8 +150,13 @@ func (c *Controller) planBatch(ctx context.Context, now time.Time, r *Rollout, s
 		case PhaseUpdating:
 			allReady = false
 
-			if now.Sub(rt.UpdatedAt) > c.cfg.Hooks.Timeout*5 {
-				c.halt(ctx, now, r, id, fmt.Sprintf("did not reach %s within %s", shortDigest(r.Desired[t.Image]), c.cfg.Hooks.Timeout*5))
+			if deadline := c.cfg.Hooks.Timeout * 5; now.Sub(rt.UpdatedAt) > deadline {
+				why := fmt.Sprintf("did not reach %s within %s", shortDigest(r.Desired[t.Image]), deadline)
+				if rt.Updated {
+					why = fmt.Sprintf("%s within %s", rt.Reason, deadline)
+				}
+
+				c.halt(ctx, now, r, id, why)
 
 				return nil
 			}

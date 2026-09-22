@@ -14,6 +14,11 @@ export ROLLOOR_EXAMPLE_COMPOSE=$compose
 log() { printf '\n== %s\n' "$*"; }
 
 cleanup() {
+  status=$?
+  if [ "$status" -ne 0 ] && [ -f /tmp/rolloor-example/rolloor.log ]; then
+    echo "== controller log (last 40 lines)" >&2
+    tail -n 40 /tmp/rolloor-example/rolloor.log >&2
+  fi
   [ -n "${rolloor_pid:-}" ] && kill "$rolloor_pid" 2>/dev/null || true
   docker compose -f "$compose" down -v --remove-orphans >/dev/null 2>&1 || true
   rm -rf /tmp/rolloor-example
