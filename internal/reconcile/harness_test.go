@@ -229,11 +229,11 @@ type notes struct {
 	events []Event
 }
 
-func (n *notes) Publish(e Event) {
+func (n *notes) Publish(e *Event) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	n.events = append(n.events, e)
+	n.events = append(n.events, *e)
 }
 
 func (n *notes) actions() []string {

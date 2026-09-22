@@ -1,0 +1,30 @@
+name: rolloor-example
+
+x-app: &app
+  image: localhost:5050/app:latest
+  pull_policy: always
+  restart: unless-stopped
+
+services:
+  registry:
+    image: registry:2
+    ports: ["5050:5000"]
+
+  app1:
+    <<: *app
+    ports: ["18081:80"]
+  app2:
+    <<: *app
+    ports: ["18082:80"]
+  app3:
+    <<: *app
+    ports: ["18083:80"]
+  app4:
+    <<: *app
+    ports: ["18084:80"]
+  app5:
+    <<: *app
+    ports: ["18085:80"]
+  app6:
+    <<: *app
+    ports: ["18086:80"]

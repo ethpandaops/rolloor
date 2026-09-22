@@ -1,0 +1,60 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: local
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: modules are tidy
+        run: |
+          go mod tidy
+          go mod verify
+          git diff --exit-code go.mod go.sum
+      - name: workload words stay out of the binary
+        run: ./scripts/lint-words.sh
+      - name: tests with coverage floors
+        run: ./scripts/coverage.sh
+      - name: build
+        run: make build
+      - name: vulnerabilities
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.1.6
+
+  generic-example:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: the whole loop against plain docker containers
+        run: ./examples/generic/run.sh
+      - name: controller log
+        if: always()
+        run: cat /tmp/rolloor-example/rolloor.log || true

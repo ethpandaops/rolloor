@@ -1,0 +1,44 @@
+# One target per compose service. The first three carry no weight and go in
+# wave 0; the other three carry weight and go in wave 1.
+- id: app1/web
+  node: app1
+  address: 127.0.0.1
+  weight: 0
+  image: localhost:5050/app:latest
+  labels: {app: web, owner: team, tier: edge, wave: "0"}
+  extra: {service: app1, port: "18081"}
+- id: app2/web
+  node: app2
+  address: 127.0.0.1
+  weight: 0
+  image: localhost:5050/app:latest
+  labels: {app: web, owner: team, tier: edge, wave: "0"}
+  extra: {service: app2, port: "18082"}
+- id: app3/web
+  node: app3
+  address: 127.0.0.1
+  weight: 0
+  image: localhost:5050/app:latest
+  labels: {app: web, owner: team, tier: edge, wave: "0"}
+  extra: {service: app3, port: "18083"}
+- id: app4/web
+  node: app4
+  address: 127.0.0.1
+  weight: 10
+  image: localhost:5050/app:latest
+  labels: {app: web, owner: team, tier: core, wave: "1"}
+  extra: {service: app4, port: "18084"}
+- id: app5/web
+  node: app5
+  address: 127.0.0.1
+  weight: 10
+  image: localhost:5050/app:latest
+  labels: {app: web, owner: team, tier: core, wave: "1"}
+  extra: {service: app5, port: "18085"}
+- id: app6/web
+  node: app6
+  address: 127.0.0.1
+  weight: 10
+  image: localhost:5050/app:latest
+  labels: {app: web, owner: team, tier: core, wave: "1"}
+  extra: {service: app6, port: "18086"}

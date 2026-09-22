@@ -42,7 +42,7 @@ type EventQuery struct {
 
 // Notifier receives every event as it happens, for live streams.
 type Notifier interface {
-	Publish(e Event)
+	Publish(e *Event)
 }
 
 // MemoryStore keeps everything in memory. It backs tests and is the default

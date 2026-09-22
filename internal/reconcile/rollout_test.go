@@ -296,17 +296,17 @@ func TestEnvironmentCheckPausesAutomatedOnly(t *testing.T) {
 
 	h := newHarness(t, cfg, testTargets)
 	h.prime()
-	h.world.set(func(w *world) { w.envOK, w.envReason = false, "finality stalled" })
+	h.world.set(func(w *world) { w.envOK, w.envReason = false, "the world is on fire" })
 	h.clock.Advance(30 * time.Second)
 	h.release(imgA, d2)
 
 	r := h.active("a")
 	require.Equal(t, WaitingForEnvironment, r.State)
-	require.Contains(t, r.Reason, "finality stalled")
+	require.Contains(t, r.Reason, "the world is on fire")
 
 	ok, reason, at := h.c.EnvironmentStatus()
 	require.False(t, ok)
-	require.Equal(t, "finality stalled", reason)
+	require.Equal(t, "the world is on fire", reason)
 	require.False(t, at.IsZero())
 	require.Contains(t, h.notes.actions(), "environment.failing")
 

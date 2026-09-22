@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# The container answers on its port.
+set -euo pipefail
+
+target=$(cat)
+port=$(jq -r .extra.port <<<"$target")
+
+if code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:${port}/"); then
+  if [ "$code" = "200" ]; then
+    echo "200 on :$port"
+    exit 0
+  fi
+
+  echo "HTTP $code on :$port"
+  exit 1
+fi
+
+echo "no answer on :$port"
+exit 1

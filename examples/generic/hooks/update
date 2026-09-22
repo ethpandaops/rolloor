@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Recreates the container from the tag's current head.
+set -euo pipefail
+
+target=$(cat)
+service=$(jq -r .extra.service <<<"$target")
+compose="${ROLLOOR_EXAMPLE_COMPOSE:-examples/generic/docker-compose.yaml}"
+
+docker compose -f "$compose" up -d --pull always --no-deps --force-recreate "$service" >/dev/null 2>&1
+echo "recreated $service"

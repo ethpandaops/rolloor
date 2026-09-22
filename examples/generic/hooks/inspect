@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Prints the digest the container is running, as the registry names it.
+set -euo pipefail
+
+target=$(cat)
+service=$(jq -r .extra.service <<<"$target")
+container="rolloor-example-${service}-1"
+
+repo_digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$container" 2>/dev/null) || {
+  echo "container $container not found"
+  exit 1
+}
+
+echo "${repo_digest##*@}"

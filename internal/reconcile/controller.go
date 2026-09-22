@@ -369,7 +369,7 @@ func (c *Controller) event(ctx context.Context, now time.Time, e *Event) {
 	c.persist(ctx, c.store.AppendEvent(ctx, e))
 
 	if c.notifier != nil {
-		c.notifier.Publish(*e)
+		c.notifier.Publish(e)
 	}
 }
 

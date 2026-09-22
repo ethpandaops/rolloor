@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# The updated containers answer at least as reliably as the ones not yet
+# reached. With nothing left to compare against, they must all answer.
+set -euo pipefail
+
+input=$(cat)
+
+rate() {
+  local ok=0 n=0 port
+  for port in $(jq -r "${1}[].extra.port" <<<"$input"); do
+    n=$((n + 1))
+    if [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:${port}/")" = "200" ]; then
+      ok=$((ok + 1))
+    fi
+  done
+  if [ "$n" -eq 0 ]; then echo "-1"; else echo $((ok * 100 / n)); fi
+}
+
+updated=$(rate .updated)
+remaining=$(rate .remaining)
+
+if [ "$remaining" = "-1" ]; then
+  remaining=100
+fi
+
+echo "updated ${updated}% ok, remaining ${remaining}% ok"
+echo "updated=${updated} remaining=${remaining} unit=%"
+
+[ "$updated" -ge "$remaining" ]

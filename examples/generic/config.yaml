@@ -1,0 +1,44 @@
+# rolloor configuration for the generic example: six nginx containers on a
+# local registry, no workload knowledge anywhere.
+environment: example
+listen: "127.0.0.1:8080"
+dataDir: /tmp/rolloor-example/data
+targetsDir: examples/generic/targets.d
+
+labels:
+  group: app
+  owner: owner
+  section: tier
+
+registry:
+  poll: 5s
+  plainHttp: ["localhost:5050"]
+
+# Weight lives on the three "weighted" nodes (10 each, total 30); 40% is 12,
+# so one weighted node moves at a time.
+budget: 40%
+
+hooks:
+  dir: examples/generic/hooks
+  timeout: 5s
+  defaults:
+    inspect: inspect
+    update: update
+    ready: ready
+    soak: soak
+
+inspect:
+  interval: 5s
+  concurrency: 4
+  unknownAfter: 2
+
+presets:
+  test: {batch: [50%], soak: {duration: 10s, interval: 2s, passes: 2, grace: 1}}
+defaultPolicy: {mode: automated, speed: test}
+
+auth:
+  mode: none
+
+log:
+  level: info
+  format: text
