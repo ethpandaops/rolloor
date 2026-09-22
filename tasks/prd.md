@@ -64,8 +64,8 @@ inspect:
 presets:
   careful: {batch: [1, 10%], soak: {duration: 12m, interval: 60s, passes: 2, grace: 1}, pauseAfterFirst: true}
   normal:  {batch: [10%],    soak: {duration: 6m,  interval: 60s, passes: 2, grace: 1}}
-  fast:    {batch: [50%],    soak: {duration: 0}}
-  all:     {batch: [100%],   soak: {duration: 0}, waves: false}
+  fast:    {batch: [50%],    soak: {duration: 0s}}
+  all:     {batch: [100%],   soak: {duration: 0s}, waves: false}
 defaultPolicy: {mode: automated, speed: normal}
 
 auth:
