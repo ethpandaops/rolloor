@@ -100,11 +100,31 @@ func (p Preset) UsesWaves() bool {
 }
 
 // Soak is the after-batch comparison schedule. Duration zero disables it.
+// Passes and Grace are pointers so that an explicit zero is kept and only an
+// omitted value takes the default.
 type Soak struct {
 	Duration time.Duration `yaml:"duration"`
-	Interval time.Duration `yaml:"interval" default:"60s"`
-	Passes   int           `yaml:"passes" default:"2"`
-	Grace    int           `yaml:"grace" default:"1"`
+	Interval time.Duration `yaml:"interval"`
+	Passes   *int          `yaml:"passes"`
+	Grace    *int          `yaml:"grace"`
+}
+
+// PassesN is the number of consecutive passes required.
+func (s Soak) PassesN() int {
+	if s.Passes == nil {
+		return 2
+	}
+
+	return *s.Passes
+}
+
+// GraceN is how many failures are tolerated before a halt.
+func (s Soak) GraceN() int {
+	if s.Grace == nil {
+		return 1
+	}
+
+	return *s.Grace
 }
 
 // Policy is a group's stored policy; here it is the default.
@@ -180,14 +200,6 @@ func applyPresetDefaults(cfg *Config) {
 			p.Soak.Interval = 60 * time.Second
 		}
 
-		if p.Soak.Passes == 0 {
-			p.Soak.Passes = 2
-		}
-
-		if p.Soak.Grace == 0 && p.Soak.Duration > 0 {
-			p.Soak.Grace = 1
-		}
-
 		cfg.Presets[name] = p
 	}
 
@@ -201,8 +213,8 @@ func applyPresetDefaults(cfg *Config) {
 		}
 	}
 
-	if cfg.Budget == (Fraction{}) {
-		cfg.Budget = Fraction{Percent: 10, IsPercent: true}
+	if !cfg.Budget.set {
+		cfg.Budget = Fraction{Percent: 10, IsPercent: true, set: true}
 	}
 }
 
@@ -213,20 +225,20 @@ func BuiltinPresets() map[string]Preset {
 	return map[string]Preset{
 		"careful": {
 			Batch:           []Fraction{{Count: 1}, {Percent: 10, IsPercent: true}},
-			Soak:            Soak{Duration: 12 * time.Minute, Interval: 60 * time.Second, Passes: 2, Grace: 1},
+			Soak:            Soak{Duration: 12 * time.Minute, Interval: 60 * time.Second},
 			PauseAfterFirst: true,
 		},
 		"normal": {
 			Batch: []Fraction{{Percent: 10, IsPercent: true}},
-			Soak:  Soak{Duration: 6 * time.Minute, Interval: 60 * time.Second, Passes: 2, Grace: 1},
+			Soak:  Soak{Duration: 6 * time.Minute, Interval: 60 * time.Second},
 		},
 		"fast": {
 			Batch: []Fraction{{Percent: 50, IsPercent: true}},
-			Soak:  Soak{Interval: 60 * time.Second, Passes: 2},
+			Soak:  Soak{Interval: 60 * time.Second},
 		},
 		"all": {
 			Batch: []Fraction{{Percent: 100, IsPercent: true}},
-			Soak:  Soak{Interval: 60 * time.Second, Passes: 2},
+			Soak:  Soak{Interval: 60 * time.Second},
 			Waves: &no,
 		},
 	}
@@ -280,8 +292,12 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("config: presets.%s.soak.interval must be positive and within duration", name)
 			}
 
-			if p.Soak.Passes <= 0 {
+			if p.Soak.PassesN() <= 0 {
 				return fmt.Errorf("config: presets.%s.soak.passes must be positive", name)
+			}
+
+			if p.Soak.GraceN() < 0 {
+				return fmt.Errorf("config: presets.%s.soak.grace must not be negative", name)
 			}
 		}
 	}

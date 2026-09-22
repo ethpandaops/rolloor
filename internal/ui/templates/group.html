@@ -1,0 +1,68 @@
+{{define "group"}}
+<div id="group" hx-get="/groups/{{.GroupLabel}}/{{.Group.Name}}" hx-trigger="every 5s" hx-swap="outerHTML">
+<nav class="crumbs"><a href="/">Fleet</a> › {{.GroupLabel}} › {{.Group.Name}}</nav>
+<div class="title-row">
+  <h1>{{.Group.Name}}</h1>
+  <div class="controls">
+    <form method="post" action="/actions/sync" class="inline">
+      <input type="hidden" name="selector" value="{{.GroupLabel}}={{.Group.Name}}">
+      <input type="hidden" name="next" value="/groups/{{.GroupLabel}}/{{.Group.Name}}">
+      <button class="primary" {{if not .Can.OK}}disabled title="{{.Can.Why}}"{{end}}>Sync</button>
+    </form>
+    <details class="dialog">
+      <summary {{if not .Can.OK}}class="disabled" title="{{.Can.Why}}"{{end}}>Suspend…</summary>
+      <form method="post" action="/actions/suspend">
+        <input type="hidden" name="selector" value="{{.GroupLabel}}={{.Group.Name}}">
+        <input type="hidden" name="next" value="/groups/{{.GroupLabel}}/{{.Group.Name}}">
+        <label>Reason <input name="reason" required placeholder="debugging peer churn"></label>
+        <label>For <select name="expiresIn"><option value="1h">1 hour</option><option value="6h">6 hours</option><option value="24h" selected>24 hours</option><option value="168h">a week</option></select></label>
+        <button {{if not .Can.OK}}disabled{{end}}>Suspend {{.Group.Targets}} targets</button>
+      </form>
+    </details>
+    {{template "disabled-why" .Can}}
+  </div>
+</div>
+
+<dl class="facts">
+  <div><dt>Selector</dt><dd><code>{{.GroupLabel}}={{.Group.Name}}</code></dd></div>
+  <div><dt>Targets</dt><dd>{{.Group.Targets}}, on {{.Group.Nodes}} nodes</dd></div>
+  <div><dt>Policy</dt><dd>{{.Group.Policy.Mode}}, {{.Group.Policy.Speed}} speed{{if .Group.Policy.Pins}}, pinned{{end}}</dd></div>
+  <div><dt>Owner</dt><dd>{{.Group.Owner}}</dd></div>
+</dl>
+
+<div class="cards">
+  <div class="card"><h3>Sync status</h3><div class="big">{{template "sync-badge" .Group.Sync}}</div><p>{{.Group.OnDesired}} of {{.Group.Targets}} on {{short (first .Group.Desired)}}{{with first .Group.Revisions}} ({{.}}){{end}}.</p></div>
+  <div class="card"><h3>Health</h3><div class="big">{{template "health-badge" .Group.Health}}</div><p>{{.Group.Reason}}</p></div>
+  <div class="card"><h3>Current rollout</h3>
+    {{if .Group.Rollout}}<div class="big"><a href="/rollouts/{{.Group.Rollout.ID}}">{{.Group.Rollout.Digest}}</a> {{template "state-badge" .Group.Rollout.State}}</div><p>{{.Group.Rollout.Reason}} Running for {{dur .Group.Rollout.Running}}.</p>
+    {{else}}<div class="big muted">none</div><p>Nothing in flight.</p>{{end}}
+  </div>
+</div>
+
+<details class="dialog policy">
+  <summary {{if not .Can.OK}}class="disabled" title="{{.Can.Why}}"{{end}}>Policy…</summary>
+  <form method="post" action="/actions/policy">
+    <input type="hidden" name="group" value="{{.Group.Name}}">
+    <input type="hidden" name="next" value="/groups/{{.GroupLabel}}/{{.Group.Name}}">
+    <label>Mode <select name="mode"><option value="automated" {{if eq .Group.Policy.Mode "automated"}}selected{{end}}>automated</option><option value="manual" {{if eq .Group.Policy.Mode "manual"}}selected{{end}}>manual</option></select></label>
+    <label>Speed <select name="speed">{{range .Presets}}<option value="{{.}}" {{if eq . $.Group.Policy.Speed}}selected{{end}}>{{.}}</option>{{end}}</select></label>
+    <button {{if not .Can.OK}}disabled{{end}}>Save</button>
+  </form>
+</details>
+
+<table class="targets">
+  <thead><tr><th>Node</th><th>Target</th><th>Sync</th><th>Health</th><th>Why</th></tr></thead>
+  <tbody>
+  {{range .Targets}}
+    <tr>
+      <td><a href="/nodes/{{.Node}}">{{.Node}}</a></td>
+      <td><code>{{.ID}}</code></td>
+      <td>{{template "sync-badge" .Sync}}</td>
+      <td>{{template "health-badge" .Health}}</td>
+      <td>{{.Reason}}</td>
+    </tr>
+  {{end}}
+  </tbody>
+</table>
+</div>
+{{end}}

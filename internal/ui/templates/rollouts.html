@@ -1,0 +1,21 @@
+{{define "rollouts"}}
+<div id="rollouts" hx-get="/rollouts" hx-trigger="every 5s" hx-swap="outerHTML">
+<h1>Rollouts</h1>
+{{if not .Rollouts}}<p class="muted">No rollouts yet. One opens the moment a tag moves.</p>{{end}}
+<table class="list">
+  <thead><tr><th>Group</th><th>Build</th><th>State</th><th>Progress</th><th>Started</th><th>Why</th></tr></thead>
+  <tbody>
+  {{range .Rollouts}}
+    <tr>
+      <td><a href="/groups/{{$.GroupLabel}}/{{.Group}}">{{.Group}}</a></td>
+      <td><a href="/rollouts/{{.ID}}"><code>{{.Digest}}</code></a>{{if .Revision}} <span class="muted">{{.Revision}}</span>{{end}}</td>
+      <td>{{template "state-badge" .State}}</td>
+      <td>{{.OnNewBuild}} of {{.Total}}</td>
+      <td>{{ago .CreatedAt}}</td>
+      <td class="muted">{{.Reason}}</td>
+    </tr>
+  {{end}}
+  </tbody>
+</table>
+</div>
+{{end}}

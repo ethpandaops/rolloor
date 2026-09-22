@@ -20,6 +20,11 @@ import (
 // errKey is the JSON field every error response carries.
 const errKey = "error"
 
+const (
+	sseWriteTimeout = 10 * time.Second
+	sseHeartbeat    = 15 * time.Second
+)
+
 // Server holds the handlers' dependencies.
 type Server struct {
 	cfg     *config.Config
@@ -41,8 +46,14 @@ func New(cfg *config.Config, c *reconcile.Controller, ts func() *targets.Set, au
 	return &Server{cfg: cfg, c: c, targets: ts, auth: auth, events: events, log: log.WithField("component", "api"), version: version}
 }
 
-// Handler returns the API routes under /api/v1 plus /healthz.
+// Handler returns the routes wrapped in the authorizer's middleware.
 func (s *Server) Handler() http.Handler {
+	return s.auth.Middleware(s.Routes())
+}
+
+// Routes returns the API routes under /api/v1 plus /healthz, without the
+// middleware, so a caller can mount them beside other handlers under one.
+func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /healthz", s.healthz)
@@ -66,7 +77,7 @@ func (s *Server) Handler() http.Handler {
 		mux.HandleFunc("POST /api/v1/actions/"+verb, h)
 	}
 
-	return s.auth.Middleware(mux)
+	return mux
 }
 
 func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
@@ -159,6 +170,29 @@ func (s *Server) history(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	limit, _ := strconv.Atoi(q.Get("limit"))
 
+	var keep map[string]struct{}
+
+	if node := q.Get("node"); node != "" {
+		keep = map[string]struct{}{}
+		for _, t := range s.targets().Node(node) {
+			keep[t.ID] = struct{}{}
+		}
+	}
+
+	if raw := q.Get("selector"); raw != "" {
+		sel, err := targets.ParseSelector(raw)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+
+			return
+		}
+
+		keep = map[string]struct{}{}
+		for _, t := range s.targets().Select(sel) {
+			keep[t.ID] = struct{}{}
+		}
+	}
+
 	events, err := s.c.Events(r.Context(), reconcile.EventQuery{Group: q.Get("group"), Rollout: q.Get("rollout"), Target: q.Get("target"), Limit: limit})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -166,16 +200,11 @@ func (s *Server) history(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if node := q.Get("node"); node != "" {
-		onNode := map[string]struct{}{}
-		for _, t := range s.targets().Node(node) {
-			onNode[t.ID] = struct{}{}
-		}
-
+	if keep != nil {
 		filtered := make([]reconcile.Event, 0, len(events))
 
 		for i := range events {
-			if _, ok := onNode[events[i].Target]; ok {
+			if _, ok := keep[events[i].Target]; ok {
 				filtered = append(filtered, events[i])
 			}
 		}
@@ -234,8 +263,7 @@ func (s *Server) suspensions(w http.ResponseWriter, _ *http.Request) {
 
 // stream sends every event as server-sent events until the client leaves.
 func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
+	if _, ok := w.(http.Flusher); !ok {
 		writeError(w, http.StatusInternalServerError, "streaming unsupported")
 
 		return
@@ -244,13 +272,27 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 	ch, stop := s.events.Subscribe()
 	defer stop()
 
+	// A client that stops reading gets a write deadline, not a parked handler.
+	rc := http.NewResponseController(w)
+	write := func(format string, args ...any) bool {
+		_ = rc.SetWriteDeadline(time.Now().Add(sseWriteTimeout))
+
+		if _, err := fmt.Fprintf(w, format, args...); err != nil {
+			return false
+		}
+
+		return rc.Flush() == nil
+	}
+
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprint(w, ": connected\n\n")
-	flusher.Flush()
 
-	heartbeat := time.NewTicker(15 * time.Second)
+	if !write(": connected\n\n") {
+		return
+	}
+
+	heartbeat := time.NewTicker(sseHeartbeat)
 	defer heartbeat.Stop()
 
 	for {
@@ -258,16 +300,18 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case <-heartbeat.C:
-			fmt.Fprint(w, ": ping\n\n")
-			flusher.Flush()
+			if !write(": ping\n\n") {
+				return
+			}
 		case e := <-ch:
 			raw, err := json.Marshal(e)
 			if err != nil {
 				continue
 			}
 
-			fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", e.ID, e.Action, raw)
-			flusher.Flush()
+			if !write("id: %d\nevent: %s\ndata: %s\n\n", e.ID, e.Action, raw) {
+				return
+			}
 		}
 	}
 }
@@ -304,21 +348,30 @@ func (s *Server) ownersOf(ts []targets.Target) []string {
 }
 
 // authorizeSelector checks the caller may act on everything the selector
-// matches, and that a selector spanning several owners was confirmed.
-func (s *Server) authorizeSelector(w http.ResponseWriter, r *http.Request, sel targets.Selector, confirm bool) (Identity, []targets.Target, bool) {
+// matches, and that a selector spanning several owners was confirmed. With
+// wholeGroups, the check covers every target in the groups the selector
+// touches, because that is what a sync acts on.
+func (s *Server) authorizeSelector(w http.ResponseWriter, r *http.Request, sel targets.Selector, confirm, wholeGroups bool) (Identity, []targets.Target, bool) {
 	id, ok := s.identity(w, r)
 	if !ok {
 		return Identity{}, nil, false
 	}
 
-	matched := s.targets().Select(sel)
+	set := s.targets()
+
+	matched := set.Select(sel)
 	if len(matched) == 0 {
 		writeError(w, http.StatusNotFound, "selector "+sel.String()+" matches nothing")
 
 		return Identity{}, nil, false
 	}
 
-	owners := s.ownersOf(matched)
+	affected := matched
+	if wholeGroups {
+		affected = expandGroups(set, matched)
+	}
+
+	owners := s.ownersOf(affected)
 
 	if allowed, why := MayAct(&id, owners); !allowed {
 		writeForbidden(w, why, owners, id.Owners)
@@ -336,6 +389,25 @@ func (s *Server) authorizeSelector(w http.ResponseWriter, r *http.Request, sel t
 	}
 
 	return id, matched, true
+}
+
+// expandGroups returns every target in the groups the given targets belong to.
+func expandGroups(set *targets.Set, matched []targets.Target) []targets.Target {
+	seen := map[string]struct{}{}
+
+	var out []targets.Target
+
+	for i := range matched {
+		g := set.Group(&matched[i])
+		if _, done := seen[g]; done {
+			continue
+		}
+
+		seen[g] = struct{}{}
+		out = append(out, set.InGroup(g)...)
+	}
+
+	return out
 }
 
 // authorizeGroup checks the caller may act on a group.

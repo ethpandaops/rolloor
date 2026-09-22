@@ -1,0 +1,78 @@
+{{define "rollout"}}
+<div id="rollout" hx-get="/rollouts/{{.Rollout.ID}}" hx-trigger="every 5s" hx-swap="outerHTML">
+<nav class="crumbs"><a href="/">Fleet</a> › <a href="/groups/{{.GroupLabel}}/{{.Rollout.Group}}">{{.Rollout.Group}}</a> › Rollout {{.Rollout.Digest}}</nav>
+<div class="title-row">
+  <h1>Rollout <code>{{.Rollout.Digest}}</code>{{if .Rollout.Revision}} <span class="muted">{{.Rollout.Revision}}</span>{{end}}</h1>
+  <div class="controls">
+    {{$rid := .Rollout.ID}}{{$next := printf "/rollouts/%s" .Rollout.ID}}
+    {{if eq .Rollout.State "Paused"}}
+      <form method="post" action="/actions/promote" class="inline"><input type="hidden" name="rollout" value="{{$rid}}"><input type="hidden" name="next" value="{{$next}}"><button class="primary" {{if not .Can.OK}}disabled title="{{.Can.Why}}"{{end}}>Promote</button></form>
+    {{else if or (eq .Rollout.State "Running") (eq .Rollout.State "Soaking") (eq .Rollout.State "WaitingForBudget") (eq .Rollout.State "WaitingForEnvironment")}}
+      <form method="post" action="/actions/pause" class="inline"><input type="hidden" name="rollout" value="{{$rid}}"><input type="hidden" name="next" value="{{$next}}"><button {{if or (not .Can.OK) .Rollout.PausePending}}disabled title="{{if .Rollout.PausePending}}pause already pending{{else}}{{.Can.Why}}{{end}}"{{end}}>Pause</button></form>
+    {{else if eq .Rollout.State "Halted"}}
+      <details class="dialog"><summary {{if not .Can.OK}}class="disabled" title="{{.Can.Why}}"{{end}}>Retry…</summary>
+        <form method="post" action="/actions/retry"><input type="hidden" name="rollout" value="{{$rid}}"><input type="hidden" name="next" value="{{$next}}"><label>Why the probe was wrong <input name="reason" required></label><button {{if not .Can.OK}}disabled{{end}}>Retry the soak</button></form>
+      </details>
+    {{end}}
+    {{if .Rollout.State.Active}}
+      <form method="post" action="/actions/abort" class="inline"><input type="hidden" name="rollout" value="{{$rid}}"><input type="hidden" name="next" value="{{$next}}"><button class="danger" {{if not .Can.OK}}disabled title="{{.Can.Why}}"{{end}}>Abort</button></form>
+    {{end}}
+    {{template "disabled-why" .Can}}
+  </div>
+</div>
+
+<dl class="facts">
+  <div><dt>Selector</dt><dd><code>{{.GroupLabel}}={{.Rollout.Group}}</code></dd></div>
+  <div><dt>From</dt><dd><code>{{short (first .Rollout.From)}}</code></dd></div>
+  <div><dt>Started</dt><dd>{{ago .Rollout.CreatedAt}}</dd></div>
+  <div><dt>Speed</dt><dd>{{.Rollout.Speed}}</dd></div>
+</dl>
+
+{{if eq .Rollout.State "Halted"}}
+<div class="halt">
+  <h2>{{template "state-badge" .Rollout.State}} {{ago .Rollout.UpdatedAt}}</h2>
+  <p>{{.Rollout.Reason}}</p>
+  {{if .Quarantine}}
+  <div class="quarantine"><h3>{{len .Quarantine}} quarantined targets</h3><p>Left running {{.Rollout.Digest}} so you can look at them.</p>
+    <ul>{{range .Quarantine}}<li><code>{{.ID}}</code> {{template "health-badge" "Degraded"}} <span class="muted">{{.Reason}}</span></li>{{end}}</ul></div>
+  {{end}}
+  <p class="muted">A new {{.Rollout.Group}} build clears this halt. The quarantined targets update first.</p>
+</div>
+{{else}}
+<div class="cards">
+  <div class="card"><h3>Status</h3><div class="big">{{template "state-badge" .Rollout.State}}</div><p>{{.Rollout.Reason}}</p></div>
+  <div class="card"><h3>On the new build</h3><div class="big">{{.Rollout.OnNewBuild}} of {{.Rollout.Total}} targets</div><p>{{.Rollout.NotReached}} have not been reached yet. They are the comparison group.</p></div>
+  <div class="card"><h3>Budget</h3><div class="big">{{.Rollout.BudgetPercent}}</div><p>A node with two targets moving counts once.</p></div>
+</div>
+{{end}}
+
+{{if .LastCheck}}
+<div class="soak">
+  <h3>Soak probe <code>{{.LastCheck.Program}}</code></h3>
+  <div class="numbers">
+    {{if .LastCheck.Updated}}<div><div class="big">{{.LastCheck.Updated}}{{.LastCheck.Unit}}</div><div class="muted">updated in this batch</div></div>{{end}}
+    {{if .LastCheck.Remaining}}<div><div class="big">{{.LastCheck.Remaining}}{{.LastCheck.Unit}}</div><div class="muted">not yet updated</div></div>{{end}}
+    <div class="verdict {{if .LastCheck.OK}}ok{{else}}bad{{end}}">{{if .LastCheck.OK}}Within tolerance{{else}}Outside tolerance{{end}} on check {{len .Rollout.Soak.Checks}}: {{.LastCheck.Reason}}</div>
+  </div>
+</div>
+{{end}}
+
+<div class="waves">
+  <h3>Waves and batches</h3>
+  {{range .Waves}}
+  <div class="wave {{if .Done}}done{{end}}">
+    <div class="wave-head"><b>Wave {{.Number}}</b> <span class="muted">{{len .Batches}} batches{{if .Pending}}, {{len .Pending}} targets not yet reached{{end}}</span></div>
+    {{range .Batches}}
+    <div class="batch {{if .Open}}open{{else if .Passed}}passed{{else}}failed{{end}}">
+      <div class="batch-head">Batch {{.Number}} <span class="muted">{{len .Targets}} targets, started {{ago .StartedAt}}{{if .Passed}}, passed{{else if not .Open}}, stopped{{end}}</span></div>
+      <table class="mini"><tbody>
+      {{range .Targets}}<tr><td><a href="/nodes/{{.Node}}">{{.Node}}</a></td><td><code>{{.ID}}</code></td><td>{{.Phase}}</td><td class="muted">{{.Reason}}</td></tr>{{end}}
+      </tbody></table>
+    </div>
+    {{end}}
+    {{if .Pending}}<div class="pending muted">Not yet reached: {{range $i, $t := .Pending}}{{if $i}}, {{end}}<code>{{$t.ID}}</code>{{end}}</div>{{end}}
+  </div>
+  {{end}}
+</div>
+</div>
+{{end}}

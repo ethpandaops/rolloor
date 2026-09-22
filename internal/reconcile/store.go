@@ -2,6 +2,7 @@ package reconcile
 
 import (
 	"context"
+	"maps"
 	"sort"
 	"sync"
 )
@@ -13,6 +14,8 @@ type Snapshot struct {
 	Suspensions []Suspension
 	Live        map[string]Live
 	Degraded    map[string]string
+	Desired     map[string]Desired
+	Aborted     map[string]string
 	NextEventID int64
 }
 
@@ -24,10 +27,13 @@ type Store interface {
 	SavePolicy(ctx context.Context, group string, p Policy) error
 	SaveSuspension(ctx context.Context, s *Suspension) error
 	DeleteSuspension(ctx context.Context, id string) error
-	SaveLive(ctx context.Context, id string, l Live) error
+	SaveLive(ctx context.Context, id string, l *Live) error
 	DeleteLive(ctx context.Context, id string) error
 	SaveDegraded(ctx context.Context, id, reason string) error
 	ClearDegraded(ctx context.Context, id string) error
+	SaveDesired(ctx context.Context, image string, d Desired) error
+	SaveAborted(ctx context.Context, group, key string) error
+	ClearAborted(ctx context.Context, group string) error
 	AppendEvent(ctx context.Context, e *Event) error
 	Events(ctx context.Context, q EventQuery) ([]Event, error)
 }
@@ -54,6 +60,8 @@ type MemoryStore struct {
 	suspensions map[string]Suspension
 	live        map[string]Live
 	degraded    map[string]string
+	desired     map[string]Desired
+	aborted     map[string]string
 	events      []Event
 	// Fail, when set, is returned by every write; tests use it.
 	Fail error
@@ -67,6 +75,8 @@ func NewMemoryStore() *MemoryStore {
 		suspensions: map[string]Suspension{},
 		live:        map[string]Live{},
 		degraded:    map[string]string{},
+		desired:     map[string]Desired{},
+		aborted:     map[string]string{},
 	}
 }
 
@@ -85,12 +95,13 @@ func (m *MemoryStore) Load(context.Context) (*Snapshot, error) {
 		Policies:    map[string]Policy{},
 		Live:        map[string]Live{},
 		Degraded:    map[string]string{},
+		Desired:     map[string]Desired{},
+		Aborted:     map[string]string{},
 		NextEventID: int64(len(m.events)) + 1,
 	}
 
 	for _, r := range m.rollouts {
-		cp := *r
-		s.Rollouts = append(s.Rollouts, &cp)
+		s.Rollouts = append(s.Rollouts, cloneRollout(r))
 	}
 
 	sort.Slice(s.Rollouts, func(i, j int) bool { return s.Rollouts[i].ID < s.Rollouts[j].ID })
@@ -113,7 +124,37 @@ func (m *MemoryStore) Load(context.Context) (*Snapshot, error) {
 		s.Degraded[k] = v
 	}
 
+	for k, v := range m.desired {
+		s.Desired[k] = v
+	}
+
+	for k, v := range m.aborted {
+		s.Aborted[k] = v
+	}
+
 	return s, nil
+}
+
+// cloneRollout copies a rollout deeply enough that later mutation of the
+// original does not show through the snapshot.
+func cloneRollout(r *Rollout) *Rollout {
+	cp := *r
+	cp.Targets = append([]RolloutTarget(nil), r.Targets...)
+	cp.Batches = append([]Batch(nil), r.Batches...)
+	cp.Soak.Checks = append([]SoakCheck(nil), r.Soak.Checks...)
+	cp.Desired = maps.Clone(r.Desired)
+	cp.Revisions = maps.Clone(r.Revisions)
+	cp.From = maps.Clone(r.From)
+
+	for i := range cp.Batches {
+		if r.Batches[i].Soak != nil {
+			s := *r.Batches[i].Soak
+			s.Checks = append([]SoakCheck(nil), r.Batches[i].Soak.Checks...)
+			cp.Batches[i].Soak = &s
+		}
+	}
+
+	return &cp
 }
 
 // SaveRollout stores a copy.
@@ -125,8 +166,7 @@ func (m *MemoryStore) SaveRollout(_ context.Context, r *Rollout) error {
 		return m.Fail
 	}
 
-	cp := *r
-	m.rollouts[r.ID] = &cp
+	m.rollouts[r.ID] = cloneRollout(r)
 
 	return nil
 }
@@ -174,7 +214,7 @@ func (m *MemoryStore) DeleteSuspension(_ context.Context, id string) error {
 }
 
 // SaveLive stores live state.
-func (m *MemoryStore) SaveLive(_ context.Context, id string, l Live) error {
+func (m *MemoryStore) SaveLive(_ context.Context, id string, l *Live) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -182,7 +222,7 @@ func (m *MemoryStore) SaveLive(_ context.Context, id string, l Live) error {
 		return m.Fail
 	}
 
-	m.live[id] = l
+	m.live[id] = *l
 
 	return nil
 }
@@ -225,6 +265,48 @@ func (m *MemoryStore) ClearDegraded(_ context.Context, id string) error {
 	}
 
 	delete(m.degraded, id)
+
+	return nil
+}
+
+// SaveDesired remembers a tag's last known digest.
+func (m *MemoryStore) SaveDesired(_ context.Context, image string, d Desired) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.Fail != nil {
+		return m.Fail
+	}
+
+	m.desired[image] = d
+
+	return nil
+}
+
+// SaveAborted records that a group's rollout to these digests was aborted.
+func (m *MemoryStore) SaveAborted(_ context.Context, group, key string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.Fail != nil {
+		return m.Fail
+	}
+
+	m.aborted[group] = key
+
+	return nil
+}
+
+// ClearAborted forgets an abort.
+func (m *MemoryStore) ClearAborted(_ context.Context, group string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.Fail != nil {
+		return m.Fail
+	}
+
+	delete(m.aborted, group)
 
 	return nil
 }

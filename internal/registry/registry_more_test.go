@@ -113,6 +113,18 @@ func TestCredsByAPIHost(t *testing.T) {
 	require.Equal(t, map[string]string{"realm": "x"}, parseChallenge(`Bearer realm="x",junk`))
 }
 
+func TestAuthFileHubAliases(t *testing.T) {
+	for _, alias := range []string{"https://index.docker.io/v1/", dockerHubAPIHost} {
+		path := filepath.Join(t.TempDir(), "config.json")
+		require.NoError(t, os.WriteFile(path, []byte(`{"auths":{"`+alias+`":{"username":"hub","password":"pw"}}}`), 0o600))
+
+		r, err := NewResolver(Options{AuthFile: path}, logrus.New())
+		require.NoError(t, err)
+		require.Equal(t, "hub:pw", r.auths[dockerHubHost], alias)
+		require.Equal(t, "hub:pw", r.creds(Reference{Host: dockerHubHost}), alias)
+	}
+}
+
 func TestAuthFileSkipsEmptyEntries(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	require.NoError(t, os.WriteFile(path, []byte(`{"auths":{"h":{}}}`), 0o600))

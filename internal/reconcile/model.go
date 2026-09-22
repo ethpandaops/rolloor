@@ -91,6 +91,9 @@ type Live struct {
 	Failures int       `json:"failures"`
 	SeenAt   time.Time `json:"seenAt"`
 	Reason   string    `json:"reason,omitempty"`
+	// ObservedAt is when the observation that produced this began, so a slow
+	// inspect that returns after a newer one cannot overwrite it.
+	ObservedAt time.Time `json:"observedAt,omitzero"`
 }
 
 // Desired is what a tag currently points at.
@@ -115,14 +118,17 @@ const (
 
 // RolloutTarget is one target's progress in a rollout.
 type RolloutTarget struct {
-	ID        string      `json:"id"`
-	Node      string      `json:"node"`
-	Wave      int         `json:"wave"`
-	Batch     int         `json:"batch"` // 0 = not yet batched
-	Phase     TargetPhase `json:"phase"`
-	Reason    string      `json:"reason,omitempty"`
-	Updated   bool        `json:"updated"`
-	UpdatedAt time.Time   `json:"updatedAt,omitzero"`
+	ID     string      `json:"id"`
+	Node   string      `json:"node"`
+	Wave   int         `json:"wave"`
+	Batch  int         `json:"batch"` // 0 = not yet batched
+	Phase  TargetPhase `json:"phase"`
+	Reason string      `json:"reason,omitempty"`
+	// UpdateDone is set once the update hook has returned success; Updated
+	// once inspect has seen the desired digest running.
+	UpdateDone bool      `json:"updateDone"`
+	Updated    bool      `json:"updated"`
+	UpdatedAt  time.Time `json:"updatedAt,omitzero"`
 	// DegradedBefore marks a target that was already Degraded when the
 	// rollout began, so its node costs nothing against the budget.
 	DegradedBefore bool `json:"degradedBefore,omitempty"`
@@ -136,6 +142,9 @@ type Batch struct {
 	StartedAt time.Time `json:"startedAt"`
 	EndedAt   time.Time `json:"endedAt,omitzero"`
 	Passed    bool      `json:"passed"`
+	// Soak is the batch's soak once it has ended; the open batch's lives on
+	// the rollout.
+	Soak *SoakProgress `json:"soak,omitempty"`
 }
 
 // SoakCheck is one run of one soak program.

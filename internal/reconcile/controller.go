@@ -84,8 +84,10 @@ type Controller struct {
 	envCheckedAt time.Time
 
 	lastResolve   time.Time
+	lastTick      time.Time
 	refreshWanted bool
 	resolveErrors map[string]string
+	targetsError  string
 	nextEventID   int64
 
 	nudge chan struct{}
@@ -169,6 +171,25 @@ func (c *Controller) restore(snap *Snapshot) {
 		c.degraded[id] = reason
 	}
 
+	for img, d := range snap.Desired {
+		c.desired[img] = d
+	}
+
+	for g, key := range snap.Aborted {
+		c.aborted[g] = key
+	}
+
+	// An update whose hook was running when the process stopped never
+	// reported back; the hook is idempotent, so it runs again.
+	for _, r := range c.rollouts {
+		for i := range r.Targets {
+			rt := &r.Targets[i]
+			if rt.Phase == PhaseUpdating && !rt.UpdateDone {
+				rt.Phase, rt.Reason = PhasePending, "update interrupted by a restart; running again"
+			}
+		}
+	}
+
 	c.nextEventID = max(snap.NextEventID, 1)
 }
 
@@ -232,22 +253,38 @@ func (c *Controller) Tick(ctx context.Context) error {
 
 	c.mu.Lock()
 	c.applyResults(ctx, now, results)
+	c.lastTick = now
 	c.mu.Unlock()
 
 	return ctx.Err()
 }
 
+// LastTick is when the loop last completed a pass.
+func (c *Controller) LastTick() time.Time {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return c.lastTick
+}
+
 // resolveIfDue re-resolves every image reference on the registry poll interval
-// or when a refresh was asked for.
+// or when a refresh was asked for. The refresh flag is consumed before the
+// network work starts, so a request arriving during it stays pending.
 func (c *Controller) resolveIfDue(ctx context.Context, now time.Time) error {
 	c.mu.Lock()
 	due := c.refreshWanted || c.lastResolve.IsZero() || now.Sub(c.lastResolve) >= c.cfg.Registry.Poll
+	c.refreshWanted = false
 	c.mu.Unlock()
 
 	if !due {
 		return nil
 	}
 
+	return c.resolveAll(ctx, now)
+}
+
+// resolveAll resolves every image now and records the results.
+func (c *Controller) resolveAll(ctx context.Context, now time.Time) error {
 	images := c.targets().Images()
 	resolved := make(map[string]registry.Resolved, len(images))
 	failed := make(map[string]string)
@@ -282,22 +319,27 @@ func (c *Controller) resolveIfDue(ctx context.Context, now time.Time) error {
 	defer c.mu.Unlock()
 
 	c.lastResolve = now
-	c.refreshWanted = false
 
 	for img, res := range resolved {
 		prev, had := c.desired[img]
-		c.desired[img] = Desired{Digest: res.Digest, Revision: res.Revision, ResolvedAt: now}
+		d := Desired{Digest: res.Digest, Revision: res.Revision, ResolvedAt: now}
+		c.desired[img] = d
 
-		delete(c.resolveErrors, img)
+		if _, wasFailing := c.resolveErrors[img]; wasFailing {
+			delete(c.resolveErrors, img)
+			c.event(ctx, now, &Event{Actor: ControllerActor, Action: "registry.recovered", Target: img})
+		}
 
 		if !had || prev.Digest != res.Digest {
+			_ = c.persist(ctx, c.store.SaveDesired(ctx, img, d))
 			c.event(ctx, now, &Event{Actor: ControllerActor, Action: "digest.changed", Target: img,
 				Reason: fmt.Sprintf("%s → %s %s", shortDigest(prev.Digest), shortDigest(res.Digest), res.Revision)})
 		}
 	}
 
+	// One event per failure episode; the latest text stays visible in views.
 	for img, msg := range failed {
-		if c.resolveErrors[img] != msg {
+		if _, already := c.resolveErrors[img]; !already {
 			c.event(ctx, now, &Event{Actor: ControllerActor, Action: "registry.error", Target: img, Reason: msg})
 		}
 
@@ -305,6 +347,34 @@ func (c *Controller) resolveIfDue(ctx context.Context, now time.Time) error {
 	}
 
 	return ctx.Err()
+}
+
+// ReportTargetsError records that the targets files failed to reload, once
+// per distinct message; the previous set stays in use.
+func (c *Controller) ReportTargetsError(ctx context.Context, err error) {
+	now := c.clock.Now()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	msg := ""
+	if err != nil {
+		msg = err.Error()
+	}
+
+	if msg == c.targetsError {
+		return
+	}
+
+	c.targetsError = msg
+
+	if msg == "" {
+		c.event(ctx, now, &Event{Actor: ControllerActor, Action: "targets.reloaded"})
+
+		return
+	}
+
+	c.event(ctx, now, &Event{Actor: ControllerActor, Action: "targets.invalid", Reason: msg})
 }
 
 // checkEnvironmentIfDue runs the environment hook on its interval.
@@ -354,7 +424,7 @@ func (c *Controller) expireSuspensions(ctx context.Context, now time.Time) {
 	for id, s := range c.suspensions {
 		if !now.Before(s.ExpiresAt) {
 			delete(c.suspensions, id)
-			c.persist(ctx, c.store.DeleteSuspension(ctx, id))
+			_ = c.persist(ctx, c.store.DeleteSuspension(ctx, id))
 			c.event(ctx, now, &Event{Actor: ControllerActor, Action: "suspend.expired", Selector: s.Selector.String(), Reason: s.Reason})
 		}
 	}
@@ -366,37 +436,61 @@ func (c *Controller) event(ctx context.Context, now time.Time, e *Event) {
 	e.At = now
 	c.nextEventID++
 
-	c.persist(ctx, c.store.AppendEvent(ctx, e))
+	_ = c.persist(ctx, c.store.AppendEvent(ctx, e))
 
 	if c.notifier != nil {
 		c.notifier.Publish(e)
 	}
 }
 
-// persist logs a store failure; in-memory state stays authoritative.
-func (c *Controller) persist(ctx context.Context, err error) {
+// persist logs a store failure and returns it. The controller's own
+// decisions carry on from memory; a person's action reports it.
+func (c *Controller) persist(ctx context.Context, err error) error {
 	if err != nil {
 		c.log.WithContext(ctx).WithError(err).Error("store write failed")
 	}
+
+	return err
 }
 
-func (c *Controller) saveRollout(ctx context.Context, r *Rollout) {
-	c.persist(ctx, c.store.SaveRollout(ctx, r))
+// commit applies change to r and saves it. When the store refuses, the
+// rollout is put back so memory never runs ahead of disk.
+func (c *Controller) commit(ctx context.Context, r *Rollout, change func()) error {
+	before := cloneRollout(r)
+
+	change()
+
+	if err := c.saveRollout(ctx, r); err != nil {
+		*r = *before
+
+		return err
+	}
+
+	return nil
 }
 
-// SetLive records what inspect reported for a target. ok false counts a
-// failure; after enough consecutive failures the target reads Unknown.
-func (c *Controller) SetLive(ctx context.Context, id, digest string, ok bool, reason string) {
+func (c *Controller) saveRollout(ctx context.Context, r *Rollout) error {
+	return c.persist(ctx, c.store.SaveRollout(ctx, r))
+}
+
+// SetLive records what inspect reported for a target, for an observation
+// that began at observedAt. ok false counts a failure; after enough
+// consecutive failures the target reads Unknown.
+func (c *Controller) SetLive(ctx context.Context, id, digest string, ok bool, reason string, observedAt time.Time) {
 	now := c.clock.Now()
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.setLiveLocked(ctx, now, id, digest, ok, reason)
+	c.setLiveLocked(ctx, now, observedAt, id, digest, ok, reason)
 }
 
-func (c *Controller) setLiveLocked(ctx context.Context, now time.Time, id, digest string, ok bool, reason string) {
+// setLiveLocked applies an observation unless a newer one is already recorded.
+func (c *Controller) setLiveLocked(ctx context.Context, now, observedAt time.Time, id, digest string, ok bool, reason string) {
 	l := c.live[id]
+	if observedAt.Before(l.ObservedAt) {
+		return
+	}
 
 	if ok {
 		l = Live{Digest: digest, SeenAt: now}
@@ -405,34 +499,48 @@ func (c *Controller) setLiveLocked(ctx context.Context, now time.Time, id, diges
 		l.Reason = reason
 	}
 
+	l.ObservedAt = observedAt
 	c.live[id] = l
-	c.persist(ctx, c.store.SaveLive(ctx, id, l))
+	_ = c.persist(ctx, c.store.SaveLive(ctx, id, &l))
 }
 
 // InspectAll runs the inspect hook for every target and records the result.
 func (c *Controller) InspectAll(ctx context.Context) {
 	set := c.targets()
 
+	// Hook input reads the desired digests, so it is built under the lock
+	// before the programs run.
+	c.mu.Lock()
+
+	inputs := make([]HookInput, len(set.Targets))
+	for i := range set.Targets {
+		inputs[i] = c.hookInput(set, &set.Targets[i])
+	}
+
+	c.mu.Unlock()
+
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(c.cfg.Inspect.Concurrency)
 
 	for i := range set.Targets {
 		t := set.Targets[i]
+		in := inputs[i]
 
 		g.Go(func() error {
-			res, err := c.runner.Run(gctx, c.programFor(&t, config.HookInspect), config.HookInspect, t.ID, t)
+			started := c.clock.Now()
+			res, err := c.runner.Run(gctx, c.programFor(&t, config.HookInspect), config.HookInspect, t.ID, in)
 
 			c.mu.Lock()
 			defer c.mu.Unlock()
 
 			if err != nil {
-				c.setLiveLocked(gctx, c.clock.Now(), t.ID, "", false, err.Error())
+				c.setLiveLocked(gctx, c.clock.Now(), started, t.ID, "", false, err.Error())
 
 				return nil
 			}
 
 			c.recordHookRun(t.ID, config.HookInspect, &res)
-			c.setLiveLocked(gctx, c.clock.Now(), t.ID, strings.TrimSpace(res.Reason), res.OK, res.Reason)
+			c.setLiveLocked(gctx, c.clock.Now(), started, t.ID, strings.TrimSpace(res.Reason), res.OK, res.Reason)
 
 			return nil
 		})
@@ -458,7 +566,7 @@ func (c *Controller) RunInspector(ctx context.Context) error {
 	}
 }
 
-// Forget drops live state for targets that left the files.
+// Forget drops live state and quarantine for targets that left the files.
 func (c *Controller) Forget(ctx context.Context, ids []string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -467,8 +575,54 @@ func (c *Controller) Forget(ctx context.Context, ids []string) {
 		delete(c.live, id)
 		delete(c.degraded, id)
 		delete(c.hookRuns, id)
-		c.persist(ctx, c.store.DeleteLive(ctx, id))
+		_ = c.persist(ctx, c.store.DeleteLive(ctx, id))
+		_ = c.persist(ctx, c.store.ClearDegraded(ctx, id))
 	}
+}
+
+// HookInput is what target hooks receive on stdin: the target plus the
+// digest it should be running, so update can deploy exactly that.
+type HookInput struct {
+	targets.Target
+
+	Desired    string `json:"desired,omitempty"`
+	DesiredRef string `json:"desiredRef,omitempty"`
+}
+
+func (c *Controller) hookInput(set *targets.Set, t *targets.Target) HookInput {
+	in := HookInput{Target: *t}
+
+	if d, ok := c.desiredFor(set.Group(t), t); ok && d.Digest != "" {
+		in.Desired = d.Digest
+		in.DesiredRef = imageRepo(t.Image) + "@" + d.Digest
+	}
+
+	return in
+}
+
+// imageRepo strips the tag from an image reference.
+func imageRepo(image string) string {
+	slash := strings.LastIndex(image, "/")
+	if colon := strings.LastIndex(image, ":"); colon > slash {
+		return image[:colon]
+	}
+
+	return image
+}
+
+// hookRunsFor copies a target's last hook results for a view.
+func (c *Controller) hookRunsFor(id string) map[string]HookRun {
+	runs, ok := c.hookRuns[id]
+	if !ok {
+		return nil
+	}
+
+	out := make(map[string]HookRun, len(runs))
+	for k, v := range runs {
+		out[k] = v
+	}
+
+	return out
 }
 
 // liveKnown reports whether a target's running digest can be trusted.

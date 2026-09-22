@@ -124,7 +124,7 @@ func (c *Controller) Target(id string) (TargetView, bool) {
 
 func (c *Controller) viewLocked(set *targets.Set, t *targets.Target) TargetView {
 	group := set.Group(t)
-	v := TargetView{Target: *t, Group: group, Owner: set.Owner(t), Wave: set.Wave(t), Health: Healthy, Hooks: c.hookRuns[t.ID]}
+	v := TargetView{Target: *t, Group: group, Owner: set.Owner(t), Wave: set.Wave(t), Health: Healthy, Hooks: c.hookRunsFor(t.ID)}
 
 	if d, ok := c.desiredFor(group, t); ok {
 		v.Desired, v.Revision = d.Digest, d.Revision
@@ -187,7 +187,9 @@ func (c *Controller) viewLocked(set *targets.Set, t *targets.Target) TargetView 
 					v.Reason = "updated in batch " + itoa(rt.Batch)
 				}
 			case PhaseFailed:
-				v.Health, v.Reason = Degraded, rt.Reason
+				if v.Health != Suspended {
+					v.Health, v.Reason = Degraded, rt.Reason
+				}
 			case PhaseSkipped:
 			}
 		}
@@ -411,14 +413,12 @@ func (c *Controller) rolloutViewLocked(set *targets.Set, r *Rollout) RolloutView
 		switch rt.Phase {
 		case PhasePassed, PhaseReady:
 			v.OnNewBuild++
-		case PhaseUpdating:
+		case PhaseUpdating, PhaseFailed:
 			if rt.Updated {
 				v.OnNewBuild++
 			}
 		case PhasePending:
 			v.NotReached++
-		case PhaseFailed:
-			v.OnNewBuild++
 		case PhaseSkipped:
 		}
 	}

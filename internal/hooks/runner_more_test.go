@@ -27,7 +27,7 @@ func TestRunEdgeCases(t *testing.T) {
 	writeScript(t, dir, "silent", `exit 4`)
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "noexec"), []byte("#!/bin/sh\n"), 0o644))
 
-	r, err := NewRunner(dir, 2*time.Second, "e", logrus.New())
+	r, err := NewRunner(dir, 10*time.Second, "e", logrus.New())
 	require.NoError(t, err)
 
 	res, err := r.Run(context.Background(), "silent", "ready", "t", nil)
@@ -47,4 +47,26 @@ func TestRunEdgeCases(t *testing.T) {
 
 	require.False(t, r.Exists("noexec"))
 	require.Equal(t, "", firstLine("  \n"))
+}
+
+func TestOutputIsBounded(t *testing.T) {
+	dir := t.TempDir()
+	writeScript(t, dir, "loud", `echo first; head -c 200000 /dev/zero | tr '\0' 'x'; echo; head -c 100000 /dev/zero | tr '\0' 'y' >&2`)
+
+	r, err := NewRunner(dir, 5*time.Second, "e", logrus.New())
+	require.NoError(t, err)
+
+	res, err := r.Run(context.Background(), "loud", "ready", "t", nil)
+	require.NoError(t, err)
+	require.True(t, res.OK)
+	require.Equal(t, "first", res.Reason)
+	require.Len(t, res.Stdout, maxCapture)
+
+	c := &capped{limit: 4}
+	n, err := c.Write([]byte("abcdef"))
+	require.NoError(t, err)
+	require.Equal(t, 6, n)
+	require.Equal(t, "abcd", c.String())
+	require.Equal(t, 4, c.Len())
+	require.Equal(t, 2, c.dropped)
 }

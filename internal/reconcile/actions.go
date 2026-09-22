@@ -23,11 +23,11 @@ type SyncRequest struct {
 	Speed    string
 }
 
-// Sync asks for the selected groups to converge now. A manual rollout waiting
+// Sync asks for the selected groups to converge now. Tags are re-resolved
+// first so the request acts on the current digests. A manual rollout waiting
 // for a sync starts; a group with no rollout gets one; an active rollout is
 // marked as a person's, so the environment check no longer holds it.
 func (c *Controller) Sync(ctx context.Context, req SyncRequest) ([]string, error) {
-	now := c.clock.Now()
 	set := c.targets()
 
 	if req.Speed != "" {
@@ -46,15 +46,27 @@ func (c *Controller) Sync(ctx context.Context, req SyncRequest) ([]string, error
 		groups[set.Group(&matched[i])] = struct{}{}
 	}
 
+	if err := c.resolveAll(ctx, c.clock.Now()); err != nil {
+		return nil, err
+	}
+
+	now := c.clock.Now()
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.refreshWanted = true
+	c.supersedeChangedRollouts(ctx, now)
 
 	var started []string
 
 	for group := range groups {
-		delete(c.aborted, group)
+		if _, aborted := c.aborted[group]; aborted {
+			delete(c.aborted, group)
+
+			if err := c.persist(ctx, c.store.ClearAborted(ctx, group)); err != nil {
+				return started, err
+			}
+		}
 
 		r := c.activeRollout(group)
 		if r == nil {
@@ -85,7 +97,10 @@ func (c *Controller) Sync(ctx context.Context, req SyncRequest) ([]string, error
 			c.setState(ctx, now, r, Running, "Started by "+req.Actor)
 		}
 
-		c.saveRollout(ctx, r)
+		if err := c.saveRollout(ctx, r); err != nil {
+			return started, err
+		}
+
 		c.event(ctx, now, &Event{Actor: req.Actor, Action: "sync", Group: group, Rollout: r.ID, Selector: req.Selector.String(),
 			Reason: syncReason(req)})
 
@@ -150,8 +165,11 @@ func (c *Controller) Suspend(ctx context.Context, req SuspendRequest) (Suspensio
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if err := c.persist(ctx, c.store.SaveSuspension(ctx, &s)); err != nil {
+		return Suspension{}, err
+	}
+
 	c.suspensions[s.ID] = s
-	c.persist(ctx, c.store.SaveSuspension(ctx, &s))
 	c.event(ctx, now, &Event{Actor: req.Actor, Action: "suspend", Selector: req.Selector.String(),
 		Reason: fmt.Sprintf("%s (until %s)", req.Reason, s.ExpiresAt.UTC().Format(time.RFC3339))})
 
@@ -173,8 +191,11 @@ func (c *Controller) Resume(ctx context.Context, actor string, sel targets.Selec
 			continue
 		}
 
+		if err := c.persist(ctx, c.store.DeleteSuspension(ctx, id)); err != nil {
+			return n, err
+		}
+
 		delete(c.suspensions, id)
-		c.persist(ctx, c.store.DeleteSuspension(ctx, id))
 
 		n++
 	}
@@ -208,16 +229,19 @@ func (c *Controller) Pause(ctx context.Context, actor, rolloutID string) error {
 		return fmt.Errorf("rollout is %s: %w", r.State, ErrState)
 	}
 
-	r.PausePending = true
+	err := c.commit(ctx, r, func() {
+		r.PausePending = true
 
-	if r.CurrentBatch() == nil {
-		r.PausePending = false
-		c.setState(ctx, now, r, Paused, "Paused by "+actor+". Run promote to continue.")
-	} else {
-		c.saveRollout(ctx, r)
+		if r.CurrentBatch() == nil {
+			r.PausePending = false
+			r.State, r.Reason, r.UpdatedAt = Paused, "Paused by "+actor+". Run promote to continue.", now
+		}
+	})
+	if err != nil {
+		return err
 	}
 
-	c.event(ctx, now, &Event{Actor: actor, Action: "pause", Group: r.Group, Rollout: r.ID})
+	c.event(ctx, now, &Event{Actor: actor, Action: "pause", Group: r.Group, Rollout: r.ID, Reason: r.Reason})
 
 	return nil
 }
@@ -238,13 +262,16 @@ func (c *Controller) Promote(ctx context.Context, actor, rolloutID string) error
 		return fmt.Errorf("rollout is %s and not pausing: %w", r.State, ErrState)
 	}
 
-	r.PausePending = false
-	r.Human = true
+	err := c.commit(ctx, r, func() {
+		r.PausePending = false
+		r.Human = true
 
-	if r.State == Paused {
-		c.setState(ctx, now, r, Running, "Promoted by "+actor)
-	} else {
-		c.saveRollout(ctx, r)
+		if r.State == Paused {
+			r.State, r.Reason, r.UpdatedAt = Running, "Promoted by "+actor, now
+		}
+	})
+	if err != nil {
+		return err
 	}
 
 	c.event(ctx, now, &Event{Actor: actor, Action: "promote", Group: r.Group, Rollout: r.ID})
@@ -270,10 +297,16 @@ func (c *Controller) Abort(ctx context.Context, actor, rolloutID string) error {
 		return fmt.Errorf("rollout is %s: %w", r.State, ErrState)
 	}
 
-	c.aborted[r.Group] = desiredKey(r.Desired)
+	key := c.groupDesiredKey(r.Group, c.targets())
+	if err := c.persist(ctx, c.store.SaveAborted(ctx, r.Group, key)); err != nil {
+		return err
+	}
+
+	c.aborted[r.Group] = key
 
 	if b := r.CurrentBatch(); b != nil {
 		b.EndedAt = now
+		b.Soak = cloneSoak(&r.Soak)
 	}
 
 	c.finish(ctx, now, r, Aborted, "Aborted by "+actor)
@@ -301,9 +334,14 @@ func (c *Controller) Retry(ctx context.Context, actor, rolloutID, reason string)
 		return fmt.Errorf("rollout is %s: %w", r.State, ErrState)
 	}
 
-	r.RetryPending = true
-	r.Human = true
-	c.saveRollout(ctx, r)
+	err := c.commit(ctx, r, func() {
+		r.RetryPending = true
+		r.Human = true
+	})
+	if err != nil {
+		return err
+	}
+
 	c.event(ctx, now, &Event{Actor: actor, Action: "retry", Group: r.Group, Rollout: r.ID, Reason: reason})
 	c.Nudge()
 
@@ -330,8 +368,11 @@ func (c *Controller) SetPolicy(ctx context.Context, actor, group string, p Polic
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if err := c.persist(ctx, c.store.SavePolicy(ctx, group, p)); err != nil {
+		return err
+	}
+
 	c.policies[group] = p
-	c.persist(ctx, c.store.SavePolicy(ctx, group, p))
 	c.event(ctx, now, &Event{Actor: actor, Action: "policy", Group: group,
 		Reason: fmt.Sprintf("mode=%s speed=%s pins=%d", p.Mode, p.Speed, len(p.Pins))})
 	c.Nudge()

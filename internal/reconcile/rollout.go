@@ -60,7 +60,7 @@ func (c *Controller) finish(ctx context.Context, now time.Time, r *Rollout, stat
 		}
 	}
 
-	c.saveRollout(ctx, r)
+	_ = c.saveRollout(ctx, r)
 	c.event(ctx, now, &Event{Actor: ControllerActor, Action: "rollout." + lower(state), Group: r.Group, Rollout: r.ID, Reason: reason})
 }
 
@@ -74,14 +74,19 @@ func (c *Controller) openRollouts(ctx context.Context, now time.Time) {
 			continue
 		}
 
-		eligible, desired, from := c.outOfSync(group, set)
-		if len(eligible) == 0 {
-			delete(c.aborted, group)
+		// An abort holds until the group's desired digests change or a person
+		// syncs; a temporary lack of eligible targets does not lift it.
+		if key, aborted := c.aborted[group]; aborted {
+			if key == c.groupDesiredKey(group, set) {
+				continue
+			}
 
-			continue
+			delete(c.aborted, group)
+			_ = c.persist(ctx, c.store.ClearAborted(ctx, group))
 		}
 
-		if c.aborted[group] == desiredKey(desired) {
+		eligible, desired, from := c.outOfSync(group, set)
+		if len(eligible) == 0 {
 			continue
 		}
 
@@ -94,10 +99,29 @@ func (c *Controller) openRollouts(ctx context.Context, now time.Time) {
 		}
 
 		c.rollouts[r.ID] = r
-		c.saveRollout(ctx, r)
+		_ = c.saveRollout(ctx, r)
 		c.event(ctx, now, &Event{Actor: ControllerActor, Action: "rollout.created", Group: group, Rollout: r.ID,
 			Reason: fmt.Sprintf("%d targets to %s (%s)", len(eligible), r.DigestShort(), policy.Speed)})
 	}
+}
+
+// groupDesiredKey identifies what every image in a group currently points at,
+// whether or not any target is out of sync.
+func (c *Controller) groupDesiredKey(group string, set *targets.Set) string {
+	desired := map[string]string{}
+
+	for i := range set.Targets {
+		t := &set.Targets[i]
+		if set.Group(t) != group {
+			continue
+		}
+
+		if d, ok := c.desiredFor(group, t); ok && d.Digest != "" {
+			desired[t.Image] = d.Digest
+		}
+	}
+
+	return desiredKey(desired)
 }
 
 // outOfSync lists the group's targets that should move: desired and live both
@@ -207,7 +231,7 @@ func (c *Controller) newRollout(now time.Time, group string, policy Policy, elig
 }
 
 // inFlightNodes lists every node with a target mid-update across all rollouts,
-// excluding nodes that were already degraded.
+// excluding nodes that were already degraded when their rollout began.
 func (c *Controller) inFlightNodes() map[string]struct{} {
 	nodes := map[string]struct{}{}
 
@@ -223,13 +247,26 @@ func (c *Controller) inFlightNodes() map[string]struct{} {
 
 		for _, id := range b.Targets {
 			rt := r.target(id)
-			if rt != nil && !rt.DegradedBefore && rt.Phase != PhaseSkipped {
+			if rt != nil && rt.Phase != PhaseSkipped && !nodeDegraded(r, rt.Node) {
 				nodes[rt.Node] = struct{}{}
 			}
 		}
 	}
 
 	return nodes
+}
+
+// nodeDegraded reports whether any of the rollout's targets on a node was
+// already degraded when the rollout began; such a node is already disrupted
+// and costs nothing against the budget.
+func nodeDegraded(r *Rollout, node string) bool {
+	for i := range r.Targets {
+		if r.Targets[i].Node == node && r.Targets[i].DegradedBefore {
+			return true
+		}
+	}
+
+	return false
 }
 
 // inFlightWeight is the weight of the in-flight nodes.
@@ -261,12 +298,17 @@ func (c *Controller) startBatch(ctx context.Context, now time.Time, r *Rollout, 
 	preset := c.preset(r.Speed)
 	wave := remaining[0].Wave
 
+	// A wave is a contiguous run of the sorted order; degraded targets sort
+	// first and may carry a later wave number, which must not pull the rest
+	// of that wave ahead of the ones between.
 	var candidates []*RolloutTarget
 
 	for _, rt := range remaining {
-		if rt.Wave == wave || !preset.UsesWaves() {
-			candidates = append(candidates, rt)
+		if rt.Wave != wave && preset.UsesWaves() {
+			break
 		}
+
+		candidates = append(candidates, rt)
 	}
 
 	idx := min(len(r.Batches), len(preset.Batch)-1)
@@ -287,7 +329,7 @@ func (c *Controller) startBatch(ctx context.Context, now time.Time, r *Rollout, 
 		}
 
 		w := set.NodeWeight(rt.Node)
-		if _, already := busy[rt.Node]; rt.DegradedBefore || already {
+		if _, already := busy[rt.Node]; already || nodeDegraded(r, rt.Node) {
 			w = 0
 		}
 
@@ -335,14 +377,8 @@ func (c *Controller) remaining(r *Rollout, set *targets.Set, now time.Time) []*R
 		}
 
 		t, ok := set.Get(rt.ID)
-		if !ok {
-			rt.Phase, rt.Reason = PhaseSkipped, "removed from the targets file"
-
-			continue
-		}
-
-		if s := c.suspensionFor(&t); s != nil {
-			rt.Phase, rt.Reason = PhaseSkipped, "suspended by "+s.Actor+": "+s.Reason
+		if reason, skip := c.skipReason(r, set, &t, ok); skip {
+			rt.Phase, rt.Reason = PhaseSkipped, reason
 
 			continue
 		}
@@ -397,7 +433,7 @@ func (c *Controller) setState(ctx context.Context, now time.Time, r *Rollout, st
 	r.Reason = reason
 	r.UpdatedAt = now
 
-	c.saveRollout(ctx, r)
+	_ = c.saveRollout(ctx, r)
 
 	if changed && state != Running {
 		c.event(ctx, now, &Event{Actor: ControllerActor, Action: "rollout." + lower(state), Group: r.Group, Rollout: r.ID, Reason: reason})

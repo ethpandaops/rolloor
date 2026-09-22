@@ -27,6 +27,10 @@ const (
 	tA1       = "a-1/cl"
 	tA2       = "a-2/cl"
 	tA3       = "a-3/cl"
+	tA4       = "a-4/cl"
+	tA5       = "a-5/cl"
+	tA6       = "a-6/cl"
+	refused   = "no"
 
 	imgA  = "org/a:t"
 	imgB  = "org/b:t"
@@ -156,9 +160,14 @@ func (w *world) Run(_ context.Context, program, hook, targetID string, input any
 			return res, nil
 		}
 
+		// A faithful updater deploys the digest it is told, not the tag head.
 		if !w.updateStuck[targetID] {
-			t, _ := input.(targets.Target)
-			w.running[targetID] = w.registry[t.Image]
+			in, _ := input.(HookInput)
+			if in.Desired != "" {
+				w.running[targetID] = in.Desired
+			} else {
+				w.running[targetID] = w.registry[in.Image]
+			}
 		}
 
 		res.Reason = "update started"

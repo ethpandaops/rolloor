@@ -29,6 +29,8 @@ CREATE TABLE IF NOT EXISTS policies (group_name TEXT PRIMARY KEY, data BLOB NOT 
 CREATE TABLE IF NOT EXISTS suspensions (id TEXT PRIMARY KEY, data BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS live (target_id TEXT PRIMARY KEY, data BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS degraded (target_id TEXT PRIMARY KEY, reason TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS desired (image TEXT PRIMARY KEY, data BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS aborted (group_name TEXT PRIMARY KEY, key TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS events (
 	id INTEGER PRIMARY KEY,
 	at TEXT NOT NULL,
@@ -87,6 +89,8 @@ func (s *SQLite) Load(ctx context.Context) (*reconcile.Snapshot, error) {
 		Policies: map[string]reconcile.Policy{},
 		Live:     map[string]reconcile.Live{},
 		Degraded: map[string]string{},
+		Desired:  map[string]reconcile.Desired{},
+		Aborted:  map[string]string{},
 	}
 
 	if err := s.loadJSON(ctx, `SELECT data FROM rollouts ORDER BY id`, func(raw []byte) error {
@@ -147,6 +151,27 @@ func (s *SQLite) Load(ctx context.Context) (*reconcile.Snapshot, error) {
 		return nil
 	}); err != nil {
 		return nil, fmt.Errorf("store: load degraded: %w", err)
+	}
+
+	if err := s.loadKeyed(ctx, `SELECT image, data FROM desired`, func(key string, raw []byte) error {
+		var d reconcile.Desired
+		if err := json.Unmarshal(raw, &d); err != nil {
+			return err
+		}
+
+		snap.Desired[key] = d
+
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("store: load desired: %w", err)
+	}
+
+	if err := s.loadKeyed(ctx, `SELECT group_name, key FROM aborted`, func(key string, raw []byte) error {
+		snap.Aborted[key] = string(raw)
+
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("store: load aborted: %w", err)
 	}
 
 	var maxID sql.NullInt64
@@ -260,7 +285,7 @@ func (s *SQLite) DeleteSuspension(ctx context.Context, id string) error {
 }
 
 // SaveLive upserts a target's live state.
-func (s *SQLite) SaveLive(ctx context.Context, id string, l reconcile.Live) error {
+func (s *SQLite) SaveLive(ctx context.Context, id string, l *reconcile.Live) error {
 	raw, err := json.Marshal(l)
 	if err != nil {
 		return fmt.Errorf("store: encode live: %w", err)
@@ -295,6 +320,38 @@ func (s *SQLite) SaveDegraded(ctx context.Context, id, reason string) error {
 func (s *SQLite) ClearDegraded(ctx context.Context, id string) error {
 	if _, err := s.db.ExecContext(ctx, `DELETE FROM degraded WHERE target_id = ?`, id); err != nil {
 		return fmt.Errorf("store: clear degraded %s: %w", id, err)
+	}
+
+	return nil
+}
+
+// SaveDesired remembers a tag's last known digest across restarts.
+func (s *SQLite) SaveDesired(ctx context.Context, image string, d reconcile.Desired) error {
+	raw, err := json.Marshal(d)
+	if err != nil {
+		return fmt.Errorf("store: encode desired: %w", err)
+	}
+
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO desired (image, data) VALUES (?, ?) ON CONFLICT(image) DO UPDATE SET data = excluded.data`, image, raw); err != nil {
+		return fmt.Errorf("store: save desired %s: %w", image, err)
+	}
+
+	return nil
+}
+
+// SaveAborted records an abort that must hold across restarts.
+func (s *SQLite) SaveAborted(ctx context.Context, group, key string) error {
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO aborted (group_name, key) VALUES (?, ?) ON CONFLICT(group_name) DO UPDATE SET key = excluded.key`, group, key); err != nil {
+		return fmt.Errorf("store: save aborted %s: %w", group, err)
+	}
+
+	return nil
+}
+
+// ClearAborted lifts an abort.
+func (s *SQLite) ClearAborted(ctx context.Context, group string) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM aborted WHERE group_name = ?`, group); err != nil {
+		return fmt.Errorf("store: clear aborted %s: %w", group, err)
 	}
 
 	return nil

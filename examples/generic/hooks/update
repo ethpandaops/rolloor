@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
-# Recreates the container from the tag's current head.
+# Recreates the container from the digest the controller asks for. Without one
+# (a plain "rolloor hook update" from the shell) the tag's current head is used.
 set -euo pipefail
 
 target=$(cat)
 service=$(jq -r .extra.service <<<"$target")
+ref=$(jq -r '.desiredRef // empty' <<<"$target")
 compose="${ROLLOOR_EXAMPLE_COMPOSE:-examples/generic/docker-compose.yaml}"
 
-docker compose -f "$compose" up -d --pull always --no-deps --force-recreate "$service" >/dev/null 2>&1
-echo "recreated $service"
+if [ -n "$ref" ]; then
+  APP_IMAGE="$ref" docker compose -f "$compose" up -d --no-deps --force-recreate "$service" >/dev/null 2>&1
+else
+  docker compose -f "$compose" up -d --pull always --no-deps --force-recreate "$service" >/dev/null 2>&1
+fi
+
+echo "recreated $service from ${ref:-the tag}"

@@ -176,6 +176,14 @@ func TestResolveComputesDigestWhenHeaderMissing(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, strings.HasPrefix(res.Digest, "sha256:"))
 	require.Len(t, res.Digest, len("sha256:")+64)
+	require.Equal(t, "7b2d0e4", res.Revision)
+
+	// Without a digest header the manifest is fetched again, but the revision
+	// for that digest is already known.
+	again, err := r.Resolve(context.Background(), f.host()+"/org/app:unstable")
+	require.NoError(t, err)
+	require.Equal(t, res.Digest, again.Digest)
+	require.Equal(t, "7b2d0e4", again.Revision)
 }
 
 func TestResolveSingleManifestAndMissingConfig(t *testing.T) {

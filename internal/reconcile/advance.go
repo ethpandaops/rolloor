@@ -40,11 +40,12 @@ type soakRollout struct {
 	Wave  int    `json:"wave"`
 }
 
-// outcome is a job with its result.
+// outcome is a job with its result and when it started.
 type outcome struct {
 	job
-	res hooks.Result
-	err error
+	res     hooks.Result
+	err     error
+	started time.Time
 }
 
 // planRollouts decides, under the lock, which hooks to run for every active
@@ -109,6 +110,7 @@ func (c *Controller) retryBatch(ctx context.Context, now time.Time, r *Rollout) 
 
 	b := &r.Batches[len(r.Batches)-1]
 	b.EndedAt = time.Time{}
+	b.Soak = nil
 
 	for _, id := range b.Targets {
 		rt := r.target(id)
@@ -116,15 +118,16 @@ func (c *Controller) retryBatch(ctx context.Context, now time.Time, r *Rollout) 
 			rt.Phase, rt.Reason = PhaseReady, "retrying"
 
 			delete(c.degraded, id)
-			c.persist(ctx, c.store.ClearDegraded(ctx, id))
+			_ = c.persist(ctx, c.store.ClearDegraded(ctx, id))
 		}
 	}
 
 	c.setState(ctx, now, r, Soaking, fmt.Sprintf("Retrying the soak for batch %d.", b.Number))
 }
 
-// planBatch moves each target in the open batch one step: update, then wait
-// for the digest to land, then ready.
+// planBatch moves each target in the open batch one step: dispatch the
+// update, wait for the digest to land, then ready. A target that has since
+// been suspended, removed or moved to another group is skipped where it is.
 func (c *Controller) planBatch(ctx context.Context, now time.Time, r *Rollout, set *targets.Set) []job {
 	b := r.CurrentBatch()
 
@@ -134,10 +137,10 @@ func (c *Controller) planBatch(ctx context.Context, now time.Time, r *Rollout, s
 
 	for _, id := range b.Targets {
 		rt := r.target(id)
-		t, ok := set.Get(id)
 
-		if !ok {
-			rt.Phase, rt.Reason = PhaseSkipped, "removed from the targets file"
+		t, ok := set.Get(id)
+		if reason, skip := c.skipReason(r, set, &t, ok); skip && (rt.Phase == PhasePending || rt.Phase == PhaseUpdating) {
+			rt.Phase, rt.Reason = PhaseSkipped, reason
 
 			continue
 		}
@@ -145,9 +148,16 @@ func (c *Controller) planBatch(ctx context.Context, now time.Time, r *Rollout, s
 		switch rt.Phase {
 		case PhasePending:
 			allReady = false
+			rt.Phase, rt.Reason, rt.UpdatedAt = PhaseUpdating, "update running", now
 
-			jobs = append(jobs, job{rollout: r.ID, target: id, hook: config.HookUpdate, program: c.programFor(&t, config.HookUpdate), input: t})
+			jobs = append(jobs, job{rollout: r.ID, target: id, hook: config.HookUpdate, program: c.programFor(&t, config.HookUpdate), input: c.hookInput(set, &t)})
 		case PhaseUpdating:
+			if rt.Updated && r.Force {
+				rt.Phase, rt.Reason = PhaseReady, "ready (forced)"
+
+				continue
+			}
+
 			allReady = false
 
 			if deadline := c.cfg.Hooks.Timeout * 5; now.Sub(rt.UpdatedAt) > deadline {
@@ -161,11 +171,15 @@ func (c *Controller) planBatch(ctx context.Context, now time.Time, r *Rollout, s
 				return nil
 			}
 
+			// The update result lands in the tick that dispatched it, so an
+			// Updating target here is past its update: it is inspected until the
+			// digest shows, then asked for readiness.
+			hook := config.HookReady
 			if !rt.Updated {
-				jobs = append(jobs, job{rollout: r.ID, target: id, hook: config.HookInspect, program: c.programFor(&t, config.HookInspect), input: t})
-			} else {
-				jobs = append(jobs, job{rollout: r.ID, target: id, hook: config.HookReady, program: c.programFor(&t, config.HookReady), input: t})
+				hook = config.HookInspect
 			}
+
+			jobs = append(jobs, job{rollout: r.ID, target: id, hook: hook, program: c.programFor(&t, hook), input: c.hookInput(set, &t)})
 		case PhaseReady, PhasePassed, PhaseSkipped, PhaseFailed:
 		}
 	}
@@ -175,6 +189,23 @@ func (c *Controller) planBatch(ctx context.Context, now time.Time, r *Rollout, s
 	}
 
 	return jobs
+}
+
+// skipReason says why a rollout target can no longer be worked on, if so.
+func (c *Controller) skipReason(r *Rollout, set *targets.Set, t *targets.Target, present bool) (string, bool) {
+	if !present {
+		return "removed from the targets file", true
+	}
+
+	if set.Group(t) != r.Group {
+		return "moved to group " + set.Group(t), true
+	}
+
+	if s := c.suspensionFor(t); s != nil {
+		return "suspended by " + s.Actor + ": " + s.Reason, true
+	}
+
+	return "", false
 }
 
 // batchReady is called once every target in the batch is ready: either the
@@ -192,9 +223,15 @@ func (c *Controller) batchReady(ctx context.Context, now time.Time, r *Rollout, 
 	c.setState(ctx, now, r, Soaking, fmt.Sprintf("Batch %d in soak for %s.", r.CurrentBatch().Number, preset.Soak.Duration))
 }
 
-// batchHasSoak reports whether any target in the open batch names a soak program.
+// batchHasSoak reports whether any target still active in the open batch
+// names a soak program.
 func (c *Controller) batchHasSoak(r *Rollout, set *targets.Set) bool {
 	for _, id := range r.CurrentBatch().Targets {
+		rt := r.target(id)
+		if rt.Phase == PhaseSkipped {
+			continue
+		}
+
 		if t, ok := set.Get(id); ok && c.programFor(&t, config.HookSoak) != "" {
 			return true
 		}
@@ -204,16 +241,31 @@ func (c *Controller) batchHasSoak(r *Rollout, set *targets.Set) bool {
 }
 
 // planSoak runs the soak programs when a check is due, and passes the batch
-// once the streak and duration are met.
+// once the streak and duration are met on evidence no older than two
+// intervals. A forced rollout, or a batch with no soak programs left, passes
+// at once.
 func (c *Controller) planSoak(ctx context.Context, now time.Time, r *Rollout, set *targets.Set) []job {
 	preset := c.preset(r.Speed)
 	b := r.CurrentBatch()
+
+	if r.Force {
+		c.passBatch(ctx, now, r, "forced")
+
+		return nil
+	}
+
+	if !c.batchHasSoak(r, set) {
+		c.passBatch(ctx, now, r, "no soak programs left in the batch")
+
+		return nil
+	}
 
 	if !r.Soak.LastCheckAt.IsZero() && now.Sub(r.Soak.LastCheckAt) < preset.Soak.Interval {
 		return nil
 	}
 
-	if r.Soak.Streak >= preset.Soak.Passes && now.Sub(r.Soak.StartedAt) >= preset.Soak.Duration {
+	fresh := !r.Soak.LastCheckAt.IsZero() && now.Sub(r.Soak.LastCheckAt) <= 2*preset.Soak.Interval
+	if fresh && r.Soak.Streak >= preset.Soak.PassesN() && now.Sub(r.Soak.StartedAt) >= preset.Soak.Duration {
 		c.passBatch(ctx, now, r, fmt.Sprintf("%d checks passed", r.Soak.Streak))
 
 		return nil
@@ -223,6 +275,11 @@ func (c *Controller) planSoak(ctx context.Context, now time.Time, r *Rollout, se
 	byProgramIDs := map[string][]string{}
 
 	for _, id := range b.Targets {
+		rt := r.target(id)
+		if rt.Phase == PhaseSkipped {
+			continue
+		}
+
 		t, ok := set.Get(id)
 		if !ok {
 			continue
@@ -288,11 +345,13 @@ func (c *Controller) remainingForSoak(r *Rollout, set *targets.Set, prog string)
 	return out
 }
 
-// passBatch closes the open batch as passed and decides what comes next.
+// passBatch closes the open batch as passed, keeps its soak with it, and
+// decides what comes next.
 func (c *Controller) passBatch(ctx context.Context, now time.Time, r *Rollout, why string) {
 	b := r.CurrentBatch()
 	b.EndedAt = now
 	b.Passed = true
+	b.Soak = cloneSoak(&r.Soak)
 
 	for _, id := range b.Targets {
 		rt := r.target(id)
@@ -300,9 +359,9 @@ func (c *Controller) passBatch(ctx context.Context, now time.Time, r *Rollout, w
 			rt.Phase, rt.Reason = PhasePassed, why
 		}
 
-		if _, was := c.degraded[id]; was {
+		if _, was := c.degraded[id]; was && rt.Phase == PhasePassed {
 			delete(c.degraded, id)
-			c.persist(ctx, c.store.ClearDegraded(ctx, id))
+			_ = c.persist(ctx, c.store.ClearDegraded(ctx, id))
 		}
 	}
 
@@ -321,6 +380,13 @@ func (c *Controller) passBatch(ctx context.Context, now time.Time, r *Rollout, w
 	c.setState(ctx, now, r, Running, fmt.Sprintf("Batch %d passed.", b.Number))
 }
 
+func cloneSoak(s *SoakProgress) *SoakProgress {
+	cp := *s
+	cp.Checks = append([]SoakCheck(nil), s.Checks...)
+
+	return &cp
+}
+
 func (c *Controller) hasRemaining(r *Rollout) bool {
 	for _, rt := range r.Targets {
 		if rt.Batch == 0 && rt.Phase == PhasePending {
@@ -335,6 +401,7 @@ func (c *Controller) hasRemaining(r *Rollout) bool {
 func (c *Controller) halt(ctx context.Context, now time.Time, r *Rollout, culprit, why string) {
 	b := r.CurrentBatch()
 	b.EndedAt = now
+	b.Soak = cloneSoak(&r.Soak)
 
 	for _, id := range b.Targets {
 		rt := r.target(id)
@@ -349,7 +416,7 @@ func (c *Controller) halt(ctx context.Context, now time.Time, r *Rollout, culpri
 
 		rt.Phase, rt.Reason = PhaseFailed, reason
 		c.degraded[id] = reason
-		c.persist(ctx, c.store.SaveDegraded(ctx, id, reason))
+		_ = c.persist(ctx, c.store.SaveDegraded(ctx, id, reason))
 	}
 
 	msg := fmt.Sprintf("Halted at batch %d: %s. %d targets left running %s for debugging.", b.Number, why, len(b.Targets), r.DigestShort())
@@ -371,10 +438,11 @@ func (c *Controller) execute(ctx context.Context, jobs []job) []outcome {
 
 	for i, j := range jobs {
 		g.Go(func() error {
+			started := c.clock.Now()
 			res, err := c.runner.Run(gctx, j.program, j.hook, j.target, j.input)
 
 			mu.Lock()
-			out[i] = outcome{job: j, res: res, err: err}
+			out[i] = outcome{job: j, res: res, err: err, started: started}
 			mu.Unlock()
 
 			return nil
@@ -386,7 +454,9 @@ func (c *Controller) execute(ctx context.Context, jobs []job) []outcome {
 	return out
 }
 
-// applyResults folds hook outcomes back into rollout state.
+// applyResults folds hook outcomes back into rollout state. A result for a
+// rollout that has since closed, or a target that has since been skipped, is
+// dropped.
 func (c *Controller) applyResults(ctx context.Context, now time.Time, results []outcome) {
 	touched := map[string]*Rollout{}
 	soaks := map[string][]outcome{}
@@ -423,18 +493,17 @@ func (c *Controller) applyResults(ctx context.Context, now time.Time, results []
 
 	for _, r := range touched {
 		if r.State.Active() {
-			c.saveRollout(ctx, r)
+			_ = c.saveRollout(ctx, r)
 		}
 	}
 }
-
 func (c *Controller) applyTargetResult(ctx context.Context, now time.Time, r *Rollout, o *outcome) {
 	if r.State != Running {
 		return
 	}
 
 	rt := r.target(o.target)
-	if rt == nil {
+	if rt == nil || rt.Phase != PhaseUpdating {
 		return
 	}
 
@@ -446,10 +515,10 @@ func (c *Controller) applyTargetResult(ctx context.Context, now time.Time, r *Ro
 			return
 		}
 
-		rt.Phase, rt.UpdatedAt, rt.Reason = PhaseUpdating, now, "update started"
+		rt.UpdateDone, rt.Reason = true, "update started, waiting for the digest"
 	case config.HookInspect:
 		digest := strings.TrimSpace(o.res.Reason)
-		c.setLiveLocked(ctx, now, o.target, digest, o.res.OK, o.res.Reason)
+		c.setLiveLocked(ctx, now, o.started, o.target, digest, o.res.OK, o.res.Reason)
 
 		t, _ := c.targets().Get(o.target)
 		if o.res.OK && digest == r.Desired[t.Image] {
@@ -499,14 +568,20 @@ func (c *Controller) applySoak(ctx context.Context, now time.Time, r *Rollout, o
 		r.Soak.Failures++
 	}
 
-	if r.Soak.Failures > preset.Soak.Grace {
+	if r.Force {
+		c.passBatch(ctx, now, r, "forced")
+
+		return
+	}
+
+	if r.Soak.Failures > preset.Soak.GraceN() {
 		last := r.Soak.Checks[len(r.Soak.Checks)-1]
 		c.halt(ctx, now, r, "", fmt.Sprintf("soak %s failed %d times: %s", last.Program, r.Soak.Failures, last.Reason))
 
 		return
 	}
 
-	if r.Soak.Streak >= preset.Soak.Passes && now.Sub(r.Soak.StartedAt) >= preset.Soak.Duration {
+	if r.Soak.Streak >= preset.Soak.PassesN() && now.Sub(r.Soak.StartedAt) >= preset.Soak.Duration {
 		c.passBatch(ctx, now, r, fmt.Sprintf("%d checks passed", r.Soak.Streak))
 
 		return
@@ -517,7 +592,7 @@ func (c *Controller) applySoak(ctx context.Context, now time.Time, r *Rollout, o
 		left = 0
 	}
 
-	c.setState(ctx, now, r, Soaking, fmt.Sprintf("Batch %d in soak, %s left, %d of %d checks passed.", r.CurrentBatch().Number, left.Round(time.Second), r.Soak.Streak, preset.Soak.Passes))
+	c.setState(ctx, now, r, Soaking, fmt.Sprintf("Batch %d in soak, %s left, %d of %d checks passed.", r.CurrentBatch().Number, left.Round(time.Second), r.Soak.Streak, preset.Soak.PassesN()))
 }
 
 // parseSoakNumbers reads the optional second stdout line

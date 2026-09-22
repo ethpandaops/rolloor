@@ -1,0 +1,37 @@
+{{define "fleet"}}
+<div id="fleet" hx-get="/{{if .ShowHidden}}?hidden=1{{end}}" hx-trigger="every 5s" hx-swap="outerHTML">
+<div class="bar">
+  <div class="env-check {{if .Fleet.EnvOK}}ok{{else}}bad{{end}}">
+    {{if .Fleet.EnvCheck}}
+      {{if .Fleet.EnvOK}}Environment check passing.{{if .Fleet.EnvReason}} {{.Fleet.EnvReason}}{{end}} Automated rollouts may run.
+      {{else}}Environment check failing: {{.Fleet.EnvReason}}. Automated rollouts are paused; a person may still sync.{{end}}
+    {{else}}No environment check configured.{{end}}
+  </div>
+  <div class="budget">Budget: {{.Fleet.BudgetInUse}} of {{.Fleet.Budget}} in use</div>
+</div>
+
+{{range .Sections}}
+<h2 class="section">{{if .Name}}{{.Name}}{{else}}groups{{end}}</h2>
+<div class="tiles">
+{{range .Groups}}
+  <a class="tile health-{{lower (printf "%s" .Health)}}" href="/groups/{{$.GroupLabel}}/{{.Name}}">
+    <div class="tile-head"><span class="name">{{.Name}}</span><span class="count">{{.Targets}} targets</span></div>
+    <div class="badges">{{template "sync-badge" .Sync}} {{template "health-badge" .Health}}</div>
+    {{if .Rollout}}<div class="progress"><b>{{.Rollout.OnNewBuild}} of {{.Rollout.Total}}</b> on {{.Rollout.Digest}}{{if .Rollout.Revision}} ({{.Rollout.Revision}}){{end}}</div>{{end}}
+    <div class="reason">{{.Reason}}</div>
+  </a>
+{{end}}
+</div>
+{{end}}
+
+{{if .Hidden}}
+<p class="hidden-note">The workload config hides {{len .Hidden}} groups: {{range $i, $g := .Hidden}}{{if $i}}, {{end}}{{$g.Name}}{{end}}. <a href="/?hidden=1">Show them</a></p>
+{{else if .ShowHidden}}
+<p class="hidden-note"><a href="/">Hide the operator groups again</a></p>
+{{end}}
+
+{{if .Fleet.Resolve}}
+<div class="flash bad">Registry errors: {{range $img, $err := .Fleet.Resolve}}<span>{{$img}}: {{$err}}</span> {{end}}</div>
+{{end}}
+</div>
+{{end}}

@@ -1,7 +1,7 @@
 name: rolloor-example
 
 x-app: &app
-  image: localhost:5050/app:latest
+  image: ${APP_IMAGE:-localhost:5050/app:latest}
   pull_policy: always
   restart: unless-stopped
 

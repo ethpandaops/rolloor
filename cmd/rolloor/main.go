@@ -31,6 +31,7 @@ import (
 	"github.com/ethpandaops/rolloor/internal/registry"
 	"github.com/ethpandaops/rolloor/internal/store"
 	"github.com/ethpandaops/rolloor/internal/targets"
+	"github.com/ethpandaops/rolloor/internal/ui"
 )
 
 // version is set at build time.
@@ -196,7 +197,13 @@ func runHook(ctx context.Context, out interface{ Write([]byte) (int, error) }, c
 			return fmt.Errorf("target %q is not in the targets files", targetID)
 		}
 
-		input = t
+		// The controller adds the desired digest at runtime; here the target
+		// stands alone. Soak receives the document the controller sends, with
+		// this target as the whole updated set.
+		input = reconcile.HookInput{Target: t}
+		if hook == config.HookSoak {
+			input = map[string]any{"updated": []targets.Target{t}, "remaining": []targets.Target{}, "rollout": map[string]any{"id": "manual", "group": set.Group(&t), "batch": 1, "wave": set.Wave(&t)}}
+		}
 
 		if program == "" {
 			program = t.Probes[hook]
@@ -275,7 +282,17 @@ func serve(ctx context.Context, configPath string) error {
 	var controller *reconcile.Controller
 
 	watcher, err := targets.NewWatcher(cfg.TargetsDir, rulesFor(cfg), watchEvery, log,
-		func(set *targets.Set) { forgetRemoved(ctx, controller, set) }, nil)
+		func(old, current *targets.Set) {
+			if controller != nil {
+				controller.ReportTargetsError(ctx, nil)
+				forgetRemoved(ctx, controller, old, current)
+			}
+		},
+		func(err error) {
+			if controller != nil {
+				controller.ReportTargetsError(ctx, err)
+			}
+		})
 	if err != nil {
 		return err
 	}
@@ -292,9 +309,27 @@ func serve(ctx context.Context, configPath string) error {
 
 	server := api.New(cfg, controller, watcher.Current, authorizer, events, version, log)
 
+	var loginURL func(string) string
+	if cfg.Auth.Mode != "none" {
+		loginURL = auth.LoginURL
+	}
+
+	pages, err := ui.New(cfg, controller, watcher.Current, authorizer, loginURL, version, log)
+	if err != nil {
+		return err
+	}
+
+	// The API and the pages share one identity middleware, which also mounts
+	// the login routes when OIDC is on. Metrics stay outside it.
+	routes := server.Routes()
+	app := http.NewServeMux()
+	app.Handle("/healthz", routes)
+	app.Handle("/api/", routes)
+	app.Handle("/", pages.Handler())
+
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
-	mux.Handle("/", server.Handler())
+	mux.Handle("/", authorizer.Middleware(app))
 
 	httpServer := &http.Server{Addr: cfg.Listen, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 
@@ -373,19 +408,14 @@ func buildAuthorizer(ctx context.Context, cfg *config.Config, log observability.
 	return oidcAuth, teams, nil
 }
 
-// forgetRemoved drops live state for targets that left the files.
-func forgetRemoved(ctx context.Context, c *reconcile.Controller, set *targets.Set) {
-	if c == nil {
-		return
-	}
-
+// forgetRemoved drops live state for targets that were in the old set and
+// are not in the new one.
+func forgetRemoved(ctx context.Context, c *reconcile.Controller, old, current *targets.Set) {
 	var gone []string
 
-	views := c.Targets(nil)
-
-	for i := range views {
-		if _, ok := set.Get(views[i].ID); !ok {
-			gone = append(gone, views[i].ID)
+	for i := range old.Targets {
+		if _, ok := current.Get(old.Targets[i].ID); !ok {
+			gone = append(gone, old.Targets[i].ID)
 		}
 	}
 

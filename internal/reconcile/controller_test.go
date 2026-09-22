@@ -13,7 +13,10 @@ import (
 	"github.com/ethpandaops/rolloor/internal/targets"
 )
 
-var errFake = errors.New("fake")
+var (
+	errFake  = errors.New("fake")
+	errOther = errors.New("other")
+)
 
 func mustSel(s string) targets.Selector {
 	sel, err := targets.ParseSelector(s)
@@ -225,7 +228,7 @@ func TestMemoryStoreEventsFilterAndFail(t *testing.T) {
 	require.Len(t, got, 2)
 
 	require.NoError(t, m.SaveDegraded(ctx, "t", "why"))
-	require.NoError(t, m.SaveLive(ctx, "t", Live{Digest: d1}))
+	require.NoError(t, m.SaveLive(ctx, "t", &Live{Digest: d1}))
 	snap, err := m.Load(ctx)
 	require.NoError(t, err)
 	require.Equal(t, "why", snap.Degraded["t"])
@@ -238,11 +241,14 @@ func TestMemoryStoreEventsFilterAndFail(t *testing.T) {
 	require.ErrorIs(t, m.SavePolicy(ctx, "g", Policy{}), errFake)
 	require.ErrorIs(t, m.SaveSuspension(ctx, &Suspension{}), errFake)
 	require.ErrorIs(t, m.DeleteSuspension(ctx, "x"), errFake)
-	require.ErrorIs(t, m.SaveLive(ctx, "x", Live{}), errFake)
+	require.ErrorIs(t, m.SaveLive(ctx, "x", &Live{}), errFake)
 	require.ErrorIs(t, m.DeleteLive(ctx, "x"), errFake)
 	require.ErrorIs(t, m.SaveDegraded(ctx, "x", ""), errFake)
 	require.ErrorIs(t, m.ClearDegraded(ctx, "x"), errFake)
 	require.ErrorIs(t, m.AppendEvent(ctx, &Event{}), errFake)
+	require.ErrorIs(t, m.SaveDesired(ctx, "img", Desired{}), errFake)
+	require.ErrorIs(t, m.SaveAborted(ctx, "g", "k"), errFake)
+	require.ErrorIs(t, m.ClearAborted(ctx, "g"), errFake)
 	_, err = m.Events(ctx, EventQuery{})
 	require.ErrorIs(t, err, errFake)
 	_, err = m.Load(ctx)

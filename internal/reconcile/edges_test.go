@@ -114,7 +114,7 @@ func TestHaltSkipsRemovedTargetInBatch(t *testing.T) {
 func TestFirstUpdateFailureHaltsBeforeSecondResultLands(t *testing.T) {
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
-	h.world.set(func(w *world) { w.updateFail[tA1] = "no" })
+	h.world.set(func(w *world) { w.updateFail[tA1] = refused })
 	h.release(imgA, d2)
 	h.tick()
 

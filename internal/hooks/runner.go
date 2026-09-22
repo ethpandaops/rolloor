@@ -29,6 +29,41 @@ type Result struct {
 	RanAt    time.Time     `json:"ranAt"`
 }
 
+// maxCapture bounds how much of a hook's stdout and stderr is kept. The
+// contract only needs the first lines; the rest is drained and dropped.
+const maxCapture = 64 << 10
+
+// capped keeps the first limit bytes written and counts the rest.
+type capped struct {
+	buf     bytes.Buffer
+	limit   int
+	dropped int
+}
+
+func (c *capped) Write(p []byte) (int, error) {
+	n := len(p)
+
+	room := c.limit - c.buf.Len()
+	if room <= 0 {
+		c.dropped += n
+
+		return n, nil
+	}
+
+	if n > room {
+		c.dropped += n - room
+		p = p[:room]
+	}
+
+	c.buf.Write(p)
+
+	return n, nil
+}
+
+func (c *capped) String() string { return c.buf.String() }
+
+func (c *capped) Len() int { return c.buf.Len() }
+
 // Runner executes programs from one directory with one timeout.
 type Runner struct {
 	dir         string
@@ -85,10 +120,11 @@ func (r *Runner) Run(ctx context.Context, program, hook, targetID string, input 
 		"ROLLOOR_TARGET_ID="+targetID,
 	)
 
-	var stdout, stderr bytes.Buffer
+	stdout := &capped{limit: maxCapture}
+	stderr := &capped{limit: maxCapture}
 
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 
 	start := time.Now()
 	runErr := cmd.Run()

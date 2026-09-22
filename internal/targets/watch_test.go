@@ -23,7 +23,11 @@ func TestWatcherReloadsOnChangeAndKeepsLastGoodOnError(t *testing.T) {
 	errs := make(chan error, 4)
 
 	w, err := NewWatcher(dir, &testRules, 10*time.Millisecond, logrus.New(),
-		func(s *Set) { changes <- s }, func(err error) { errs <- err })
+		func(old, s *Set) {
+			require.NotNil(t, old)
+
+			changes <- s
+		}, func(err error) { errs <- err })
 	require.NoError(t, err)
 	require.Equal(t, 1, w.Current().Len())
 

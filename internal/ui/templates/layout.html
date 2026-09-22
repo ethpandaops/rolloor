@@ -1,0 +1,31 @@
+{{define "layout"}}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Title}} / {{.Env}} / rolloor</title>
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/htmx.min.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <div class="brand"><a href="/">rolloor</a> <span class="sep">/</span> <span class="env">{{.Env}}</span></div>
+  <nav>
+    <a href="/" {{if eq .Path "/"}}class="on"{{end}}>Fleet</a>
+    <a href="/rollouts" {{if eq .Path "/rollouts"}}class="on"{{end}}>Rollouts</a>
+    <a href="/history" {{if eq .Path "/history"}}class="on"{{end}}>History</a>
+  </nav>
+  <div class="viewer">{{if .SignedIn}}{{.Viewer.Name}}{{else if .LoginURL}}<a href="{{.LoginURL}}">Sign in</a>{{end}}</div>
+</header>
+{{if .Flash}}<div class="flash ok">{{.Flash}}</div>{{end}}
+{{if .Error}}<div class="flash bad">{{.Error}}</div>{{end}}
+<main>{{.Body}}</main>
+<footer>rolloor {{.Version}}</footer>
+</body>
+</html>{{end}}
+
+{{define "sync-badge"}}<span class="badge sync-{{lower (printf "%s" .)}}">{{.}}</span>{{end}}
+{{define "health-badge"}}<span class="badge health-{{lower (printf "%s" .)}}">{{.}}</span>{{end}}
+{{define "state-badge"}}<span class="badge state-{{lower (printf "%s" .)}}">{{.}}</span>{{end}}
+
+{{define "disabled-why"}}{{if not .OK}}<span class="why">{{.Why}}, so these are view-only for you.</span>{{end}}{{end}}

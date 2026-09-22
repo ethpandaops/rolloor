@@ -111,6 +111,11 @@ func (r *Resolver) loadAuth(path string) error {
 		host = strings.TrimSuffix(host, "/v1/")
 		host = strings.TrimSuffix(host, "/")
 
+		// Docker writes Hub credentials under index.docker.io; images name docker.io.
+		if host == "index.docker.io" || host == dockerHubAPIHost {
+			host = dockerHubHost
+		}
+
 		switch {
 		case a.Auth != "":
 			dec, err := base64.StdEncoding.DecodeString(a.Auth)
@@ -135,14 +140,33 @@ func (r *Resolver) Resolve(ctx context.Context, ref string) (Resolved, error) {
 		return Resolved{}, err
 	}
 
-	digest, body, err := r.manifest(ctx, parsed, parsed.Tag)
+	// A HEAD gives the digest cheaply; an unchanged tag whose revision is
+	// already cached costs nothing more than that.
+	digest, err := r.head(ctx, parsed)
 	if err != nil {
 		return Resolved{}, err
 	}
 
 	res := Resolved{Digest: digest, At: time.Now()}
 
-	rev, err := r.revision(ctx, parsed, digest, body)
+	r.mu.Lock()
+	rev, cached := r.revisions[digest]
+	r.mu.Unlock()
+
+	if digest != "" && cached {
+		res.Revision = rev
+
+		return res, nil
+	}
+
+	digest, body, err := r.manifest(ctx, parsed, parsed.Tag)
+	if err != nil {
+		return Resolved{}, err
+	}
+
+	res.Digest = digest
+
+	rev, err = r.revision(ctx, parsed, digest, body)
 	if err != nil {
 		r.log.WithContext(ctx).WithError(err).WithField("image", ref).Debug("revision label unavailable")
 	} else {
@@ -150,6 +174,19 @@ func (r *Resolver) Resolve(ctx context.Context, ref string) (Resolved, error) {
 	}
 
 	return res, nil
+}
+
+// head returns the tag's digest from a HEAD request, or "" when the registry
+// sends none, in which case the manifest is fetched.
+func (r *Resolver) head(ctx context.Context, ref Reference) (string, error) {
+	resp, err := r.do(ctx, ref, http.MethodHead, r.baseURL(ref)+"/manifests/"+ref.Tag, acceptManifests)
+	if err != nil {
+		return "", err
+	}
+
+	resp.Body.Close()
+
+	return resp.Header.Get("Docker-Content-Digest"), nil
 }
 
 // manifest fetches a manifest by tag or digest and returns its digest and body.

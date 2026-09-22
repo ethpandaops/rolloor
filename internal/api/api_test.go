@@ -55,8 +55,8 @@ func (f *fakeWorld) Run(_ context.Context, program, hook, id string, input any) 
 	case config.HookInspect:
 		res.Reason = f.running[id]
 	case config.HookUpdate:
-		if _, ok := input.(targets.Target); ok {
-			f.running[id] = f.digest
+		if in, ok := input.(reconcile.HookInput); ok {
+			f.running[id] = in.Desired
 		}
 	}
 
@@ -80,6 +80,8 @@ const fleetYAML = `
 - {id: a-1/cl, node: a-1, weight: 0,   image: org/a:t, labels: {client: a, owner: a, wave: "0"}}
 - {id: a-2/cl, node: a-2, weight: 100, image: org/a:t, labels: {client: a, owner: a, wave: "1"}}
 - {id: b-1/el, node: a-2, weight: 100, image: org/b:t, labels: {client: b, owner: b, wave: "1"}}
+- {id: c-1/x,  node: c-1, weight: 0,   image: org/c:t, labels: {client: c, owner: a, wave: "0"}}
+- {id: c-2/x,  node: c-2, weight: 0,   image: org/c:t, labels: {client: c, owner: b, wave: "0"}}
 `
 
 type fixture struct {
@@ -104,7 +106,7 @@ func newFixture(t *testing.T) *fixture {
 	require.NoError(t, err)
 
 	f := &fixture{t: t, ctx: context.Background(), store: reconcile.NewMemoryStore(), set: set,
-		world: &fakeWorld{digest: d1, running: map[string]string{"a-1/cl": d1, "a-2/cl": d1, "b-1/el": d1}},
+		world: &fakeWorld{digest: d1, running: map[string]string{"a-1/cl": d1, "a-2/cl": d1, "b-1/el": d1, "c-1/x": d1, "c-2/x": d1}},
 		auth:  &fakeAuth{id: Identity{Name: "sam", Admin: true}}, bc: NewBroadcaster()}
 
 	ids := 0
@@ -209,6 +211,13 @@ func TestReadRoutes(t *testing.T) {
 	code, _, raw = f.do(http.MethodGet, "/api/v1/history?node=a-2", "")
 	require.Equal(t, http.StatusOK, code)
 	require.Equal(t, "[]\n", raw)
+
+	code, _, _ = f.do(http.MethodGet, "/api/v1/history?selector=nope", "")
+	require.Equal(t, http.StatusBadRequest, code)
+
+	code, _, raw = f.do(http.MethodGet, "/api/v1/history?selector=client=a", "")
+	require.Equal(t, http.StatusOK, code)
+	require.Equal(t, "[]\n", raw, "digest events name images, not targets")
 
 	code, _, _ = f.do(http.MethodGet, "/api/v1/policies/zzz", "")
 	require.Equal(t, http.StatusNotFound, code)
@@ -341,6 +350,28 @@ func TestAuthorization(t *testing.T) {
 	require.Equal(t, http.StatusForbidden, code)
 
 	code, _, _ = f.do(http.MethodPost, "/api/v1/actions/sync", `{"selector": "client=b"}`)
+	require.Equal(t, http.StatusOK, code)
+
+	// A sync acts on whole groups, so owning the selected target is not enough
+	// when its group has targets from other owners.
+	code, body, _ = f.do(http.MethodPost, "/api/v1/actions/sync", `{"selector": "id=c-2/x"}`)
+	require.Equal(t, http.StatusForbidden, code)
+	require.Equal(t, "you're not listed under a", body["error"])
+
+	// Suspend acts only on the selection, so that same target is fine.
+	code, _, _ = f.do(http.MethodPost, "/api/v1/actions/suspend", `{"selector": "id=c-2/x", "reason": "x"}`)
+	require.Equal(t, http.StatusOK, code)
+
+	// Lifting a suspension that spans two owners needs the confirmation too.
+	f.auth.id = Identity{Name: "sam", Admin: true}
+	code, _, _ = f.do(http.MethodPost, "/api/v1/actions/suspend", `{"selector": "client=c", "reason": "x", "confirm": true}`)
+	require.Equal(t, http.StatusOK, code)
+
+	code, body, _ = f.do(http.MethodPost, "/api/v1/actions/resume", `{"selector": "client=c"}`)
+	require.Equal(t, http.StatusConflict, code)
+	require.Equal(t, "confirm_required", body["code"])
+
+	code, _, _ = f.do(http.MethodPost, "/api/v1/actions/resume", `{"selector": "client=c", "confirm": true}`)
 	require.Equal(t, http.StatusOK, code)
 
 	// No identity at all is a 401 on every route that needs one.

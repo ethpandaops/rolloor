@@ -154,7 +154,7 @@ func TestServeRunsAndStops(t *testing.T) {
 		return resp.StatusCode == http.StatusOK
 	}, 10*time.Second, 20*time.Millisecond)
 
-	for _, path := range []string{"/metrics", "/api/v1/fleet", "/api/v1/targets"} {
+	for _, path := range []string{"/metrics", "/api/v1/fleet", "/api/v1/targets", "/", "/rollouts", "/history", "/static/style.css"} {
 		resp, err := client.Get("http://" + addr + path)
 		require.NoError(t, err)
 		resp.Body.Close()

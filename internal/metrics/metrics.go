@@ -15,6 +15,7 @@ const (
 	namespace  = "rolloor"
 	labelID    = "id"
 	labelGroup = "group"
+	labelHook  = "hook"
 )
 
 // Collector reads the controller's views on every scrape. Target ids are
@@ -29,6 +30,7 @@ type Collector struct {
 	budgetRatio  *prometheus.Desc
 	envPassing   *prometheus.Desc
 	envCheckedAt *prometheus.Desc
+	lastTick     *prometheus.Desc
 }
 
 var _ prometheus.Collector = (*Collector)(nil)
@@ -44,12 +46,13 @@ func NewCollector(c *reconcile.Controller) *Collector {
 		budgetRatio:  prometheus.NewDesc(namespace+"_budget_ratio", "In-flight weight over the budget.", nil, nil),
 		envPassing:   prometheus.NewDesc(namespace+"_environment_check_passing", "1 when the environment check passes.", nil, nil),
 		envCheckedAt: prometheus.NewDesc(namespace+"_environment_checked_at_seconds", "When the environment check last ran.", nil, nil),
+		lastTick:     prometheus.NewDesc(namespace+"_last_tick_timestamp_seconds", "When the reconcile loop last completed a pass.", nil, nil),
 	}
 }
 
 // Describe sends every descriptor.
 func (m *Collector) Describe(ch chan<- *prometheus.Desc) {
-	for _, d := range []*prometheus.Desc{m.targetInfo, m.targetSync, m.targetHealth, m.rolloutState, m.budgetRatio, m.envPassing, m.envCheckedAt} {
+	for _, d := range []*prometheus.Desc{m.targetInfo, m.targetSync, m.targetHealth, m.rolloutState, m.budgetRatio, m.envPassing, m.envCheckedAt, m.lastTick} {
 		ch <- d
 	}
 }
@@ -92,6 +95,7 @@ func (m *Collector) Collect(ch chan<- prometheus.Metric) {
 	for _, metric := range []prometheus.Metric{
 		prometheus.MustNewConstMetric(m.envPassing, prometheus.GaugeValue, boolValue(ok)),
 		prometheus.MustNewConstMetric(m.envCheckedAt, prometheus.GaugeValue, float64(at.Unix())),
+		prometheus.MustNewConstMetric(m.lastTick, prometheus.GaugeValue, float64(m.c.LastTick().Unix())),
 	} {
 		ch <- metric
 	}
@@ -138,6 +142,7 @@ type HookRunner struct {
 	inner    reconcile.Runner
 	duration *prometheus.HistogramVec
 	runs     *prometheus.CounterVec
+	failures *prometheus.CounterVec
 }
 
 var _ reconcile.Runner = (*HookRunner)(nil)
@@ -149,13 +154,16 @@ func NewHookRunner(inner reconcile.Runner, reg prometheus.Registerer) *HookRunne
 		duration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: namespace, Name: "hook_duration_seconds", Help: "How long each hook program took.",
 			Buckets: []float64{.1, .5, 1, 2, 5, 10, 30, 60, 120},
-		}, []string{"hook"}),
+		}, []string{labelHook}),
 		runs: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace, Name: "hook_runs_total", Help: "Hook runs by outcome: ok, failed, error.",
-		}, []string{"hook", "outcome"}),
+		}, []string{labelHook, "outcome"}),
+		failures: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Name: "hook_failures_total", Help: "Hook runs that did not pass, including ones that could not run.",
+		}, []string{labelHook}),
 	}
 
-	reg.MustRegister(h.duration, h.runs)
+	reg.MustRegister(h.duration, h.runs, h.failures)
 
 	return h
 }
@@ -177,6 +185,10 @@ func (h *HookRunner) Run(ctx context.Context, program, hook, targetID string, in
 	}
 
 	h.runs.WithLabelValues(hook, outcome).Inc()
+
+	if outcome != "ok" {
+		h.failures.WithLabelValues(hook).Inc()
+	}
 
 	return res, err
 }

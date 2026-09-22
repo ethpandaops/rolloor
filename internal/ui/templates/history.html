@@ -1,0 +1,27 @@
+{{define "history"}}
+<div id="history" hx-get="/history?group={{escape .Group}}&node={{escape .Node}}&rollout={{escape .Rollout}}" hx-trigger="every 10s" hx-swap="outerHTML">
+<h1>History</h1>
+<form method="get" action="/history" class="filters">
+  <label>Group <input name="group" value="{{.Group}}" placeholder="{{.GroupLabel}} value"></label>
+  <label>Node <input name="node" value="{{.Node}}"></label>
+  <label>Rollout <input name="rollout" value="{{.Rollout}}"></label>
+  <button>Filter</button>
+  {{if or .Group .Node .Rollout}}<a href="/history">clear</a>{{end}}
+</form>
+{{if not .Events}}<p class="muted">Nothing yet.</p>{{end}}
+<table class="list history">
+  <thead><tr><th>When</th><th>Who</th><th>What</th><th>On</th><th>Why</th></tr></thead>
+  <tbody>
+  {{range .Events}}
+    <tr class="{{if eq .Actor "controller"}}controller{{else}}person{{end}}">
+      <td title="{{.At}}">{{clock .At}}</td>
+      <td>{{.Actor}}</td>
+      <td><code>{{.Action}}</code></td>
+      <td>{{if .Rollout}}<a href="/rollouts/{{.Rollout}}">{{.Rollout}}</a>{{end}}{{if .Group}} <a href="/groups/{{$.GroupLabel}}/{{.Group}}">{{.Group}}</a>{{end}}{{if .Target}} <code>{{.Target}}</code>{{end}}{{if .Selector}} <code>{{.Selector}}</code>{{end}}</td>
+      <td class="muted">{{.Reason}}</td>
+    </tr>
+  {{end}}
+  </tbody>
+</table>
+</div>
+{{end}}

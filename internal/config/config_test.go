@@ -35,8 +35,25 @@ presets:
 	require.NoError(t, err)
 	require.Len(t, cfg.Presets, 1)
 	require.Equal(t, 60*time.Second, cfg.Presets["slow"].Soak.Interval)
-	require.Equal(t, 2, cfg.Presets["slow"].Soak.Passes)
-	require.Equal(t, 1, cfg.Presets["slow"].Soak.Grace)
+	require.Equal(t, 2, cfg.Presets["slow"].Soak.PassesN())
+	require.Equal(t, 1, cfg.Presets["slow"].Soak.GraceN())
+
+	// Explicit zeros are kept: halt on the first failure, no weighted updates.
+	strict, err := Parse([]byte(`
+environment: x
+budget: 0
+defaultPolicy: {speed: strict}
+presets:
+  strict: {batch: [1], soak: {duration: 5m, grace: 0, passes: 1}}
+`))
+	require.NoError(t, err)
+	require.Equal(t, 0, strict.Presets["strict"].Soak.GraceN())
+	require.Equal(t, 1, strict.Presets["strict"].Soak.PassesN())
+	require.Equal(t, "0", strict.Budget.String())
+	require.InDelta(t, 0, strict.Budget.OfWeight(1000), 0.001)
+
+	_, err = Parse([]byte("environment: x\npresets: {p: {batch: [1], soak: {duration: 1m, grace: -1}}}\ndefaultPolicy: {speed: p}\n"))
+	require.Error(t, err)
 }
 
 func TestValidateErrors(t *testing.T) {

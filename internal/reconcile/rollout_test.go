@@ -78,15 +78,15 @@ func TestHappyPathWavesBatchesSoak(t *testing.T) {
 	// Wave 1 batch is two weighted nodes, which is exactly the budget.
 	h.tick()
 	r = h.active("a")
-	require.Equal(t, []string{tA3, "a-4/cl"}, r.Batches[1].Targets)
+	require.Equal(t, []string{tA3, tA4}, r.Batches[1].Targets)
 	require.Equal(t, "40.0% of 50%", r.BudgetPercent)
-	require.Equal(t, "not reached yet", h.view("a-5/cl").Reason)
+	require.Equal(t, "not reached yet", h.view(tA5).Reason)
 
 	final := h.drive(r.ID, 60, 20*time.Second)
 	require.Equal(t, Complete, final.State)
 	require.Len(t, final.Batches, 4)
-	require.Equal(t, []string{"a-5/cl"}, final.Batches[2].Targets)
-	require.Equal(t, []string{"a-6/cl"}, final.Batches[3].Targets, "wave 2 last")
+	require.Equal(t, []string{tA5}, final.Batches[2].Targets)
+	require.Equal(t, []string{tA6}, final.Batches[3].Targets, "wave 2 last")
 	require.Equal(t, 6, final.OnNewBuild)
 	require.Equal(t, "All 6 targets on 2222222.", final.Reason)
 
@@ -253,7 +253,7 @@ func TestBudgetIsSharedAcrossGroupsAndNodesCountOnce(t *testing.T) {
 	h.tick()
 
 	ra, rb := h.active("a"), h.active("b")
-	require.Equal(t, []string{tA3, "a-4/cl"}, ra.Batches[0].Targets)
+	require.Equal(t, []string{tA3, tA4}, ra.Batches[0].Targets)
 
 	// Node a-3 is already in flight, so a-3/el is free; b-1 would exceed the budget.
 	require.Equal(t, []string{"a-3/el"}, rb.Batches[0].Targets)
@@ -542,7 +542,7 @@ func TestSuspendResumeAndExpiry(t *testing.T) {
 
 	final := h.drive(r.ID, 60, 20*time.Second)
 	require.Equal(t, Complete, final.State)
-	require.Equal(t, PhaseSkipped, h.phases(final)["a-6/cl"])
+	require.Equal(t, PhaseSkipped, h.phases(final)[tA6])
 	require.Contains(t, final.Targets[4].Reason, "suspended by sam")
 
 	// Resume lifts by exact selector; expiry lifts on its own.
@@ -593,7 +593,7 @@ func TestUnknownTargetsAreLeftAlone(t *testing.T) {
 	require.Equal(t, []string{tA1}, r.Batches[0].Targets)
 
 	// A target that becomes unreachable mid-rollout is skipped at its turn.
-	h.world.set(func(w *world) { w.inspectFail["a-6/cl"] = true })
+	h.world.set(func(w *world) { w.inspectFail[tA6] = true })
 	h.c.InspectAll(h.ctx)
 	h.c.InspectAll(h.ctx)
 
@@ -616,7 +616,7 @@ func TestSetLiveDirectlyAndAlreadyOnBuild(t *testing.T) {
 	h.world.set(func(w *world) { w.registry[imgA] = d2 })
 	h.clock.Advance(h.cfg.Registry.Poll)
 	h.tick()
-	h.c.SetLive(h.ctx, "a-6/cl", d2, true, "")
+	h.c.SetLive(h.ctx, tA6, d2, true, "", h.clock.Now())
 
 	r := h.active("a")
 
@@ -626,11 +626,11 @@ func TestSetLiveDirectlyAndAlreadyOnBuild(t *testing.T) {
 	require.Len(t, final.Batches, 3)
 
 	// Failures accumulate and reset.
-	h.c.SetLive(h.ctx, tA1, "", false, "timeout")
+	h.c.SetLive(h.ctx, tA1, "", false, "timeout", h.clock.Now())
 	require.Equal(t, Synced, h.view(tA1).Sync, "one failure is not yet unknown")
-	h.c.SetLive(h.ctx, tA1, "", false, "timeout")
+	h.c.SetLive(h.ctx, tA1, "", false, "timeout", h.clock.Now())
 	require.Equal(t, Unknown, h.view(tA1).Sync)
-	h.c.SetLive(h.ctx, tA1, d2, true, "")
+	h.c.SetLive(h.ctx, tA1, d2, true, "", h.clock.Now())
 	require.Equal(t, Synced, h.view(tA1).Sync)
 }
 
@@ -656,7 +656,7 @@ func TestTargetRemovedMidRollout(t *testing.T) {
 	require.Equal(t, Complete, final.State)
 	require.Equal(t, PhaseSkipped, h.phases(final)[tA2])
 	require.Equal(t, "removed from the targets file", final.Targets[1].Reason)
-	require.Equal(t, PhaseSkipped, h.phases(final)["a-6/cl"])
+	require.Equal(t, PhaseSkipped, h.phases(final)[tA6])
 }
 
 func TestRegistryErrorsAndRefresh(t *testing.T) {

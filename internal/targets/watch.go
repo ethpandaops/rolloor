@@ -18,7 +18,7 @@ type Watcher struct {
 	rules    Rules
 	interval time.Duration
 	log      observability.ContextualLogger
-	onChange func(*Set)
+	onChange func(old, current *Set)
 	onError  func(error)
 
 	mu      sync.RWMutex
@@ -28,7 +28,7 @@ type Watcher struct {
 
 // NewWatcher loads once, synchronously, so Current is never nil after a
 // successful construction.
-func NewWatcher(dir string, rules *Rules, interval time.Duration, log observability.ContextualLogger, onChange func(*Set), onError func(error)) (*Watcher, error) {
+func NewWatcher(dir string, rules *Rules, interval time.Duration, log observability.ContextualLogger, onChange func(old, current *Set), onError func(error)) (*Watcher, error) {
 	w := &Watcher{
 		dir:      dir,
 		rules:    *rules,
@@ -120,6 +120,7 @@ func (w *Watcher) load(stamp string) error {
 	}
 
 	w.mu.Lock()
+	old := w.current
 	w.current = set
 	w.stamp = stamp
 	w.mu.Unlock()
@@ -127,7 +128,7 @@ func (w *Watcher) load(stamp string) error {
 	w.log.WithField("targets", set.Len()).Info("targets reloaded")
 
 	if w.onChange != nil {
-		w.onChange(set)
+		w.onChange(old, set)
 	}
 
 	return nil

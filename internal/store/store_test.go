@@ -14,8 +14,9 @@ import (
 )
 
 const (
-	r1 = "r1"
-	t1 = "t1"
+	r1  = "r1"
+	t1  = "t1"
+	sha = "sha256:1"
 )
 
 func open(t *testing.T) (*SQLite, string) {
@@ -36,7 +37,7 @@ func TestRoundTrip(t *testing.T) {
 	s, dir := open(t)
 
 	now := time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
-	r := &reconcile.Rollout{ID: r1, Group: "a", State: reconcile.Running, Desired: map[string]string{"img": "sha256:1"}, CreatedAt: now,
+	r := &reconcile.Rollout{ID: r1, Group: "a", State: reconcile.Running, Desired: map[string]string{"img": sha}, CreatedAt: now,
 		Targets: []reconcile.RolloutTarget{{ID: t1, Node: "n1", Phase: reconcile.PhasePending}}}
 	require.NoError(t, s.SaveRollout(ctx, r))
 
@@ -52,9 +53,15 @@ func TestRoundTrip(t *testing.T) {
 	require.NoError(t, s.SaveSuspension(ctx, &reconcile.Suspension{ID: "s2"}))
 	require.NoError(t, s.DeleteSuspension(ctx, "s2"))
 
-	require.NoError(t, s.SaveLive(ctx, t1, reconcile.Live{Digest: "sha256:1", SeenAt: now}))
-	require.NoError(t, s.SaveLive(ctx, "t2", reconcile.Live{Failures: 2}))
+	require.NoError(t, s.SaveLive(ctx, t1, &reconcile.Live{Digest: sha, SeenAt: now}))
+	require.NoError(t, s.SaveLive(ctx, "t2", &reconcile.Live{Failures: 2}))
 	require.NoError(t, s.DeleteLive(ctx, "t2"))
+
+	require.NoError(t, s.SaveDesired(ctx, "img", reconcile.Desired{Digest: sha, Revision: "r"}))
+	require.NoError(t, s.SaveDesired(ctx, "img", reconcile.Desired{Digest: "sha256:2"}))
+	require.NoError(t, s.SaveAborted(ctx, "a", "img=sha256:2"))
+	require.NoError(t, s.SaveAborted(ctx, "b", "x"))
+	require.NoError(t, s.ClearAborted(ctx, "b"))
 
 	require.NoError(t, s.SaveDegraded(ctx, t1, "bad"))
 	require.NoError(t, s.SaveDegraded(ctx, t1, "worse"))
@@ -79,9 +86,11 @@ func TestRoundTrip(t *testing.T) {
 	require.Equal(t, "fast", snap.Policies["a"].Speed)
 	require.Len(t, snap.Suspensions, 1)
 	require.Equal(t, "n1", snap.Suspensions[0].Selector["node"])
-	require.Equal(t, "sha256:1", snap.Live[t1].Digest)
+	require.Equal(t, sha, snap.Live[t1].Digest)
 	require.Len(t, snap.Live, 1)
 	require.Equal(t, map[string]string{t1: "worse"}, snap.Degraded)
+	require.Equal(t, "sha256:2", snap.Desired["img"].Digest)
+	require.Equal(t, map[string]string{"a": "img=sha256:2"}, snap.Aborted)
 	require.Equal(t, int64(4), snap.NextEventID)
 
 	events, err := s.Events(ctx, reconcile.EventQuery{})
@@ -149,10 +158,13 @@ func TestClosedStoreFailsEveryCall(t *testing.T) {
 	require.Error(t, s.SavePolicy(ctx, "g", reconcile.Policy{}))
 	require.Error(t, s.SaveSuspension(ctx, &reconcile.Suspension{ID: "x"}))
 	require.Error(t, s.DeleteSuspension(ctx, "x"))
-	require.Error(t, s.SaveLive(ctx, "x", reconcile.Live{}))
+	require.Error(t, s.SaveLive(ctx, "x", &reconcile.Live{}))
 	require.Error(t, s.DeleteLive(ctx, "x"))
 	require.Error(t, s.SaveDegraded(ctx, "x", "r"))
 	require.Error(t, s.ClearDegraded(ctx, "x"))
+	require.Error(t, s.SaveDesired(ctx, "i", reconcile.Desired{}))
+	require.Error(t, s.SaveAborted(ctx, "g", "k"))
+	require.Error(t, s.ClearAborted(ctx, "g"))
 	require.Error(t, s.AppendEvent(ctx, &reconcile.Event{ID: 1}))
 
 	_, err := s.Events(ctx, reconcile.EventQuery{})
@@ -191,6 +203,13 @@ func TestCorruptRowsAreErrors(t *testing.T) {
 	_, err = s.Load(ctx)
 	require.ErrorContains(t, err, "load live")
 	_, err = s.db.ExecContext(ctx, `DELETE FROM live`)
+	require.NoError(t, err)
+
+	_, err = s.db.ExecContext(ctx, `INSERT INTO desired (image, data) VALUES ('i', 'not json')`)
+	require.NoError(t, err)
+	_, err = s.Load(ctx)
+	require.ErrorContains(t, err, "load desired")
+	_, err = s.db.ExecContext(ctx, `DELETE FROM desired`)
 	require.NoError(t, err)
 
 	_, err = s.db.ExecContext(ctx, `INSERT INTO events (id, at, actor, action) VALUES (1, 'not a time', 'a', 'b')`)

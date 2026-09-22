@@ -15,6 +15,9 @@ type Fraction struct {
 	Count   int
 	// IsPercent reports which of the two fields is meaningful.
 	IsPercent bool
+	// set is true once a value was written explicitly, so an explicit zero
+	// is not mistaken for an omitted field.
+	set bool
 }
 
 // ParseFraction accepts "N%" or an integer.
@@ -94,6 +97,7 @@ func (f *Fraction) UnmarshalYAML(value *yaml.Node) error {
 		return err
 	}
 
+	parsed.set = true
 	*f = parsed
 
 	return nil

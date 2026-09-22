@@ -46,7 +46,7 @@ func (s *Server) actionSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	id, _, ok := s.authorizeSelector(w, r, sel, body.Confirm)
+	id, _, ok := s.authorizeSelector(w, r, sel, body.Confirm, true)
 	if !ok {
 		return
 	}
@@ -94,7 +94,7 @@ func (s *Server) actionSuspend(w http.ResponseWriter, r *http.Request) {
 		expires = d
 	}
 
-	id, _, ok := s.authorizeSelector(w, r, sel, body.Confirm)
+	id, _, ok := s.authorizeSelector(w, r, sel, body.Confirm, false)
 	if !ok {
 		return
 	}
@@ -110,12 +110,12 @@ func (s *Server) actionSuspend(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) actionResume(w http.ResponseWriter, r *http.Request) {
-	_, sel, ok := parseSelectorBody(w, r)
+	body, sel, ok := parseSelectorBody(w, r)
 	if !ok {
 		return
 	}
 
-	id, _, ok := s.authorizeSelector(w, r, sel, true)
+	id, _, ok := s.authorizeSelector(w, r, sel, body.Confirm, false)
 	if !ok {
 		return
 	}
