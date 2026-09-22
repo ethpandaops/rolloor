@@ -14,9 +14,10 @@ type selectorBody struct {
 	// Sync only.
 	Force bool   `json:"force"`
 	Speed string `json:"speed"`
-	// Suspend only.
+	// Suspend only. ExpiresIn is a duration; ExpiresAt an RFC 3339 time.
 	Reason    string `json:"reason"`
 	ExpiresIn string `json:"expiresIn"`
+	ExpiresAt string `json:"expiresAt"`
 }
 
 type rolloutBody struct {
@@ -92,6 +93,22 @@ func (s *Server) actionSuspend(w http.ResponseWriter, r *http.Request) {
 		}
 
 		expires = d
+	}
+
+	if body.ExpiresAt != "" {
+		at, err := time.Parse(time.RFC3339, body.ExpiresAt)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "expiresAt: "+err.Error())
+
+			return
+		}
+
+		expires = time.Until(at)
+		if expires <= 0 {
+			writeError(w, http.StatusBadRequest, "expiresAt: already past")
+
+			return
+		}
 	}
 
 	id, _, ok := s.authorizeSelector(w, r, sel, body.Confirm, false)

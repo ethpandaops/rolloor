@@ -83,17 +83,33 @@ func mustView(t *testing.T, c *Controller, id string) TargetView {
 	return v
 }
 
-func TestStoreFailuresAreLoggedNotFatal(t *testing.T) {
+func TestStoreFailureStopsNewWorkUntilFlushed(t *testing.T) {
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
-	h.store.Fail = errFake
-
 	h.release(imgA, d2)
 	require.Equal(t, Running, h.active("a").State)
+
+	// The store fails during a tick: the decisions made in that tick stay in
+	// memory, but no further program runs until they are written.
+	h.store.Fail = errFake
+	h.tick()
+
+	updates := len(h.world.callsFor("update"))
+	inspects := len(h.world.callsFor("inspect"))
+	readies := len(h.world.callsFor("ready"))
 	h.ticks(3, 0)
+	require.Equal(t, updates, len(h.world.callsFor("update")))
+	require.Equal(t, inspects, len(h.world.callsFor("inspect")))
+	require.Equal(t, readies, len(h.world.callsFor("ready")))
 
 	_, err := h.c.Events(h.ctx, EventQuery{})
 	require.ErrorIs(t, err, errFake)
+
+	// Once the store is back, everything is rewritten and work resumes.
+	h.store.Fail = nil
+	h.tick()
+	require.Greater(t, len(h.world.callsFor("ready")), readies)
+	require.Equal(t, Complete, h.drive(h.active("a").ID, 80, 20*time.Second).State)
 }
 
 func TestRunAndInspectorLoops(t *testing.T) {
@@ -227,6 +243,15 @@ func TestMemoryStoreEventsFilterAndFail(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, got, 2)
 
+	// Replay after an id is oldest first.
+	got, err = m.Events(ctx, EventQuery{After: 1})
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	require.Equal(t, int64(2), got[0].ID)
+
+	require.NoError(t, m.SaveHookRun(ctx, "t", &HookRun{Hook: "h"}))
+	require.NoError(t, m.DeleteHookRuns(ctx, "t"))
+
 	require.NoError(t, m.SaveDegraded(ctx, "t", "why"))
 	require.NoError(t, m.SaveLive(ctx, "t", &Live{Digest: d1}))
 	snap, err := m.Load(ctx)
@@ -249,6 +274,8 @@ func TestMemoryStoreEventsFilterAndFail(t *testing.T) {
 	require.ErrorIs(t, m.SaveDesired(ctx, "img", Desired{}), errFake)
 	require.ErrorIs(t, m.SaveAborted(ctx, "g", "k"), errFake)
 	require.ErrorIs(t, m.ClearAborted(ctx, "g"), errFake)
+	require.ErrorIs(t, m.SaveHookRun(ctx, "t", &HookRun{Hook: "h"}), errFake)
+	require.ErrorIs(t, m.DeleteHookRuns(ctx, "t"), errFake)
 	_, err = m.Events(ctx, EventQuery{})
 	require.ErrorIs(t, err, errFake)
 	_, err = m.Load(ctx)

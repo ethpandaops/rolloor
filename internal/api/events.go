@@ -6,8 +6,9 @@ import (
 	"github.com/ethpandaops/rolloor/internal/reconcile"
 )
 
-// Broadcaster fans events out to live subscribers. A slow subscriber drops
-// events rather than slowing the controller.
+// Broadcaster fans events out to live subscribers. A subscriber that falls
+// behind is closed rather than slowing the controller; the stream tells the
+// client so it can replay from the store.
 type Broadcaster struct {
 	mu   sync.Mutex
 	subs map[chan reconcile.Event]struct{}
@@ -29,6 +30,8 @@ func (b *Broadcaster) Publish(e *reconcile.Event) {
 		select {
 		case ch <- *e:
 		default:
+			delete(b.subs, ch)
+			close(ch)
 		}
 	}
 }
@@ -43,8 +46,12 @@ func (b *Broadcaster) Subscribe() (events <-chan reconcile.Event, stop func()) {
 
 	return ch, func() {
 		b.mu.Lock()
-		delete(b.subs, ch)
-		b.mu.Unlock()
+		defer b.mu.Unlock()
+
+		if _, live := b.subs[ch]; live {
+			delete(b.subs, ch)
+			close(ch)
+		}
 	}
 }
 

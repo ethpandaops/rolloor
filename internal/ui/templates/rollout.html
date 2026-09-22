@@ -1,5 +1,5 @@
 {{define "rollout"}}
-<div id="rollout" hx-get="/rollouts/{{.Rollout.ID}}" hx-trigger="every 5s" hx-swap="outerHTML">
+<div id="rollout" hx-get="/rollouts/{{.Rollout.ID}}" hx-trigger="every 5s [!document.querySelector('details[open]') && document.activeElement.tagName !== 'INPUT']" hx-swap="outerHTML">
 <nav class="crumbs"><a href="/">Fleet</a> › <a href="/groups/{{.GroupLabel}}/{{.Rollout.Group}}">{{.Rollout.Group}}</a> › Rollout {{.Rollout.Digest}}</nav>
 <div class="title-row">
   <h1>Rollout <code>{{.Rollout.Digest}}</code>{{if .Rollout.Revision}} <span class="muted">{{.Rollout.Revision}}</span>{{end}}</h1>
@@ -33,7 +33,7 @@
   <h2>{{template "state-badge" .Rollout.State}} {{ago .Rollout.UpdatedAt}}</h2>
   <p>{{.Rollout.Reason}}</p>
   {{if .Quarantine}}
-  <div class="quarantine"><h3>{{len .Quarantine}} quarantined targets</h3><p>Left running {{.Rollout.Digest}} so you can look at them.</p>
+  <div class="quarantine"><h3>{{len .Quarantine}} quarantined targets</h3><p>Left as they are so you can look at them; the digest column on each node says what they run.</p>
     <ul>{{range .Quarantine}}<li><code>{{.ID}}</code> {{template "health-badge" "Degraded"}} <span class="muted">{{.Reason}}</span></li>{{end}}</ul></div>
   {{end}}
   <p class="muted">A new {{.Rollout.Group}} build clears this halt. The quarantined targets update first.</p>

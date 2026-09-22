@@ -46,22 +46,40 @@ func (c *Controller) desiredForImage(group, image string, set *targets.Set) (str
 	return "", false
 }
 
-// finish moves a rollout to a terminal state.
+// finish moves a rollout to a terminal state and records it.
 func (c *Controller) finish(ctx context.Context, now time.Time, r *Rollout, state RolloutState, reason string) {
+	c.end(now, r, state, reason)
+	_ = c.saveRollout(ctx, r)
+	c.event(ctx, now, &Event{Actor: ControllerActor, Action: "rollout." + lower(state), Group: r.Group, Rollout: r.ID, Reason: reason})
+}
+
+// end is the in-memory part of finishing. A target whose update was
+// dispatched keeps its node counted against the budget for as long as that
+// update could still be landing.
+func (c *Controller) end(now time.Time, r *Rollout, state RolloutState, reason string) {
 	r.State = state
 	r.Reason = reason
 	r.UpdatedAt = now
 	r.EndedAt = now
 
 	for i := range r.Targets {
-		if r.Targets[i].Phase == PhaseUpdating || r.Targets[i].Phase == PhaseReady {
-			r.Targets[i].Phase = PhaseSkipped
-			r.Targets[i].Reason = string(state)
+		rt := &r.Targets[i]
+		if rt.Phase != PhaseUpdating && rt.Phase != PhaseReady {
+			continue
 		}
-	}
 
-	_ = c.saveRollout(ctx, r)
-	c.event(ctx, now, &Event{Actor: ControllerActor, Action: "rollout." + lower(state), Group: r.Group, Rollout: r.ID, Reason: reason})
+		if rt.Phase == PhaseUpdating && !rt.Updated {
+			rt.HoldUntil = now.Add(c.updateDeadline())
+		}
+
+		rt.Phase = PhaseSkipped
+		rt.Reason = string(state)
+	}
+}
+
+// updateDeadline is how long an update may take to show its digest.
+func (c *Controller) updateDeadline() time.Duration {
+	return c.cfg.Hooks.Timeout * 5
 }
 
 // openRollouts creates a rollout for every group with out-of-sync targets and
@@ -230,13 +248,21 @@ func (c *Controller) newRollout(now time.Time, group string, policy Policy, elig
 	return r
 }
 
-// inFlightNodes lists every node with a target mid-update across all rollouts,
-// excluding nodes that were already degraded when their rollout began.
-func (c *Controller) inFlightNodes() map[string]struct{} {
+// inFlightNodes lists every node with a target mid-update across all
+// rollouts, plus nodes a finished rollout may still be changing, excluding
+// nodes that are already degraded.
+func (c *Controller) inFlightNodes(set *targets.Set, now time.Time) map[string]struct{} {
 	nodes := map[string]struct{}{}
 
 	for _, r := range c.rollouts {
 		if !r.State.Active() {
+			for i := range r.Targets {
+				rt := &r.Targets[i]
+				if now.Before(rt.HoldUntil) && !c.nodeDegraded(set, r, rt.Node) {
+					nodes[rt.Node] = struct{}{}
+				}
+			}
+
 			continue
 		}
 
@@ -247,7 +273,7 @@ func (c *Controller) inFlightNodes() map[string]struct{} {
 
 		for _, id := range b.Targets {
 			rt := r.target(id)
-			if rt != nil && rt.Phase != PhaseSkipped && !nodeDegraded(r, rt.Node) {
+			if rt != nil && rt.Phase != PhaseSkipped && !c.nodeDegraded(set, r, rt.Node) {
 				nodes[rt.Node] = struct{}{}
 			}
 		}
@@ -256,12 +282,18 @@ func (c *Controller) inFlightNodes() map[string]struct{} {
 	return nodes
 }
 
-// nodeDegraded reports whether any of the rollout's targets on a node was
-// already degraded when the rollout began; such a node is already disrupted
-// and costs nothing against the budget.
-func nodeDegraded(r *Rollout, node string) bool {
+// nodeDegraded reports whether a node is already disrupted: any target on it
+// is quarantined, or was degraded when the rollout began. Such a node costs
+// nothing against the budget, whichever group is moving it.
+func (c *Controller) nodeDegraded(set *targets.Set, r *Rollout, node string) bool {
 	for i := range r.Targets {
 		if r.Targets[i].Node == node && r.Targets[i].DegradedBefore {
+			return true
+		}
+	}
+
+	for _, t := range set.Node(node) {
+		if _, degraded := c.degraded[t.ID]; degraded {
 			return true
 		}
 	}
@@ -272,7 +304,7 @@ func nodeDegraded(r *Rollout, node string) bool {
 // inFlightWeight is the weight of the in-flight nodes.
 func (c *Controller) inFlightWeight(set *targets.Set) float64 {
 	var w float64
-	for n := range c.inFlightNodes() {
+	for n := range c.inFlightNodes(set, c.clock.Now()) {
 		w += set.NodeWeight(n)
 	}
 
@@ -314,7 +346,7 @@ func (c *Controller) startBatch(ctx context.Context, now time.Time, r *Rollout, 
 	idx := min(len(r.Batches), len(preset.Batch)-1)
 	size := preset.Batch[idx].Of(len(r.Targets))
 	budget := c.cfg.Budget.OfWeight(set.TotalWeight())
-	busy := c.inFlightNodes()
+	busy := c.inFlightNodes(set, now)
 	inflight := c.inFlightWeight(set)
 
 	var (
@@ -329,7 +361,7 @@ func (c *Controller) startBatch(ctx context.Context, now time.Time, r *Rollout, 
 		}
 
 		w := set.NodeWeight(rt.Node)
-		if _, already := busy[rt.Node]; already || nodeDegraded(r, rt.Node) {
+		if _, already := busy[rt.Node]; already || c.nodeDegraded(set, r, rt.Node) {
 			w = 0
 		}
 
@@ -408,7 +440,8 @@ func (c *Controller) estimateBatches(r *Rollout, preset *config.Preset) int {
 	last := max(preset.Batch[len(preset.Batch)-1].Of(len(r.Targets)), 1)
 	left := map[int]int{}
 
-	for _, rt := range r.Targets {
+	for i := range r.Targets {
+		rt := &r.Targets[i]
 		if rt.Batch == 0 && rt.Phase == PhasePending {
 			wave := rt.Wave
 			if !preset.UsesWaves() {

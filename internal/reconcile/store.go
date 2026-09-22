@@ -16,6 +16,7 @@ type Snapshot struct {
 	Degraded    map[string]string
 	Desired     map[string]Desired
 	Aborted     map[string]string
+	HookRuns    map[string]map[string]HookRun
 	NextEventID int64
 }
 
@@ -34,6 +35,8 @@ type Store interface {
 	SaveDesired(ctx context.Context, image string, d Desired) error
 	SaveAborted(ctx context.Context, group, key string) error
 	ClearAborted(ctx context.Context, group string) error
+	SaveHookRun(ctx context.Context, id string, run *HookRun) error
+	DeleteHookRuns(ctx context.Context, id string) error
 	AppendEvent(ctx context.Context, e *Event) error
 	Events(ctx context.Context, q EventQuery) ([]Event, error)
 }
@@ -43,7 +46,9 @@ type EventQuery struct {
 	Group   string
 	Rollout string
 	Target  string
-	Limit   int
+	// After returns only events with a greater id, oldest first, for replay.
+	After int64
+	Limit int
 }
 
 // Notifier receives every event as it happens, for live streams.
@@ -63,8 +68,11 @@ type MemoryStore struct {
 	desired     map[string]Desired
 	aborted     map[string]string
 	events      []Event
-	// Fail, when set, is returned by every write; tests use it.
-	Fail error
+	// Fail, when set, is returned by every write; FailRollouts by rollout
+	// saves only. Tests use them.
+	Fail         error
+	FailRollouts error
+	hookRuns     map[string]map[string]HookRun
 }
 
 // NewMemoryStore returns an empty store.
@@ -77,6 +85,7 @@ func NewMemoryStore() *MemoryStore {
 		degraded:    map[string]string{},
 		desired:     map[string]Desired{},
 		aborted:     map[string]string{},
+		hookRuns:    map[string]map[string]HookRun{},
 	}
 }
 
@@ -97,7 +106,12 @@ func (m *MemoryStore) Load(context.Context) (*Snapshot, error) {
 		Degraded:    map[string]string{},
 		Desired:     map[string]Desired{},
 		Aborted:     map[string]string{},
+		HookRuns:    map[string]map[string]HookRun{},
 		NextEventID: int64(len(m.events)) + 1,
+	}
+
+	for id, runs := range m.hookRuns {
+		s.HookRuns[id] = maps.Clone(runs)
 	}
 
 	for _, r := range m.rollouts {
@@ -164,6 +178,10 @@ func (m *MemoryStore) SaveRollout(_ context.Context, r *Rollout) error {
 
 	if m.Fail != nil {
 		return m.Fail
+	}
+
+	if m.FailRollouts != nil {
+		return m.FailRollouts
 	}
 
 	m.rollouts[r.ID] = cloneRollout(r)
@@ -283,6 +301,38 @@ func (m *MemoryStore) SaveDesired(_ context.Context, image string, d Desired) er
 	return nil
 }
 
+// SaveHookRun stores the last result of one hook for one target.
+func (m *MemoryStore) SaveHookRun(_ context.Context, id string, run *HookRun) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.Fail != nil {
+		return m.Fail
+	}
+
+	if m.hookRuns[id] == nil {
+		m.hookRuns[id] = map[string]HookRun{}
+	}
+
+	m.hookRuns[id][run.Hook] = *run
+
+	return nil
+}
+
+// DeleteHookRuns forgets a target's hook results.
+func (m *MemoryStore) DeleteHookRuns(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.Fail != nil {
+		return m.Fail
+	}
+
+	delete(m.hookRuns, id)
+
+	return nil
+}
+
 // SaveAborted records that a group's rollout to these digests was aborted.
 func (m *MemoryStore) SaveAborted(_ context.Context, group, key string) error {
 	m.mu.Lock()
@@ -335,6 +385,16 @@ func (m *MemoryStore) Events(_ context.Context, q EventQuery) ([]Event, error) {
 	}
 
 	var out []Event
+
+	if q.After > 0 {
+		for i := range m.events {
+			if m.events[i].ID > q.After {
+				out = append(out, m.events[i])
+			}
+		}
+
+		return out, nil
+	}
 
 	for i := len(m.events) - 1; i >= 0; i-- {
 		e := m.events[i]

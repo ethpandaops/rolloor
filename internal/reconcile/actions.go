@@ -69,7 +69,9 @@ func (c *Controller) Sync(ctx context.Context, req SyncRequest) ([]string, error
 		}
 
 		r := c.activeRollout(group)
-		if r == nil {
+		created := r == nil
+
+		if created {
 			eligible, desired, from := c.outOfSync(group, set)
 			if len(eligible) == 0 {
 				continue
@@ -81,24 +83,29 @@ func (c *Controller) Sync(ctx context.Context, req SyncRequest) ([]string, error
 			}
 
 			r = c.newRollout(now, group, policy, eligible, desired, from, set)
+		}
+
+		// Nothing reaches controller memory before the store has it.
+		err := c.commit(ctx, r, func() {
+			r.Human = true
+			r.Force = r.Force || req.Force
+
+			if req.Speed != "" {
+				r.Speed = req.Speed
+			}
+
+			if r.State == WaitingForSync || r.State == WaitingForEnvironment {
+				r.State, r.Reason, r.UpdatedAt = Running, "Started by "+req.Actor, now
+			}
+		})
+		if err != nil {
+			return started, err
+		}
+
+		if created {
 			c.rollouts[r.ID] = r
 			c.event(ctx, now, &Event{Actor: req.Actor, Action: "rollout.created", Group: group, Rollout: r.ID,
-				Reason: fmt.Sprintf("%d targets to %s (%s)", len(eligible), r.DigestShort(), policy.Speed)})
-		}
-
-		r.Human = true
-		r.Force = r.Force || req.Force
-
-		if req.Speed != "" {
-			r.Speed = req.Speed
-		}
-
-		if r.State == WaitingForSync || r.State == WaitingForEnvironment {
-			c.setState(ctx, now, r, Running, "Started by "+req.Actor)
-		}
-
-		if err := c.saveRollout(ctx, r); err != nil {
-			return started, err
+				Reason: fmt.Sprintf("%d targets to %s (%s)", len(r.Targets), r.DigestShort(), r.Speed)})
 		}
 
 		c.event(ctx, now, &Event{Actor: req.Actor, Action: "sync", Group: group, Rollout: r.ID, Selector: req.Selector.String(),
@@ -297,19 +304,32 @@ func (c *Controller) Abort(ctx context.Context, actor, rolloutID string) error {
 		return fmt.Errorf("rollout is %s: %w", r.State, ErrState)
 	}
 
+	// The marker goes first; if the rollout itself cannot be saved the marker
+	// is taken back, so the two never disagree on disk. A restart with the
+	// marker but an active rollout resolves in the marker's favour.
 	key := c.groupDesiredKey(r.Group, c.targets())
 	if err := c.persist(ctx, c.store.SaveAborted(ctx, r.Group, key)); err != nil {
 		return err
 	}
 
-	c.aborted[r.Group] = key
+	reason := "Aborted by " + actor
 
-	if b := r.CurrentBatch(); b != nil {
-		b.EndedAt = now
-		b.Soak = cloneSoak(&r.Soak)
+	err := c.commit(ctx, r, func() {
+		if b := r.CurrentBatch(); b != nil {
+			b.EndedAt = now
+			b.Soak = cloneSoak(&r.Soak)
+		}
+
+		c.end(now, r, Aborted, reason)
+	})
+	if err != nil {
+		_ = c.persist(ctx, c.store.ClearAborted(ctx, r.Group))
+
+		return err
 	}
 
-	c.finish(ctx, now, r, Aborted, "Aborted by "+actor)
+	c.aborted[r.Group] = key
+	c.event(ctx, now, &Event{Actor: ControllerActor, Action: "rollout.aborted", Group: r.Group, Rollout: r.ID, Reason: reason})
 
 	return nil
 }
@@ -383,4 +403,87 @@ func (c *Controller) SetPolicy(ctx context.Context, actor, group string, p Polic
 // Events returns history from the store.
 func (c *Controller) Events(ctx context.Context, q EventQuery) ([]Event, error) {
 	return c.store.Events(ctx, q)
+}
+
+// EventsAbout returns the history that concerns some targets: events naming
+// one of them, events whose selector matches one, and group or rollout
+// events for the groups they belong to. It filters before it cuts to the
+// limit, so an old match is not hidden by unrelated recent events.
+func (c *Controller) EventsAbout(ctx context.Context, about []targets.Target, q EventQuery) ([]Event, error) {
+	limit := q.Limit
+	if limit <= 0 {
+		limit = 200
+	}
+
+	q.Limit = 0
+
+	all, err := c.store.Events(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+
+	set := c.targets()
+	ids := map[string]struct{}{}
+	groups := map[string]struct{}{}
+
+	for i := range about {
+		ids[about[i].ID] = struct{}{}
+		groups[set.Group(&about[i])] = struct{}{}
+	}
+
+	c.mu.RLock()
+
+	rolloutGroups := make(map[string]string, len(c.rollouts))
+	for id, r := range c.rollouts {
+		rolloutGroups[id] = r.Group
+	}
+
+	c.mu.RUnlock()
+
+	out := make([]Event, 0, limit)
+
+	for i := range all {
+		e := &all[i]
+		if eventConcerns(e, about, ids, groups, rolloutGroups) {
+			out = append(out, *e)
+		}
+
+		if len(out) >= limit {
+			break
+		}
+	}
+
+	return out, nil
+}
+
+func eventConcerns(e *Event, about []targets.Target, ids, groups map[string]struct{}, rolloutGroups map[string]string) bool {
+	if e.Target != "" {
+		_, ok := ids[e.Target]
+
+		return ok
+	}
+
+	if e.Selector != "" {
+		sel, err := targets.ParseSelector(e.Selector)
+		if err != nil {
+			return false
+		}
+
+		for i := range about {
+			if sel.Match(&about[i]) {
+				return true
+			}
+		}
+
+		return false
+	}
+
+	group := e.Group
+	if group == "" && e.Rollout != "" {
+		group = rolloutGroups[e.Rollout]
+	}
+
+	_, ok := groups[group]
+
+	return ok
 }

@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS live (target_id TEXT PRIMARY KEY, data BLOB NOT NULL)
 CREATE TABLE IF NOT EXISTS degraded (target_id TEXT PRIMARY KEY, reason TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS desired (image TEXT PRIMARY KEY, data BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS aborted (group_name TEXT PRIMARY KEY, key TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS hook_runs (target_id TEXT NOT NULL, hook TEXT NOT NULL, data BLOB NOT NULL, PRIMARY KEY (target_id, hook));
 CREATE TABLE IF NOT EXISTS events (
 	id INTEGER PRIMARY KEY,
 	at TEXT NOT NULL,
@@ -91,6 +92,24 @@ func (s *SQLite) Load(ctx context.Context) (*reconcile.Snapshot, error) {
 		Degraded: map[string]string{},
 		Desired:  map[string]reconcile.Desired{},
 		Aborted:  map[string]string{},
+		HookRuns: map[string]map[string]reconcile.HookRun{},
+	}
+
+	if err := s.loadKeyed(ctx, `SELECT target_id, data FROM hook_runs`, func(key string, raw []byte) error {
+		var run reconcile.HookRun
+		if err := json.Unmarshal(raw, &run); err != nil {
+			return err
+		}
+
+		if snap.HookRuns[key] == nil {
+			snap.HookRuns[key] = map[string]reconcile.HookRun{}
+		}
+
+		snap.HookRuns[key][run.Hook] = run
+
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("store: load hook runs: %w", err)
 	}
 
 	if err := s.loadJSON(ctx, `SELECT data FROM rollouts ORDER BY id`, func(raw []byte) error {
@@ -325,6 +344,29 @@ func (s *SQLite) ClearDegraded(ctx context.Context, id string) error {
 	return nil
 }
 
+// SaveHookRun upserts the last result of one hook for one target.
+func (s *SQLite) SaveHookRun(ctx context.Context, id string, run *reconcile.HookRun) error {
+	raw, err := json.Marshal(run)
+	if err != nil {
+		return fmt.Errorf("store: encode hook run: %w", err)
+	}
+
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO hook_runs (target_id, hook, data) VALUES (?, ?, ?) ON CONFLICT(target_id, hook) DO UPDATE SET data = excluded.data`, id, run.Hook, raw); err != nil {
+		return fmt.Errorf("store: save hook run %s/%s: %w", id, run.Hook, err)
+	}
+
+	return nil
+}
+
+// DeleteHookRuns removes a target's hook results.
+func (s *SQLite) DeleteHookRuns(ctx context.Context, id string) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM hook_runs WHERE target_id = ?`, id); err != nil {
+		return fmt.Errorf("store: delete hook runs %s: %w", id, err)
+	}
+
+	return nil
+}
+
 // SaveDesired remembers a tag's last known digest across restarts.
 func (s *SQLite) SaveDesired(ctx context.Context, image string, d reconcile.Desired) error {
 	raw, err := json.Marshal(d)
@@ -389,12 +431,20 @@ func (s *SQLite) Events(ctx context.Context, q reconcile.EventQuery) ([]reconcil
 		args = append(args, q.Target)
 	}
 
+	order := "DESC"
+
+	if q.After > 0 {
+		where = append(where, "id > ?")
+		args = append(args, q.After)
+		order = "ASC"
+	}
+
 	query := `SELECT id, at, actor, action, group_name, rollout, target, selector, reason FROM events`
 	if len(where) > 0 {
 		query += " WHERE " + strings.Join(where, " AND ") //nolint:gosec // fixed fragments; every value is bound
 	}
 
-	query += " ORDER BY id DESC LIMIT ?"
+	query += " ORDER BY id " + order + " LIMIT ?"
 
 	limit := q.Limit
 	if limit <= 0 || limit > 1000 {

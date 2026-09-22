@@ -78,7 +78,7 @@ auth:
   adminOwner: operators          # members of this owner value may act on anything
 ```
 
-Unknown fields are an error. `budget` and batch fractions accept `N%` or an absolute number. Precedence: flags > environment (`ROLLOOR_*`) > file > defaults.
+Unknown fields are an error. `budget` and batch fractions accept `N%` or an absolute number. The file is the only source of configuration; defaults fill what it leaves out. There are no flag or environment overrides.
 
 ### 2.2 Targets file
 
@@ -119,7 +119,7 @@ Owner value → list of identity-claim values. Without the file, a claim value e
 - **Target**: a row from the file plus live state. `desired` (the tag's current digest, or a pinned one), `live` (from `inspect`), `sync` = `Synced | OutOfSync | Unknown`, `health` = `Healthy | Progressing | Degraded | Suspended`. JSON field names are camelCase throughout the API.
 - **Node**: the set of targets sharing `node`. Weight counted once.
 - **Group**: the set of targets sharing the group label value. One policy, at most one active rollout.
-- **Policy** (per group, stored): `mode: automated | manual`, `speed: <preset>`, `pin: {image: digest}` optional.
+- **Policy** (per group, stored): `mode: automated | manual`, `speed: <preset>`, `pins: {image: digest}` optional.
 - **Rollout**: the convergence of one group's OutOfSync targets toward their desired digests. Created by the controller, never by a person. Identified by a random 12-hex-character id; displayed by the short form of the digest it moves to (first changed image if several).
 - **Suspension**: selector, reason, actor, expires_at. Matching targets are `Suspended`: skipped by rollouts, excluded from budget and from the comparison group.
 - **Event**: who (identity or `controller`), what (verb or transition), on what (selector, rollout, target), why (reason), when. Append-only. This is history.
@@ -147,7 +147,7 @@ In-flight weight = sum over nodes with any target `Progressing`, across all roll
 
 ### 4.2 Update, ready
 
-For each target in the batch: mark `Progressing`; run `update` with the target plus `desired` and `desiredRef` (see section 6), so the program deploys exactly that digest. Exit 0 = started. An `update` whose result never came back (the process stopped) runs again after restart; programs must be idempotent. Then poll `inspect` until `live_digest == desired_digest` or `hooks.timeout × 5`; then run `ready` (target's or default) until exit 0 or the same deadline. Any deadline or non-zero `update` → target `Degraded`, rollout `Halted` with the hook's reason. A target suspended, removed or moved to another group while its batch is open is marked skipped and takes no further part.
+For each target in the batch: mark `Progressing`; run `update` with the target plus `desired` and `desiredRef` (see section 6), so the program deploys exactly that digest. Exit 0 = started. An `update` whose result never came back (the process stopped) runs again after restart; programs must be idempotent. Then poll `inspect` until `live_digest == desired_digest` or `hooks.timeout × 5`; then run `ready` (target's or default) until exit 0 or the same deadline. Any deadline or non-zero `update` → target `Degraded`, rollout `Halted` with the hook's reason. A target suspended, removed, moved to another group or node, or given another image while its batch is open is marked skipped and takes no further part, whether that is noticed while planning, while soaking, or when its program's result comes back; such a result neither advances nor halts the batch.
 
 ### 4.3 Soak
 
@@ -159,13 +159,13 @@ If the effective soak duration is 0, the batch passes when all its targets are r
  "rollout": {"id": "...", "group": "lighthouse", "batch": 1, "wave": 1}}
 ```
 
-Exit 0 is a pass. Stdout's first line is shown as the reason; a second line of the form `updated=<num> remaining=<num> unit=<text>` is shown as the two numbers. The batch passes after `passes` consecutive passes with no more than `grace` failures in total; the `grace+1`th failure halts. A pass on stored evidence needs the last check to be no older than two intervals, so a process that was away re-checks before passing. A batch whose targets have no soak programs left passes at once. Each batch keeps its own soak record. `remaining` may be empty on the last batch; the program decides what that means.
+Exit 0 is a pass. Stdout's first line is shown as the reason; a second line of the form `updated=<num> remaining=<num> unit=<text>` is shown as the two numbers. The batch passes after `passes` consecutive passes with no more than `grace` failures in total; the `grace+1`th failure halts. A pass on stored evidence needs the last completed check to be no older than two intervals, so a process that was away re-checks before passing; a check that was dispatched but never answered is not evidence. A batch whose targets have no soak programs left passes at once. Each batch keeps its own soak record. `remaining` may be empty on the last batch; the program decides what that means.
 
 ### 4.4 Advance, pause, halt
 
 After a pass: if `pause_after_first` and this was batch 1, or a `pause` is pending, the rollout is `Paused` with the reason. `promote` or `resume` continues. Otherwise the next batch starts. After the last batch the rollout is `Complete`.
 
-`Halted`: the failed batch's targets stay `Degraded` on the new digest. Nothing else moves. The halt belongs to the desired digests at the time; when any of them changes, the rollout closes as `Superseded` and a new one is created with the Degraded targets sorted first. `retry` (reason required) re-runs the soak for the halted batch. `abort` closes the rollout; the group stays OutOfSync and the controller creates no new rollout for it until `sync` or a new digest. The abort is persisted with the digests it applies to and survives a restart. Known risk, accepted: an abort while an `update` is still running releases that node's budget before the program has finished.
+`Halted`: the failed batch's targets stay `Degraded` on the new digest. Nothing else moves. The halt belongs to the desired digests at the time; when any of them changes, the rollout closes as `Superseded` and a new one is created with the Degraded targets sorted first. `retry` (reason required) reopens the halted batch: its failed targets are inspected again before readiness and the soak, and the failed soak stays on the batch's record. `abort` closes the rollout; the group stays OutOfSync and the controller creates no new rollout for it until `sync` or a new digest. The abort is persisted with the digests it applies to and survives a restart; the marker is written before the rollout, and on restart the marker wins over a rollout the store still shows active. When a rollout ends (abort or supersede) while an `update` has been dispatched and its digest has not shown, that target's node stays counted against the budget for the update deadline (`hooks.timeout × 5`), so the next rollout cannot admit another node on top of it.
 
 Pause never carries across digests: a new digest supersedes a paused rollout too.
 
@@ -187,7 +187,7 @@ Programs under `hooks.dir`, run with the target document (or the soak/environmen
 | `soak` | `{updated, remaining, rollout}` | updated are no worse than remaining |
 | `environment` | `{environment}` | automated progress may continue |
 
-The target document is the target's row from the file plus `desired` (the digest it should run) and `desiredRef` (`<image repository>@<digest>`, ready to hand to a container runtime). Stdout and stderr are captured up to 64 KiB each; the rest is discarded. `rolloor hook <name> <target id>` runs a program by hand with the same document.
+The target document is the target's row from the file plus `desired` (the digest it should run) and `desiredRef` (`<image repository>@<digest>`, ready to hand to a container runtime). Stdout and stderr are captured up to 64 KiB each; the rest is discarded. `rolloor hook <name> --target <id>` runs a program by hand with the same document, resolving `desired` from the registry unless `--desired` is given.
 
 ## 7. API
 
@@ -201,11 +201,11 @@ GET  /targets?selector=k=v,k=v       targets matching
 GET  /rollouts                       all rollouts, newest first
 GET  /rollouts/{id}                  the rollout: waves, batches, soak results, reason
 GET  /history?selector=&node=&limit= events, filtered to targets the selector or node matches
-GET  /policies/{group}               PUT to change mode, speed, pin
-GET  /events                         SSE: every event and state transition as it happens
+GET  /policies/{group}               PUT replaces mode, speed, pins (a PUT without pins unpins)
+GET  /events                         SSE: every event as it happens; a client that falls behind gets `event: gap` and reconnects with `Last-Event-ID` to have the rest replayed from the store
 POST /actions/sync                   {selector, force?, speed?, confirm?}
 POST /actions/refresh                re-resolve every tag now
-POST /actions/suspend                {selector, reason, expires_in | expires_at, confirm?}
+POST /actions/suspend                {selector, reason, expiresIn | expiresAt, confirm?}
 POST /actions/resume                 {selector, confirm?}            lifts suspensions
 POST /actions/pause                  {rollout}
 POST /actions/promote                {rollout}                       also resumes a manual pause
@@ -224,11 +224,11 @@ Go `html/template` plus htmx for polling fragments every 5 s. No build step. Rou
 
 `/` fleet, `/groups/{label}/{value}`, `/rollouts`, `/rollouts/{id}`, `/nodes/{node}`, `/history`.
 
-Rules the templates enforce: every waiting or stopped state shows its `reason`; a control the viewer may not use is rendered disabled with the `403` reason; a target the rollout hasn't reached is styled as ordinary, never as an error; fleet tiles with a rollout in flight show `N of M on <digest>`.
+Form posts must come from this site (`Sec-Fetch-Site`, else `Origin`, else `Referer` must match the host); anything else is refused. Pages stop polling while a dialog is open or a field has focus. Rules the templates enforce: every waiting or stopped state shows its `reason`; a control the viewer may not use is rendered disabled with the `403` reason; a target the rollout hasn't reached is styled as ordinary, never as an error; fleet tiles with a rollout in flight show `N of M on <digest>`.
 
 ## 9. Storage
 
-SQLite via `modernc.org/sqlite` (no cgo), WAL mode, one file in `dataDir`. Tables: `live`, `degraded`, `desired`, `aborted`, `policies`, `rollouts` (the whole rollout as JSON, batches and soak included), `suspensions`, `events`. Migrations embedded and applied on start. Targets themselves are not stored; the file is the source. Last hook results are kept in memory only.
+SQLite via `modernc.org/sqlite` (no cgo), WAL mode, one file in `dataDir`. Tables: `live`, `degraded`, `desired`, `aborted`, `policies`, `rollouts` (the whole rollout as JSON, batches and soak included), `suspensions`, `events`. Migrations embedded and applied on start. Targets themselves are not stored; the file is the source. The last result per target and hook is stored (`hook_runs`) so it survives a restart.
 
 ## 10. Metrics
 

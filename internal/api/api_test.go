@@ -31,6 +31,8 @@ const (
 
 var errFake = errors.New("fake")
 
+const admin = "sam"
+
 // fakeWorld is a registry and a fleet whose hooks always succeed.
 type fakeWorld struct {
 	mu      sync.Mutex
@@ -107,7 +109,7 @@ func newFixture(t *testing.T) *fixture {
 
 	f := &fixture{t: t, ctx: context.Background(), store: reconcile.NewMemoryStore(), set: set,
 		world: &fakeWorld{digest: d1, running: map[string]string{"a-1/cl": d1, "a-2/cl": d1, "b-1/el": d1, "c-1/x": d1, "c-2/x": d1}},
-		auth:  &fakeAuth{id: Identity{Name: "sam", Admin: true}}, bc: NewBroadcaster()}
+		auth:  &fakeAuth{id: Identity{Name: admin, Admin: true}}, bc: NewBroadcaster()}
 
 	ids := 0
 	f.c, err = reconcile.New(f.ctx, &reconcile.Options{Config: cfg, Targets: func() *targets.Set { return f.set }, Resolver: f.world, Runner: f.world,
@@ -169,7 +171,7 @@ func TestReadRoutes(t *testing.T) {
 
 	code, body, _ = f.do(http.MethodGet, "/api/v1/me", "")
 	require.Equal(t, http.StatusOK, code)
-	require.Equal(t, "sam", body["name"])
+	require.Equal(t, admin, body["name"])
 
 	code, body, _ = f.do(http.MethodGet, "/api/v1/fleet", "")
 	require.Equal(t, http.StatusOK, code)
@@ -363,7 +365,7 @@ func TestAuthorization(t *testing.T) {
 	require.Equal(t, http.StatusOK, code)
 
 	// Lifting a suspension that spans two owners needs the confirmation too.
-	f.auth.id = Identity{Name: "sam", Admin: true}
+	f.auth.id = Identity{Name: admin, Admin: true}
 	code, _, _ = f.do(http.MethodPost, "/api/v1/actions/suspend", `{"selector": "client=c", "reason": "x", "confirm": true}`)
 	require.Equal(t, http.StatusOK, code)
 
@@ -464,7 +466,8 @@ func TestEventStreamAndBroadcaster(t *testing.T) {
 	cancel()
 	require.Eventually(t, func() bool { return f.bc.Subscribers() == 0 }, time.Second, 5*time.Millisecond)
 
-	// A full subscriber drops events instead of blocking the publisher.
+	// A subscriber that falls behind is closed instead of blocking the
+	// publisher, so the stream can tell the client to replay.
 	bc := NewBroadcaster()
 	ch, stop := bc.Subscribe()
 
@@ -473,8 +476,166 @@ func TestEventStreamAndBroadcaster(t *testing.T) {
 	}
 
 	require.Len(t, ch, 64)
-	stop()
 	require.Equal(t, 0, bc.Subscribers())
+
+	for range 64 {
+		<-ch
+	}
+
+	_, open := <-ch
+	require.False(t, open)
+	stop()
+}
+
+func TestEventStreamReplaysAndSignalsGaps(t *testing.T) {
+	f := newFixture(t)
+	f.release()
+
+	// Reconnecting with the id of the first event gets everything after it
+	// from the store before live events.
+	ctx, cancel := context.WithCancel(f.ctx)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.srv.URL+"/api/v1/events", http.NoBody)
+	require.NoError(t, err)
+	req.Header.Set("Last-Event-ID", "1")
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+
+	defer resp.Body.Close()
+
+	reader := bufio.NewReader(resp.Body)
+
+	var ids []string
+
+	for len(ids) < 2 {
+		line, err := reader.ReadString('\n')
+		require.NoError(t, err)
+
+		if strings.HasPrefix(line, "id: ") {
+			ids = append(ids, strings.TrimSpace(strings.TrimPrefix(line, "id: ")))
+		}
+	}
+
+	require.Equal(t, "2", ids[0], "replay starts right after the id the client had")
+	require.Equal(t, "3", ids[1])
+
+	// A subscriber that falls behind gets a gap event and the stream ends.
+	require.Eventually(t, func() bool { return f.bc.Subscribers() == 1 }, time.Second, 5*time.Millisecond)
+
+	for i := 0; i < 200; i++ {
+		f.bc.Publish(&reconcile.Event{ID: int64(1000 + i), Action: "x"})
+	}
+
+	var sawGap bool
+
+	for i := 0; i < 400 && !sawGap; i++ {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			break
+		}
+
+		sawGap = line == "event: gap\n"
+	}
+
+	require.True(t, sawGap)
+
+	// A bad Last-Event-ID is ignored; a failing store is reported.
+	f.store.Fail = errFake
+
+	code, _, _ := f.doWithHeader(http.MethodGet, "/api/v1/events", "Last-Event-ID", "5")
+	require.Equal(t, http.StatusInternalServerError, code)
+
+	f.store.Fail = nil
+}
+
+func (f *fixture) doWithHeader(method, path, key, value string) (int, map[string]any, string) {
+	f.t.Helper()
+
+	req, err := http.NewRequestWithContext(f.ctx, method, f.srv.URL+path, http.NoBody)
+	require.NoError(f.t, err)
+	req.Header.Set(key, value)
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(f.t, err)
+
+	defer resp.Body.Close()
+
+	var buf strings.Builder
+
+	_, _ = bufio.NewReader(resp.Body).WriteTo(&buf)
+
+	return resp.StatusCode, nil, buf.String()
+}
+
+func TestAuthorizeSharedRule(t *testing.T) {
+	f := newFixture(t)
+	root := &Identity{Name: admin, Admin: true}
+	dev := &Identity{Name: "dev", Owners: []string{"b"}}
+
+	_, err := Authorize(f.set, root, mustSel("client=zzz"), false, false)
+	require.ErrorContains(t, err, "matches nothing")
+
+	var ae *ActionError
+
+	require.ErrorAs(t, err, &ae)
+	require.Equal(t, http.StatusNotFound, ae.Status)
+
+	_, err = Authorize(f.set, dev, mustSel("id=c-2/x"), false, true)
+	require.ErrorAs(t, err, &ae)
+	require.Equal(t, "forbidden", ae.Code)
+	require.Equal(t, []string{"a", "b"}, ae.Owners)
+
+	matched, err := Authorize(f.set, dev, mustSel("id=c-2/x"), false, false)
+	require.NoError(t, err)
+	require.Len(t, matched, 1)
+
+	_, err = Authorize(f.set, root, mustSel("client=c"), false, false)
+	require.ErrorAs(t, err, &ae)
+	require.Equal(t, "confirm_required", ae.Code)
+	require.Equal(t, http.StatusConflict, ae.Status)
+
+	rec := httptest.NewRecorder()
+	writeActionRefusal(rec, errFake, nil)
+	require.Equal(t, http.StatusInternalServerError, rec.Code)
+}
+
+func TestSuspendAcceptsAnAbsoluteExpiry(t *testing.T) {
+	f := newFixture(t)
+
+	at := time.Now().Add(2 * time.Hour).UTC().Format(time.RFC3339)
+	code, body, _ := f.do(http.MethodPost, "/api/v1/actions/suspend", `{"selector": "id=a-1/cl", "reason": "x", "expiresAt": "`+at+`"}`)
+	require.Equal(t, http.StatusOK, code)
+
+	raw, isString := body["expiresAt"].(string)
+	require.True(t, isString)
+
+	got, err := time.Parse(time.RFC3339Nano, raw)
+	require.NoError(t, err)
+	require.WithinDuration(t, time.Now().Add(2*time.Hour), got, time.Minute)
+
+	code, body, _ = f.do(http.MethodPost, "/api/v1/actions/suspend", `{"selector": "id=a-2/cl", "reason": "x", "expiresAt": "yesterday"}`)
+	require.Equal(t, http.StatusBadRequest, code)
+	require.Contains(t, body["error"], "expiresAt")
+
+	code, body, _ = f.do(http.MethodPost, "/api/v1/actions/suspend", `{"selector": "id=a-2/cl", "reason": "x", "expiresAt": "2001-01-01T00:00:00Z"}`)
+	require.Equal(t, http.StatusBadRequest, code)
+	require.Contains(t, body["error"], "already past")
+}
+
+func TestHistoryAboutANodeIncludesItsGroupsAndSuspensions(t *testing.T) {
+	f := newFixture(t)
+	f.release()
+
+	code, _, _ := f.do(http.MethodPost, "/api/v1/actions/suspend", `{"selector": "node=a-2", "reason": "x", "confirm": true}`)
+	require.Equal(t, http.StatusOK, code)
+
+	code, _, raw := f.do(http.MethodGet, "/api/v1/history?node=a-2", "")
+	require.Equal(t, http.StatusOK, code)
+	require.Contains(t, raw, `"action":"suspend"`, "a selector event that covers the node")
+	require.Contains(t, raw, `"action":"rollout.created"`, "a group event for a group on the node")
+	require.NotContains(t, raw, `"target":"org/c:t"`, "group c is not on this node")
 }
 
 func TestStreamNeedsFlusher(t *testing.T) {
@@ -496,3 +657,12 @@ type noFlush struct {
 func (n *noFlush) Header() http.Header         { return n.header }
 func (n *noFlush) Write(b []byte) (int, error) { return n.body.Write(b) }
 func (n *noFlush) WriteHeader(code int)        { n.status = code }
+
+func mustSel(s string) targets.Selector {
+	sel, err := targets.ParseSelector(s)
+	if err != nil {
+		panic(err)
+	}
+
+	return sel
+}

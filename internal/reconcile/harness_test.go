@@ -31,6 +31,8 @@ const (
 	tA5       = "a-5/cl"
 	tA6       = "a-6/cl"
 	refused   = "no"
+	mine      = "mine"
+	tA3el     = "a-3/el"
 
 	imgA  = "org/a:t"
 	imgB  = "org/b:t"
@@ -92,6 +94,9 @@ type world struct {
 	soakFail    map[string]bool
 	soakStdout  string
 	runErr      map[string]error
+	gates       map[string]chan struct{}
+	entered     chan struct{}
+	resolved    int
 
 	envOK     bool
 	envReason string
@@ -111,13 +116,51 @@ func newWorld() *world {
 		notReady:    map[string]bool{},
 		soakFail:    map[string]bool{},
 		runErr:      map[string]error{},
+		gates:       map[string]chan struct{}{},
 		envOK:       true,
 	}
 }
 
+// gate makes the next call of kind ("resolve" or a hook name) block until
+// the returned function is called, so a test can overlap two operations.
+func (w *world) gate(kind string) (entered <-chan struct{}, release func()) {
+	in := make(chan struct{})
+	out := make(chan struct{})
+
+	w.mu.Lock()
+	w.gates[kind] = out
+	w.entered = in
+	w.mu.Unlock()
+
+	return in, func() { close(out) }
+}
+
+// wait blocks on the gate for kind if one is set, once.
+func (w *world) wait(kind string) {
+	w.mu.Lock()
+	g, ok := w.gates[kind]
+	entered := w.entered
+
+	if ok {
+		delete(w.gates, kind)
+		w.entered = nil
+	}
+
+	w.mu.Unlock()
+
+	if ok {
+		close(entered)
+		<-g
+	}
+}
+
 func (w *world) Resolve(_ context.Context, ref string) (registry.Resolved, error) {
+	w.wait("resolve")
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
+	w.resolved++
 
 	if err, ok := w.registryErr[ref]; ok {
 		return registry.Resolved{}, err
@@ -132,6 +175,8 @@ func (w *world) Resolve(_ context.Context, ref string) (registry.Resolved, error
 }
 
 func (w *world) Run(_ context.Context, program, hook, targetID string, input any) (hooks.Result, error) {
+	w.wait(hook)
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -197,6 +242,14 @@ func (w *world) set(fn func(w *world)) {
 	defer w.mu.Unlock()
 
 	fn(w)
+}
+
+// resolves is how many registry lookups have been made.
+func (w *world) resolves() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	return w.resolved
 }
 
 func (w *world) callsFor(hook string) []string {

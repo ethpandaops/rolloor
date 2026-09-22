@@ -86,6 +86,12 @@ type Controller struct {
 	lastResolve   time.Time
 	lastTick      time.Time
 	refreshWanted bool
+	// dirty is set when a store write failed; no hook runs until every
+	// decision has been written again.
+	dirty bool
+	// resolveMu serializes registry scans so an older scan cannot publish
+	// over a newer one.
+	resolveMu     sync.Mutex
 	resolveErrors map[string]string
 	targetsError  string
 	nextEventID   int64
@@ -179,6 +185,17 @@ func (c *Controller) restore(snap *Snapshot) {
 		c.aborted[g] = key
 	}
 
+	for id, runs := range snap.HookRuns {
+		c.hookRuns[id] = runs
+	}
+
+	// An abort whose rollout save never landed: the marker wins.
+	for _, r := range c.rollouts {
+		if _, aborted := c.aborted[r.Group]; aborted && r.State.Active() {
+			c.end(c.clock.Now(), r, Aborted, "Aborted before the last restart.")
+		}
+	}
+
 	// An update whose hook was running when the process stopped never
 	// reported back; the hook is idempotent, so it runs again.
 	for _, r := range c.rollouts {
@@ -243,10 +260,18 @@ func (c *Controller) Tick(ctx context.Context) error {
 	}
 
 	c.mu.Lock()
-	c.expireSuspensions(ctx, now)
-	c.supersedeChangedRollouts(ctx, now)
-	c.openRollouts(ctx, now)
-	jobs := c.planRollouts(ctx, now)
+
+	var jobs []job
+
+	// Decisions the store refused are written again before any new ones are
+	// made or any program runs on their behalf.
+	if c.flush(ctx) {
+		c.expireSuspensions(ctx, now)
+		c.supersedeChangedRollouts(ctx, now)
+		c.openRollouts(ctx, now)
+		jobs = c.planRollouts(ctx, now)
+	}
+
 	c.mu.Unlock()
 
 	results := c.execute(ctx, jobs)
@@ -285,6 +310,9 @@ func (c *Controller) resolveIfDue(ctx context.Context, now time.Time) error {
 
 // resolveAll resolves every image now and records the results.
 func (c *Controller) resolveAll(ctx context.Context, now time.Time) error {
+	c.resolveMu.Lock()
+	defer c.resolveMu.Unlock()
+
 	images := c.targets().Images()
 	resolved := make(map[string]registry.Resolved, len(images))
 	failed := make(map[string]string)
@@ -443,14 +471,49 @@ func (c *Controller) event(ctx context.Context, now time.Time, e *Event) {
 	}
 }
 
-// persist logs a store failure and returns it. The controller's own
-// decisions carry on from memory; a person's action reports it.
+// persist logs a store failure, marks the state dirty and returns it. A
+// person's action reports it; the controller's own decisions stay in memory
+// and are written again by flush before anything else happens.
 func (c *Controller) persist(ctx context.Context, err error) error {
 	if err != nil {
+		c.dirty = true
+
 		c.log.WithContext(ctx).WithError(err).Error("store write failed")
 	}
 
 	return err
+}
+
+// flush writes every decision again after a store failure. It reports
+// whether the store is clean.
+func (c *Controller) flush(ctx context.Context) bool {
+	if !c.dirty {
+		return true
+	}
+
+	c.dirty = false
+
+	for _, r := range c.rollouts {
+		_ = c.saveRollout(ctx, r)
+	}
+
+	for id, reason := range c.degraded {
+		_ = c.persist(ctx, c.store.SaveDegraded(ctx, id, reason))
+	}
+
+	for g, key := range c.aborted {
+		_ = c.persist(ctx, c.store.SaveAborted(ctx, g, key))
+	}
+
+	for img, d := range c.desired {
+		_ = c.persist(ctx, c.store.SaveDesired(ctx, img, d))
+	}
+
+	if c.dirty {
+		c.log.WithContext(ctx).Warn("store still failing; no programs run this tick")
+	}
+
+	return !c.dirty
 }
 
 // commit applies change to r and saves it. When the store refuses, the
@@ -485,11 +548,16 @@ func (c *Controller) SetLive(ctx context.Context, id, digest string, ok bool, re
 	c.setLiveLocked(ctx, now, observedAt, id, digest, ok, reason)
 }
 
-// setLiveLocked applies an observation unless a newer one is already recorded.
-func (c *Controller) setLiveLocked(ctx context.Context, now, observedAt time.Time, id, digest string, ok bool, reason string) {
+// setLiveLocked applies an observation unless a newer one is already
+// recorded or the target has left the files. It reports whether it applied.
+func (c *Controller) setLiveLocked(ctx context.Context, now, observedAt time.Time, id, digest string, ok bool, reason string) bool {
+	if _, present := c.targets().Get(id); !present {
+		return false
+	}
+
 	l := c.live[id]
 	if observedAt.Before(l.ObservedAt) {
-		return
+		return false
 	}
 
 	if ok {
@@ -502,6 +570,8 @@ func (c *Controller) setLiveLocked(ctx context.Context, now, observedAt time.Tim
 	l.ObservedAt = observedAt
 	c.live[id] = l
 	_ = c.persist(ctx, c.store.SaveLive(ctx, id, &l))
+
+	return true
 }
 
 // InspectAll runs the inspect hook for every target and records the result.
@@ -539,7 +609,7 @@ func (c *Controller) InspectAll(ctx context.Context) {
 				return nil
 			}
 
-			c.recordHookRun(t.ID, config.HookInspect, &res)
+			c.recordHookRun(gctx, t.ID, config.HookInspect, &res)
 			c.setLiveLocked(gctx, c.clock.Now(), started, t.ID, strings.TrimSpace(res.Reason), res.OK, res.Reason)
 
 			return nil
@@ -577,6 +647,7 @@ func (c *Controller) Forget(ctx context.Context, ids []string) {
 		delete(c.hookRuns, id)
 		_ = c.persist(ctx, c.store.DeleteLive(ctx, id))
 		_ = c.persist(ctx, c.store.ClearDegraded(ctx, id))
+		_ = c.persist(ctx, c.store.DeleteHookRuns(ctx, id))
 	}
 }
 
@@ -594,10 +665,16 @@ func (c *Controller) hookInput(set *targets.Set, t *targets.Target) HookInput {
 
 	if d, ok := c.desiredFor(set.Group(t), t); ok && d.Digest != "" {
 		in.Desired = d.Digest
-		in.DesiredRef = imageRepo(t.Image) + "@" + d.Digest
+		in.DesiredRef = DesiredRef(t.Image, d.Digest)
 	}
 
 	return in
+}
+
+// DesiredRef is the image reference a runtime can pull for exactly one
+// digest: the repository without its tag, at the digest.
+func DesiredRef(image, digest string) string {
+	return imageRepo(image) + "@" + digest
 }
 
 // imageRepo strips the tag from an image reference.
@@ -686,12 +763,21 @@ func (c *Controller) programFor(t *targets.Target, hook string) string {
 	return c.cfg.Hooks.Defaults[hook]
 }
 
-func (c *Controller) recordHookRun(id, hook string, res *hooks.Result) {
+// recordHookRun keeps the last result per target and hook, for people
+// looking at a target. A result for a target that has left the files is
+// dropped.
+func (c *Controller) recordHookRun(ctx context.Context, id, hook string, res *hooks.Result) {
+	if _, present := c.targets().Get(id); !present {
+		return
+	}
+
 	if c.hookRuns[id] == nil {
 		c.hookRuns[id] = map[string]HookRun{}
 	}
 
-	c.hookRuns[id][hook] = HookRun{Hook: hook, Result: *res}
+	run := HookRun{Hook: hook, Result: *res}
+	c.hookRuns[id][hook] = run
+	_ = c.persist(ctx, c.store.SaveHookRun(ctx, id, &run))
 }
 
 // activeRollout returns the group's active rollout, if any.

@@ -9,6 +9,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/ethpandaops/rolloor/internal/hooks"
 	"github.com/ethpandaops/rolloor/internal/reconcile"
 	"github.com/ethpandaops/rolloor/internal/targets"
 )
@@ -57,6 +58,11 @@ func TestRoundTrip(t *testing.T) {
 	require.NoError(t, s.SaveLive(ctx, "t2", &reconcile.Live{Failures: 2}))
 	require.NoError(t, s.DeleteLive(ctx, "t2"))
 
+	require.NoError(t, s.SaveHookRun(ctx, t1, &reconcile.HookRun{Hook: "update", Result: hooks.Result{Reason: "no"}}))
+	require.NoError(t, s.SaveHookRun(ctx, t1, &reconcile.HookRun{Hook: "update", Result: hooks.Result{Reason: "still no"}}))
+	require.NoError(t, s.SaveHookRun(ctx, "t2", &reconcile.HookRun{Hook: "inspect"}))
+	require.NoError(t, s.DeleteHookRuns(ctx, "t2"))
+
 	require.NoError(t, s.SaveDesired(ctx, "img", reconcile.Desired{Digest: sha, Revision: "r"}))
 	require.NoError(t, s.SaveDesired(ctx, "img", reconcile.Desired{Digest: "sha256:2"}))
 	require.NoError(t, s.SaveAborted(ctx, "a", "img=sha256:2"))
@@ -90,6 +96,19 @@ func TestRoundTrip(t *testing.T) {
 	require.Len(t, snap.Live, 1)
 	require.Equal(t, map[string]string{t1: "worse"}, snap.Degraded)
 	require.Equal(t, "sha256:2", snap.Desired["img"].Digest)
+	require.Equal(t, "still no", snap.HookRuns[t1]["update"].Result.Reason)
+	require.NotContains(t, snap.HookRuns, "t2")
+
+	// Replay: everything after an id, oldest first.
+	after, err := s.Events(ctx, reconcile.EventQuery{After: 1})
+	require.NoError(t, err)
+	require.NotEmpty(t, after)
+	require.Greater(t, after[0].ID, int64(1))
+
+	if len(after) > 1 {
+		require.Less(t, after[0].ID, after[1].ID)
+	}
+
 	require.Equal(t, map[string]string{"a": "img=sha256:2"}, snap.Aborted)
 	require.Equal(t, int64(4), snap.NextEventID)
 
@@ -165,6 +184,8 @@ func TestClosedStoreFailsEveryCall(t *testing.T) {
 	require.Error(t, s.SaveDesired(ctx, "i", reconcile.Desired{}))
 	require.Error(t, s.SaveAborted(ctx, "g", "k"))
 	require.Error(t, s.ClearAborted(ctx, "g"))
+	require.Error(t, s.SaveHookRun(ctx, "x", &reconcile.HookRun{Hook: "h"}))
+	require.Error(t, s.DeleteHookRuns(ctx, "x"))
 	require.Error(t, s.AppendEvent(ctx, &reconcile.Event{ID: 1}))
 
 	_, err := s.Events(ctx, reconcile.EventQuery{})

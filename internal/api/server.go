@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"sort"
 	"strconv"
 	"time"
 
@@ -170,13 +169,10 @@ func (s *Server) history(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	limit, _ := strconv.Atoi(q.Get("limit"))
 
-	var keep map[string]struct{}
+	var about []targets.Target
 
 	if node := q.Get("node"); node != "" {
-		keep = map[string]struct{}{}
-		for _, t := range s.targets().Node(node) {
-			keep[t.ID] = struct{}{}
-		}
+		about = s.targets().Node(node)
 	}
 
 	if raw := q.Get("selector"); raw != "" {
@@ -187,29 +183,26 @@ func (s *Server) history(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		keep = map[string]struct{}{}
-		for _, t := range s.targets().Select(sel) {
-			keep[t.ID] = struct{}{}
-		}
+		about = s.targets().Select(sel)
 	}
 
-	events, err := s.c.Events(r.Context(), reconcile.EventQuery{Group: q.Get("group"), Rollout: q.Get("rollout"), Target: q.Get("target"), Limit: limit})
+	query := reconcile.EventQuery{Group: q.Get("group"), Rollout: q.Get("rollout"), Target: q.Get("target"), Limit: limit}
+
+	var (
+		events []reconcile.Event
+		err    error
+	)
+
+	if about != nil {
+		events, err = s.c.EventsAbout(r.Context(), about, query)
+	} else {
+		events, err = s.c.Events(r.Context(), query)
+	}
+
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 
 		return
-	}
-
-	if keep != nil {
-		filtered := make([]reconcile.Event, 0, len(events))
-
-		for i := range events {
-			if _, ok := keep[events[i].Target]; ok {
-				filtered = append(filtered, events[i])
-			}
-		}
-
-		events = filtered
 	}
 
 	if events == nil {
@@ -272,6 +265,27 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 	ch, stop := s.events.Subscribe()
 	defer stop()
 
+	// A client that reconnects says where it was; everything since is
+	// replayed from the store before live events continue.
+	var last int64
+
+	if raw := r.Header.Get("Last-Event-ID"); raw != "" {
+		last, _ = strconv.ParseInt(raw, 10, 64)
+	}
+
+	var replay []reconcile.Event
+
+	if last > 0 {
+		missed, err := s.c.Events(r.Context(), reconcile.EventQuery{After: last})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+
+			return
+		}
+
+		replay = missed
+	}
+
 	// A client that stops reading gets a write deadline, not a parked handler.
 	rc := http.NewResponseController(w)
 	write := func(format string, args ...any) bool {
@@ -292,6 +306,27 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	send := func(e *reconcile.Event) bool {
+		if e.ID <= last {
+			return true
+		}
+
+		raw, err := json.Marshal(e)
+		if err != nil {
+			return true
+		}
+
+		last = e.ID
+
+		return write("id: %d\nevent: %s\ndata: %s\n\n", e.ID, e.Action, raw)
+	}
+
+	for i := range replay {
+		if !send(&replay[i]) {
+			return
+		}
+	}
+
 	heartbeat := time.NewTicker(sseHeartbeat)
 	defer heartbeat.Stop()
 
@@ -303,13 +338,16 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 			if !write(": ping\n\n") {
 				return
 			}
-		case e := <-ch:
-			raw, err := json.Marshal(e)
-			if err != nil {
-				continue
+		case e, ok := <-ch:
+			if !ok {
+				// The client fell too far behind. It reconnects with the last id
+				// it saw and gets the rest replayed rather than silently missing it.
+				write("event: gap\ndata: {\"lastId\": %d}\n\n", last)
+
+				return
 			}
 
-			if !write("id: %d\nevent: %s\ndata: %s\n\n", e.ID, e.Action, raw) {
+			if !send(&e) {
 				return
 			}
 		}
@@ -329,24 +367,6 @@ func (s *Server) identity(w http.ResponseWriter, r *http.Request) (Identity, boo
 }
 
 // ownersOf lists the distinct owner values of some targets, sorted.
-func (s *Server) ownersOf(ts []targets.Target) []string {
-	set := s.targets()
-	seen := map[string]struct{}{}
-
-	for i := range ts {
-		seen[set.Owner(&ts[i])] = struct{}{}
-	}
-
-	out := make([]string, 0, len(seen))
-	for o := range seen {
-		out = append(out, o)
-	}
-
-	sort.Strings(out)
-
-	return out
-}
-
 // authorizeSelector checks the caller may act on everything the selector
 // matches, and that a selector spanning several owners was confirmed. With
 // wholeGroups, the check covers every target in the groups the selector
@@ -357,33 +377,9 @@ func (s *Server) authorizeSelector(w http.ResponseWriter, r *http.Request, sel t
 		return Identity{}, nil, false
 	}
 
-	set := s.targets()
-
-	matched := set.Select(sel)
-	if len(matched) == 0 {
-		writeError(w, http.StatusNotFound, "selector "+sel.String()+" matches nothing")
-
-		return Identity{}, nil, false
-	}
-
-	affected := matched
-	if wholeGroups {
-		affected = expandGroups(set, matched)
-	}
-
-	owners := s.ownersOf(affected)
-
-	if allowed, why := MayAct(&id, owners); !allowed {
-		writeForbidden(w, why, owners, id.Owners)
-
-		return Identity{}, nil, false
-	}
-
-	if len(owners) > 1 && !confirm {
-		writeJSON(w, http.StatusConflict, map[string]any{
-			errKey: fmt.Sprintf("selector %s spans %d owners (%v); send confirm: true to proceed", sel, len(owners), owners),
-			"code": "confirm_required", "owners": owners,
-		})
+	matched, err := Authorize(s.targets(), &id, sel, confirm, wholeGroups)
+	if err != nil {
+		writeActionRefusal(w, err, id.Owners)
 
 		return Identity{}, nil, false
 	}
@@ -391,23 +387,23 @@ func (s *Server) authorizeSelector(w http.ResponseWriter, r *http.Request, sel t
 	return id, matched, true
 }
 
-// expandGroups returns every target in the groups the given targets belong to.
-func expandGroups(set *targets.Set, matched []targets.Target) []targets.Target {
-	seen := map[string]struct{}{}
+// writeActionRefusal answers with the status and body an ActionError carries.
+func writeActionRefusal(w http.ResponseWriter, err error, held []string) {
+	var ae *ActionError
+	if !errors.As(err, &ae) {
+		writeError(w, http.StatusInternalServerError, err.Error())
 
-	var out []targets.Target
-
-	for i := range matched {
-		g := set.Group(&matched[i])
-		if _, done := seen[g]; done {
-			continue
-		}
-
-		seen[g] = struct{}{}
-		out = append(out, set.InGroup(g)...)
+		return
 	}
 
-	return out
+	switch ae.Code {
+	case "forbidden":
+		writeForbidden(w, ae.Message, ae.Owners, held)
+	case "confirm_required":
+		writeJSON(w, ae.Status, map[string]any{errKey: ae.Message, "code": ae.Code, "owners": ae.Owners})
+	default:
+		writeError(w, ae.Status, ae.Message)
+	}
 }
 
 // authorizeGroup checks the caller may act on a group.
@@ -424,7 +420,7 @@ func (s *Server) authorizeGroup(w http.ResponseWriter, r *http.Request, group st
 		return Identity{}, false
 	}
 
-	owners := s.ownersOf(members)
+	owners := OwnersOf(s.targets(), members)
 	if allowed, why := MayAct(&id, owners); !allowed {
 		writeForbidden(w, why, owners, id.Owners)
 

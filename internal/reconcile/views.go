@@ -409,11 +409,13 @@ func (c *Controller) rolloutViewLocked(set *targets.Set, r *Rollout) RolloutView
 		break
 	}
 
-	for _, rt := range r.Targets {
+	// Only an observed digest counts as being on the new build, whatever
+	// phase the target is in.
+	for i := range r.Targets {
+		rt := &r.Targets[i]
+
 		switch rt.Phase {
-		case PhasePassed, PhaseReady:
-			v.OnNewBuild++
-		case PhaseUpdating, PhaseFailed:
+		case PhasePassed, PhaseReady, PhaseUpdating, PhaseFailed:
 			if rt.Updated {
 				v.OnNewBuild++
 			}

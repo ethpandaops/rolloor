@@ -85,7 +85,7 @@ func (c *Controller) planRollout(ctx context.Context, now time.Time, r *Rollout,
 
 		c.retryBatch(ctx, now, r)
 
-		return c.planSoak(ctx, now, r, set)
+		return c.planBatch(ctx, now, r, set)
 	case Soaking:
 		return c.planSoak(ctx, now, r, set)
 	case Running, WaitingForBudget, WaitingForEnvironment:
@@ -103,26 +103,33 @@ func (c *Controller) planRollout(ctx context.Context, now time.Time, r *Rollout,
 	}
 }
 
-// retryBatch reopens a halted batch for another soak.
+// retryBatch reopens a halted batch. Its failed targets go back to waiting
+// for their digest to show, so nothing is claimed that was not observed; the
+// batch's earlier soak attempts stay on the record.
 func (c *Controller) retryBatch(ctx context.Context, now time.Time, r *Rollout) {
 	r.RetryPending = false
-	r.Soak = SoakProgress{StartedAt: now}
+	r.Soak = SoakProgress{}
 
 	b := &r.Batches[len(r.Batches)-1]
 	b.EndedAt = time.Time{}
-	b.Soak = nil
+
+	if b.Soak != nil {
+		b.PriorSoaks = append(b.PriorSoaks, b.Soak)
+		b.Soak = nil
+	}
 
 	for _, id := range b.Targets {
 		rt := r.target(id)
 		if rt.Phase == PhaseFailed {
-			rt.Phase, rt.Reason = PhaseReady, "retrying"
+			rt.Phase, rt.Reason, rt.UpdatedAt = PhaseUpdating, "retrying: waiting for the digest", now
+			rt.UpdateDone, rt.Updated = true, false
 
 			delete(c.degraded, id)
 			_ = c.persist(ctx, c.store.ClearDegraded(ctx, id))
 		}
 	}
 
-	c.setState(ctx, now, r, Soaking, fmt.Sprintf("Retrying the soak for batch %d.", b.Number))
+	c.setState(ctx, now, r, Running, fmt.Sprintf("Retrying batch %d.", b.Number))
 }
 
 // planBatch moves each target in the open batch one step: dispatch the
@@ -201,6 +208,14 @@ func (c *Controller) skipReason(r *Rollout, set *targets.Set, t *targets.Target,
 		return "moved to group " + set.Group(t), true
 	}
 
+	if rt := r.target(t.ID); rt != nil && rt.Node != t.Node {
+		return "moved to node " + t.Node, true
+	}
+
+	if _, known := r.Desired[t.Image]; !known {
+		return "image changed to " + t.Image, true
+	}
+
 	if s := c.suspensionFor(t); s != nil {
 		return "suspended by " + s.Actor + ": " + s.Reason, true
 	}
@@ -260,7 +275,7 @@ func (c *Controller) planSoak(ctx context.Context, now time.Time, r *Rollout, se
 		return nil
 	}
 
-	if !r.Soak.LastCheckAt.IsZero() && now.Sub(r.Soak.LastCheckAt) < preset.Soak.Interval {
+	if !r.Soak.LastCheckStartedAt.IsZero() && now.Sub(r.Soak.LastCheckStartedAt) < preset.Soak.Interval {
 		return nil
 	}
 
@@ -281,7 +296,9 @@ func (c *Controller) planSoak(ctx context.Context, now time.Time, r *Rollout, se
 		}
 
 		t, ok := set.Get(id)
-		if !ok {
+		if reason, skip := c.skipReason(r, set, &t, ok); skip {
+			rt.Phase, rt.Reason = PhaseSkipped, reason
+
 			continue
 		}
 
@@ -315,7 +332,7 @@ func (c *Controller) planSoak(ctx context.Context, now time.Time, r *Rollout, se
 		})
 	}
 
-	r.Soak.LastCheckAt = now
+	r.Soak.LastCheckStartedAt = now
 
 	return jobs
 }
@@ -325,7 +342,8 @@ func (c *Controller) planSoak(ctx context.Context, now time.Time, r *Rollout, se
 func (c *Controller) remainingForSoak(r *Rollout, set *targets.Set, prog string) []targets.Target {
 	out := []targets.Target{}
 
-	for _, rt := range r.Targets {
+	for i := range r.Targets {
+		rt := &r.Targets[i]
 		if rt.Batch != 0 || rt.Phase != PhasePending {
 			continue
 		}
@@ -388,8 +406,8 @@ func cloneSoak(s *SoakProgress) *SoakProgress {
 }
 
 func (c *Controller) hasRemaining(r *Rollout) bool {
-	for _, rt := range r.Targets {
-		if rt.Batch == 0 && rt.Phase == PhasePending {
+	for i := range r.Targets {
+		if rt := &r.Targets[i]; rt.Batch == 0 && rt.Phase == PhasePending {
 			return true
 		}
 	}
@@ -479,7 +497,7 @@ func (c *Controller) applyResults(ctx context.Context, now time.Time, results []
 			continue
 		}
 
-		c.recordHookRun(o.target, o.hook, &o.res)
+		c.recordHookRun(ctx, o.target, o.hook, &o.res)
 
 		touched[r.ID] = r
 		c.applyTargetResult(ctx, now, r, o)
@@ -507,6 +525,15 @@ func (c *Controller) applyTargetResult(ctx context.Context, now time.Time, r *Ro
 		return
 	}
 
+	// A target that stopped being eligible while its program ran is skipped;
+	// its result neither advances nor halts the batch.
+	t, present := c.targets().Get(o.target)
+	if reason, skip := c.skipReason(r, c.targets(), &t, present); skip {
+		rt.Phase, rt.Reason = PhaseSkipped, reason
+
+		return
+	}
+
 	switch o.hook {
 	case config.HookUpdate:
 		if !o.res.OK {
@@ -518,10 +545,9 @@ func (c *Controller) applyTargetResult(ctx context.Context, now time.Time, r *Ro
 		rt.UpdateDone, rt.Reason = true, "update started, waiting for the digest"
 	case config.HookInspect:
 		digest := strings.TrimSpace(o.res.Reason)
-		c.setLiveLocked(ctx, now, o.started, o.target, digest, o.res.OK, o.res.Reason)
+		accepted := c.setLiveLocked(ctx, now, o.started, o.target, digest, o.res.OK, o.res.Reason)
 
-		t, _ := c.targets().Get(o.target)
-		if o.res.OK && digest == r.Desired[t.Image] {
+		if accepted && o.res.OK && digest == r.Desired[t.Image] {
 			rt.Updated, rt.Reason = true, "on the new build, checking readiness"
 
 			if r.Force {
@@ -553,13 +579,15 @@ func (c *Controller) applySoak(ctx context.Context, now time.Time, r *Rollout, o
 		r.Soak.Checks = append(r.Soak.Checks, check)
 
 		for _, id := range o.soakIDs {
-			c.recordHookRun(id, config.HookSoak, &o.res)
+			c.recordHookRun(ctx, id, config.HookSoak, &o.res)
 		}
 
 		if !o.res.OK {
 			allOK = false
 		}
 	}
+
+	r.Soak.LastCheckAt = now
 
 	if allOK {
 		r.Soak.Streak++

@@ -144,8 +144,18 @@ func TestSoakFailureHaltsQuarantinesAndRetries(t *testing.T) {
 	require.NoError(t, h.c.Retry(h.ctx, actor, r.ID, "probe was wrong"))
 	h.world.set(func(w *world) { w.soakFail[soakA] = false })
 	h.tick()
-	require.Equal(t, Soaking, h.active("a").State)
+
+	// The failed targets are inspected again before anything is claimed, and
+	// the soak that failed stays on the batch's record.
+	retried := h.active("a")
+	require.Equal(t, Running, retried.State)
+	require.Equal(t, PhaseUpdating, h.phases(retried)[tA1])
+	require.Equal(t, 2, retried.OnNewBuild, "inspect saw the digest again in the same tick")
+	require.Len(t, retried.Batches[0].PriorSoaks, 1)
 	require.Equal(t, Progressing, h.view(tA1).Health)
+
+	h.ticks(3, 0)
+	require.Equal(t, Soaking, h.active("a").State)
 	h.ticks(4, 20*time.Second)
 	require.Equal(t, Running, h.active("a").State)
 	require.Equal(t, PhasePassed, h.phases(h.active("a"))[tA1])
@@ -256,7 +266,7 @@ func TestBudgetIsSharedAcrossGroupsAndNodesCountOnce(t *testing.T) {
 	require.Equal(t, []string{tA3, tA4}, ra.Batches[0].Targets)
 
 	// Node a-3 is already in flight, so a-3/el is free; b-1 would exceed the budget.
-	require.Equal(t, []string{"a-3/el"}, rb.Batches[0].Targets)
+	require.Equal(t, []string{tA3el}, rb.Batches[0].Targets)
 	require.Equal(t, "40.0%", h.c.Fleet().BudgetInUse)
 
 	h.drive(ra.ID, 120, 20*time.Second)
@@ -280,7 +290,7 @@ func TestWaitingForBudgetSaysHowMuch(t *testing.T) {
 
 	ra, rb := h.active("a"), h.active("b")
 	require.Equal(t, []string{tA3}, ra.Batches[0].Targets)
-	require.Equal(t, []string{"a-3/el"}, rb.Batches[0].Targets, "same node, no extra cost")
+	require.Equal(t, []string{tA3el}, rb.Batches[0].Targets, "same node, no extra cost")
 
 	// After the first batches pass, a takes the next node and b has to wait.
 	h.ticks(4, 0)
@@ -537,7 +547,7 @@ func TestSuspendResumeAndExpiry(t *testing.T) {
 
 	// A suspension arriving mid-rollout skips the target when its turn comes,
 	// and it leaves the soak comparison group.
-	_, err = h.c.Suspend(h.ctx, SuspendRequest{Actor: actor, Selector: mustSel("id=a-6/cl"), Reason: "mine"})
+	_, err = h.c.Suspend(h.ctx, SuspendRequest{Actor: actor, Selector: mustSel("id=a-6/cl"), Reason: mine})
 	require.NoError(t, err)
 
 	final := h.drive(r.ID, 60, 20*time.Second)

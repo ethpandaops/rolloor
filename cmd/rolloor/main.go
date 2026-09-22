@@ -156,24 +156,26 @@ func newHookCommand(configPath *string) *cobra.Command {
 	var (
 		targetID string
 		program  string
+		desired  string
 	)
 
 	cmd := &cobra.Command{
 		Use:   "hook <inspect|update|ready|soak|environment>",
-		Short: "Run one hook against one target and print the result",
+		Short: "Run one hook against one target with the document the controller would send",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runHook(cmd.Context(), cmd.OutOrStdout(), *configPath, args[0], targetID, program)
+			return runHook(cmd.Context(), cmd.OutOrStdout(), *configPath, args[0], targetID, program, desired)
 		},
 	}
 
 	cmd.Flags().StringVar(&targetID, "target", "", "target id (required for target hooks)")
 	cmd.Flags().StringVar(&program, "program", "", "program name; defaults to the target's probe or the configured default")
+	cmd.Flags().StringVar(&desired, "desired", "", "digest to send as desired; resolved from the registry when empty")
 
 	return cmd
 }
 
-func runHook(ctx context.Context, out interface{ Write([]byte) (int, error) }, configPath, hook, targetID, program string) error {
+func runHook(ctx context.Context, out interface{ Write([]byte) (int, error) }, configPath, hook, targetID, program, desired string) error {
 	cfg, set, err := load(configPath)
 	if err != nil {
 		return err
@@ -197,10 +199,30 @@ func runHook(ctx context.Context, out interface{ Write([]byte) (int, error) }, c
 			return fmt.Errorf("target %q is not in the targets files", targetID)
 		}
 
-		// The controller adds the desired digest at runtime; here the target
-		// stands alone. Soak receives the document the controller sends, with
-		// this target as the whole updated set.
-		input = reconcile.HookInput{Target: t}
+		// Target hooks get the same document the controller sends, desired
+		// digest included, so an update program can be tried by hand without
+		// falling back to the tag. Soak gets this target as the whole batch.
+		in := reconcile.HookInput{Target: t}
+
+		if desired == "" && hook != config.HookSoak {
+			resolver, rerr := registry.NewResolver(registry.Options{AuthFile: cfg.Registry.AuthFile, PlainHTTP: cfg.Registry.PlainHTTP, Timeout: cfg.Registry.Timeout}, log)
+			if rerr != nil {
+				return rerr
+			}
+
+			res, rerr := resolver.Resolve(ctx, t.Image)
+			if rerr != nil {
+				return fmt.Errorf("resolve %s (pass --desired to skip): %w", t.Image, rerr)
+			}
+
+			desired = res.Digest
+		}
+
+		if desired != "" {
+			in.Desired, in.DesiredRef = desired, reconcile.DesiredRef(t.Image, desired)
+		}
+
+		input = in
 		if hook == config.HookSoak {
 			input = map[string]any{"updated": []targets.Target{t}, "remaining": []targets.Target{}, "rollout": map[string]any{"id": "manual", "group": set.Group(&t), "batch": 1, "wave": set.Wave(&t)}}
 		}

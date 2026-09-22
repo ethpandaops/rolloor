@@ -132,6 +132,9 @@ type RolloutTarget struct {
 	// DegradedBefore marks a target that was already Degraded when the
 	// rollout began, so its node costs nothing against the budget.
 	DegradedBefore bool `json:"degradedBefore,omitempty"`
+	// HoldUntil keeps the node counted against the budget after the rollout
+	// ended while this target's update may still be landing.
+	HoldUntil time.Time `json:"holdUntil,omitzero"`
 }
 
 // Batch is one step of a rollout.
@@ -143,8 +146,9 @@ type Batch struct {
 	EndedAt   time.Time `json:"endedAt,omitzero"`
 	Passed    bool      `json:"passed"`
 	// Soak is the batch's soak once it has ended; the open batch's lives on
-	// the rollout.
-	Soak *SoakProgress `json:"soak,omitempty"`
+	// the rollout. PriorSoaks are the attempts a retry replaced.
+	Soak       *SoakProgress   `json:"soak,omitempty"`
+	PriorSoaks []*SoakProgress `json:"priorSoaks,omitempty"`
 }
 
 // SoakCheck is one run of one soak program.
@@ -160,11 +164,14 @@ type SoakCheck struct {
 
 // SoakProgress tracks the current batch's soak.
 type SoakProgress struct {
-	StartedAt   time.Time   `json:"startedAt,omitzero"`
-	LastCheckAt time.Time   `json:"lastCheckAt,omitzero"`
-	Streak      int         `json:"streak"`
-	Failures    int         `json:"failures"`
-	Checks      []SoakCheck `json:"checks,omitempty"`
+	StartedAt time.Time `json:"startedAt,omitzero"`
+	// LastCheckAt is when the last check completed; LastCheckStartedAt is
+	// when the last one was dispatched, which paces checks but is no evidence.
+	LastCheckAt        time.Time   `json:"lastCheckAt,omitzero"`
+	LastCheckStartedAt time.Time   `json:"lastCheckStartedAt,omitzero"`
+	Streak             int         `json:"streak"`
+	Failures           int         `json:"failures"`
+	Checks             []SoakCheck `json:"checks,omitempty"`
 }
 
 // Rollout is one group's convergence toward a set of digests.

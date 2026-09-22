@@ -158,21 +158,7 @@ func (s *Server) canAct(id *api.Identity, owners []string) can {
 }
 
 func (s *Server) ownersOf(ts []targets.Target) []string {
-	set := s.targets()
-	seen := map[string]struct{}{}
-
-	for i := range ts {
-		seen[set.Owner(&ts[i])] = struct{}{}
-	}
-
-	out := make([]string, 0, len(seen))
-	for o := range seen {
-		out = append(out, o)
-	}
-
-	sort.Strings(out)
-
-	return out
+	return api.OwnersOf(s.targets(), ts)
 }
 
 // section groups tiles under a heading from the section label.
@@ -230,7 +216,9 @@ type groupData struct {
 	Targets    []reconcile.TargetView
 	GroupLabel string
 	Can        can
-	Presets    []string
+	// Owners are the owner values in the group; more than one means the
+	// forms need the confirm box.
+	Owners []string
 }
 
 func (s *Server) group(w http.ResponseWriter, r *http.Request) {
@@ -252,7 +240,8 @@ func (s *Server) group(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data := groupData{Group: g, Targets: ts, GroupLabel: s.cfg.Labels.Group, Can: s.canAct(&id, s.ownersOf(s.targets().InGroup(g.Name))), Presets: s.cfg.PresetNames()}
+	owners := s.ownersOf(s.targets().InGroup(g.Name))
+	data := groupData{Group: g, Targets: ts, GroupLabel: s.cfg.Labels.Group, Can: s.canAct(&id, owners), Owners: owners}
 	s.render(w, r, id, g.Name, "group", data)
 }
 
@@ -300,7 +289,8 @@ func (s *Server) rollout(w http.ResponseWriter, r *http.Request) {
 
 	var order []int
 
-	for _, rt := range v.Targets {
+	for i := range v.Targets {
+		rt := v.Targets[i]
 		byID[rt.ID] = rt
 
 		if _, seen := waves[rt.Wave]; !seen {
@@ -319,8 +309,10 @@ func (s *Server) rollout(w http.ResponseWriter, r *http.Request) {
 
 	sort.Ints(order)
 
-	for _, b := range v.Batches {
-		bv := batchView{Batch: b, Open: b.EndedAt.IsZero()}
+	for i := range v.Batches {
+		b := &v.Batches[i]
+		bv := batchView{Batch: *b, Open: b.EndedAt.IsZero()}
+
 		for _, tid := range b.Targets {
 			bv.Targets = append(bv.Targets, byID[tid])
 		}
@@ -366,7 +358,11 @@ type nodeData struct {
 	Node       reconcile.NodeView
 	GroupLabel string
 	Can        map[string]can
-	NodeCan    can
+	// ResumeCan is per target: lifting its suspension acts on everything
+	// that suspension's selector matches, not just this row.
+	ResumeCan map[string]can
+	NodeCan   can
+	Owners    []string
 }
 
 func (s *Server) node(w http.ResponseWriter, r *http.Request) {
@@ -382,13 +378,20 @@ func (s *Server) node(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data := nodeData{Node: n, GroupLabel: s.cfg.Labels.Group, Can: map[string]can{}}
+	set := s.targets()
+	data := nodeData{Node: n, GroupLabel: s.cfg.Labels.Group, Can: map[string]can{}, ResumeCan: map[string]can{}}
 
 	for i := range n.Targets {
-		data.Can[n.Targets[i].ID] = s.canAct(&id, []string{n.Targets[i].Owner})
+		t := &n.Targets[i]
+		data.Can[t.ID] = s.canAct(&id, []string{t.Owner})
+
+		if t.Suspension != nil {
+			data.ResumeCan[t.ID] = s.canAct(&id, s.ownersOf(set.Select(t.Suspension.Selector)))
+		}
 	}
 
-	data.NodeCan = s.canAct(&id, s.ownersOf(s.targets().Node(n.Name)))
+	data.Owners = s.ownersOf(set.Node(n.Name))
+	data.NodeCan = s.canAct(&id, data.Owners)
 	s.render(w, r, id, n.Name, "node", data)
 }
 
@@ -409,28 +412,23 @@ func (s *Server) history(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	data := historyData{Group: q.Get("group"), Node: q.Get("node"), Rollout: q.Get("rollout"), GroupLabel: s.cfg.Labels.Group}
 
-	events, err := s.c.Events(r.Context(), reconcile.EventQuery{Group: data.Group, Rollout: data.Rollout, Limit: 200})
+	query := reconcile.EventQuery{Group: data.Group, Rollout: data.Rollout, Limit: 200}
+
+	var (
+		events []reconcile.Event
+		err    error
+	)
+
+	if data.Node != "" {
+		events, err = s.c.EventsAbout(r.Context(), s.targets().Node(data.Node), query)
+	} else {
+		events, err = s.c.Events(r.Context(), query)
+	}
+
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 
 		return
-	}
-
-	if data.Node != "" {
-		onNode := map[string]struct{}{}
-		for _, t := range s.targets().Node(data.Node) {
-			onNode[t.ID] = struct{}{}
-		}
-
-		kept := events[:0]
-
-		for i := range events {
-			if _, ok := onNode[events[i].Target]; ok {
-				kept = append(kept, events[i])
-			}
-		}
-
-		events = kept
 	}
 
 	data.Events = events
@@ -445,20 +443,24 @@ func (s *Server) action(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A form post rides on the session cookie, so it must come from this
+	// site: a page elsewhere cannot make the browser act for the viewer.
+	if !sameOrigin(r) {
+		http.Error(w, "cross-site request refused", http.StatusForbidden)
+
+		return
+	}
+
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 
 		return
 	}
 
-	next := r.Form.Get("next")
-	if !strings.HasPrefix(next, "/") || strings.HasPrefix(next, "//") {
-		next = "/"
-	}
+	target := returnPath(r.Form.Get("next"))
 
 	flash, err := s.perform(r, &id)
 
-	target, _ := url.Parse(next)
 	q := target.Query()
 	q.Del("flash")
 	q.Del("error")
@@ -470,14 +472,55 @@ func (s *Server) action(w http.ResponseWriter, r *http.Request) {
 	}
 
 	target.RawQuery = q.Encode()
-	//nolint:gosec // next is a same-origin path: it must start with one slash and is re-encoded above.
+	//nolint:gosec // returnPath only yields a same-site path.
 	http.Redirect(w, r, target.String(), http.StatusSeeOther)
+}
+
+// returnPath turns the form's next value into a same-site path, falling back
+// to the root for anything else.
+func returnPath(next string) *url.URL {
+	if !strings.HasPrefix(next, "/") || strings.HasPrefix(next, "//") {
+		return &url.URL{Path: "/"}
+	}
+
+	u, err := url.Parse(next)
+	if err != nil || u.Host != "" || u.Scheme != "" {
+		return &url.URL{Path: "/"}
+	}
+
+	return u
+}
+
+// sameOrigin reports whether a request was sent by a page on this host.
+// Browsers set Sec-Fetch-Site on every request and Origin on form posts;
+// a request with neither (an old client, or a script) falls back to Referer.
+func sameOrigin(r *http.Request) bool {
+	switch r.Header.Get("Sec-Fetch-Site") {
+	case "same-origin", "none":
+		return true
+	case "cross-site", "same-site":
+		return false
+	}
+
+	for _, h := range []string{headerOrigin, "Referer"} {
+		if v := r.Header.Get(h); v != "" {
+			u, err := url.Parse(v)
+
+			return err == nil && u.Host == r.Host
+		}
+	}
+
+	return false
 }
 
 var errForbidden = errors.New("not allowed")
 
 // checked is what a browser sends for a ticked checkbox.
-const checked = "on"
+const (
+	checked      = "on"
+	headerOrigin = "Origin"
+	verbSync     = "sync"
+)
 
 func (s *Server) perform(r *http.Request, id *api.Identity) (string, error) {
 	ctx := r.Context()
@@ -485,28 +528,20 @@ func (s *Server) perform(r *http.Request, id *api.Identity) (string, error) {
 	verb := r.PathValue("verb")
 
 	switch verb {
-	case "sync", "suspend", "resume":
+	case verbSync, "suspend", "resume":
 		sel, err := targets.ParseSelector(f.Get("selector"))
 		if err != nil {
 			return "", err
 		}
 
-		matched := s.targets().Select(sel)
-		if len(matched) == 0 {
-			return "", fmt.Errorf("selector %s matches nothing", sel)
-		}
-
-		owners := s.ownersOf(matched)
-		if ok, why := api.MayAct(id, owners); !ok {
-			return "", fmt.Errorf("%w: %s", errForbidden, why)
-		}
-
-		if len(owners) > 1 && f.Get("confirm") != checked && verb != "resume" {
-			return "", fmt.Errorf("%s spans %d owners (%s); tick confirm to proceed", sel, len(owners), strings.Join(owners, ", "))
+		// The same rule as the API: sync moves whole groups, and several
+		// owners need the confirm box, for lifting a suspension too.
+		if _, err := api.Authorize(s.targets(), id, sel, f.Get("confirm") == checked, verb == verbSync); err != nil {
+			return "", err
 		}
 
 		switch verb {
-		case "sync":
+		case verbSync:
 			ids, err := s.c.Sync(ctx, reconcile.SyncRequest{Actor: id.Name, Selector: sel, Force: f.Get("force") == checked, Speed: f.Get("speed")})
 			if err != nil {
 				return "", err
@@ -573,18 +608,6 @@ func (s *Server) perform(r *http.Request, id *api.Identity) (string, error) {
 		}
 
 		return strings.ToUpper(verb[:1]) + verb[1:] + " sent.", nil
-	case "policy":
-		group := f.Get("group")
-		if ok, why := api.MayAct(id, s.ownersOf(s.targets().InGroup(group))); !ok {
-			return "", fmt.Errorf("%w: %s", errForbidden, why)
-		}
-
-		p := reconcile.Policy{Mode: f.Get("mode"), Speed: f.Get("speed")}
-		if err := s.c.SetPolicy(ctx, id.Name, group, p); err != nil {
-			return "", err
-		}
-
-		return fmt.Sprintf("Policy for %s: %s, %s.", group, p.Mode, p.Speed), nil
 	}
 
 	return "", fmt.Errorf("unknown action %q", verb)

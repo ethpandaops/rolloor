@@ -43,7 +43,7 @@ func TestSuspensionAndGroupMoveMidBatch(t *testing.T) {
 	require.Equal(t, PhaseUpdating, h.phases(h.active("a"))[tA1])
 
 	// Suspending a target mid-update stops further work on it.
-	_, err := h.c.Suspend(h.ctx, SuspendRequest{Actor: other, Selector: mustSel("id=" + tA1), Reason: "mine"})
+	_, err := h.c.Suspend(h.ctx, SuspendRequest{Actor: other, Selector: mustSel("id=" + tA1), Reason: mine})
 	require.NoError(t, err)
 
 	// Moving the other target to another group does the same.

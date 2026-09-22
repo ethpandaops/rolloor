@@ -45,6 +45,11 @@ const (
 	keySel    = "selector"
 	keyMode   = "mode"
 	keySpeed  = "speed"
+	keyConf   = "confirm"
+	dev       = "dev"
+	hdrOrigin = "Origin"
+	hdrSite   = "Sec-Fetch-Site"
+	hdrRef    = "Referer"
 	manual    = "manual"
 )
 
@@ -218,6 +223,7 @@ func (f *fixture) post(verb string, form url.Values) (int, string) {
 	req, err := http.NewRequestWithContext(f.ctx, http.MethodPost, f.srv.URL+"/actions/"+verb, strings.NewReader(form.Encode()))
 	require.NoError(f.t, err)
 	req.Header.Set("Content-Type", formType)
+	req.Header.Set(hdrOrigin, f.srv.URL)
 
 	return f.send(req)
 }
@@ -276,7 +282,7 @@ func TestPagesRender(t *testing.T) {
 	code, body = f.get("/groups/client/a", false)
 	require.Equal(t, http.StatusOK, code)
 	require.Contains(t, body, tA1)
-	require.Contains(t, body, `value="slow" selected`)
+	require.NotContains(t, body, "/actions/policy", "policy is not edited from the pages")
 
 	code, _ = f.get("/groups/team/a", false)
 	require.Equal(t, http.StatusNotFound, code)
@@ -313,7 +319,7 @@ func TestPagesRender(t *testing.T) {
 	code, body = f.get("/nodes/a-2", false)
 	require.Equal(t, http.StatusOK, code)
 	require.Contains(t, body, tB1)
-	require.Contains(t, body, "more than one owner")
+	require.Contains(t, body, "targets from 2 owners")
 
 	code, _ = f.get("/nodes/zz", false)
 	require.Equal(t, http.StatusNotFound, code)
@@ -367,7 +373,7 @@ func TestViewerNeedsAnIdentity(t *testing.T) {
 func TestControlsAreDisabledWithAReason(t *testing.T) {
 	f := newFixture(t, nil)
 	f.release()
-	f.auth.set(api.Identity{Name: "dev", Owners: []string{"b"}}, nil)
+	f.auth.set(api.Identity{Name: dev, Owners: []string{"b"}}, nil)
 
 	code, body := f.get("/groups/client/a", false)
 	require.Equal(t, http.StatusOK, code)
@@ -409,28 +415,34 @@ func TestActionsRedirectWithFlashOrError(t *testing.T) {
 	_, loc = f.post("sync", url.Values{keySel: {nope}, keyNext: {"//evil.example/"}})
 	require.True(t, strings.HasPrefix(loc, "/?error="), loc)
 
-	// Two owners need the confirm box; resume does not.
+	// Two owners need the confirm box, for lifting a suspension too.
 	_, loc = f.post("suspend", url.Values{keySel: {selC}, keyReason: {"x"}, keyNext: {"/"}})
 	require.Contains(t, loc, "spans+2+owners")
 
-	_, loc = f.post("suspend", url.Values{keySel: {selC}, keyReason: {"x"}, "confirm": {on}, "expiresIn": {"2h"}, keyNext: {"/"}})
+	_, loc = f.post("suspend", url.Values{keySel: {selC}, keyReason: {"x"}, keyConf: {on}, "expiresIn": {"2h"}, keyNext: {"/"}})
 	require.Contains(t, loc, "flash=Suspended+client%3Dc+until")
 
 	_, loc = f.post("suspend", url.Values{keySel: {"id=" + tA1}, keyReason: {"x"}, "expiresIn": {"soon"}, keyNext: {"/"}})
 	require.Contains(t, loc, "error=expiry")
 
 	_, loc = f.post("resume", url.Values{keySel: {selC}, keyNext: {"/"}})
+	require.Contains(t, loc, "spans+2+owners")
+
+	_, loc = f.post("resume", url.Values{keySel: {selC}, keyConf: {on}, keyNext: {"/"}})
 	require.Contains(t, loc, "flash=Resumed+client%3Dc+%281+lifted%29.")
 
-	_, loc = f.post("resume", url.Values{keySel: {selC}, keyNext: {"/"}})
+	_, loc = f.post("resume", url.Values{keySel: {selC}, keyConf: {on}, keyNext: {"/"}})
 	require.Contains(t, loc, "error=", "nothing left to lift")
 
-	// Policy.
+	// Policy is not a page action.
 	_, loc = f.post("policy", url.Values{keyGroup: {"a"}, keyMode: {manual}, keySpeed: {"slow"}, keyNext: {"/"}})
-	require.Contains(t, loc, "flash=Policy+for+a%3A+manual%2C+slow.")
+	require.Contains(t, loc, "error=unknown+action+%22policy%22")
 
-	_, loc = f.post("policy", url.Values{keyGroup: {"a"}, keyMode: {manual}, keySpeed: {"warp"}, keyNext: {"/"}})
-	require.Contains(t, loc, "error=")
+	// A malformed return path falls back to the root before anything runs.
+	_, loc = f.post("sync", url.Values{keySel: {nope}, keyNext: {"/%zz"}})
+	require.True(t, strings.HasPrefix(loc, "/?error="), loc)
+	_, loc = f.post("sync", url.Values{keySel: {nope}, keyNext: {"/a?b=c"}})
+	require.True(t, strings.HasPrefix(loc, "/a?b=c&error="), loc)
 
 	// A sync that opens rollouts says how many.
 	f.world.mu.Lock()
@@ -467,6 +479,7 @@ func TestActionsRedirectWithFlashOrError(t *testing.T) {
 	req, err := http.NewRequestWithContext(f.ctx, http.MethodPost, f.srv.URL+"/actions/sync", strings.NewReader("a=%zz"))
 	require.NoError(t, err)
 	req.Header.Set("Content-Type", formType)
+	req.Header.Set(hdrOrigin, f.srv.URL)
 	code, _ = f.send(req)
 	require.Equal(t, http.StatusBadRequest, code)
 }
@@ -474,13 +487,15 @@ func TestActionsRedirectWithFlashOrError(t *testing.T) {
 func TestActionsRespectOwnership(t *testing.T) {
 	f := newFixture(t, nil)
 	f.release()
-	f.auth.set(api.Identity{Name: "dev", Owners: []string{"b"}}, nil)
+	f.auth.set(api.Identity{Name: dev, Owners: []string{"b"}}, nil)
 
 	_, loc := f.post("sync", url.Values{keySel: {selA}, keyNext: {"/"}})
-	require.Contains(t, loc, "error=not+allowed%3A+you%27re+not+listed+under+a")
+	require.Contains(t, loc, "error=you%27re+not+listed+under+a")
 
-	_, loc = f.post("policy", url.Values{keyGroup: {"a"}, keyMode: {manual}, keySpeed: {"fast"}, keyNext: {"/"}})
-	require.Contains(t, loc, "error=not+allowed")
+	// Owning the selected target is not enough for a sync when its group
+	// has other owners' targets too.
+	_, loc = f.post("sync", url.Values{keySel: {"id=c-2/x"}, keyNext: {"/"}})
+	require.Contains(t, loc, "error=you%27re+not+listed+under+a")
 
 	_, loc = f.post("abort", url.Values{keyRoll: {f.rolloutFor("a").ID}, keyNext: {"/"}})
 	require.Contains(t, loc, "error=not+allowed")
@@ -546,4 +561,56 @@ func helper[T any](t *testing.T, fn template.FuncMap, name string) T {
 	require.True(t, ok, name)
 
 	return v
+}
+
+func TestFormPostsMustComeFromThisSite(t *testing.T) {
+	f := newFixture(t, nil)
+
+	post := func(headers map[string]string) int {
+		req, err := http.NewRequestWithContext(f.ctx, http.MethodPost, f.srv.URL+"/actions/sync", strings.NewReader(url.Values{keySel: {selA}, keyNext: {"/"}}.Encode()))
+		require.NoError(t, err)
+		req.Header.Set("Content-Type", formType)
+
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+
+		code, _ := f.send(req)
+
+		return code
+	}
+
+	require.Equal(t, http.StatusForbidden, post(nil), "no origin at all")
+	require.Equal(t, http.StatusForbidden, post(map[string]string{hdrOrigin: "https://evil.example"}))
+	require.Equal(t, http.StatusForbidden, post(map[string]string{hdrSite: "cross-site", hdrOrigin: f.srv.URL}))
+	require.Equal(t, http.StatusForbidden, post(map[string]string{hdrSite: "same-site"}))
+	require.Equal(t, http.StatusSeeOther, post(map[string]string{hdrSite: "same-origin"}))
+	require.Equal(t, http.StatusSeeOther, post(map[string]string{hdrSite: "none"}))
+	require.Equal(t, http.StatusSeeOther, post(map[string]string{hdrRef: f.srv.URL + "/groups/client/a"}))
+	require.Equal(t, http.StatusForbidden, post(map[string]string{hdrRef: "://bad"}))
+
+	require.Equal(t, "/", returnPath("http://x/").Path)
+	require.Equal(t, "/", returnPath("").Path)
+}
+
+func TestGroupAndNodeFormsCarryTheConfirmBox(t *testing.T) {
+	f := newFixture(t, nil)
+
+	code, body := f.get("/groups/client/c", false)
+	require.Equal(t, http.StatusOK, code)
+	require.Contains(t, body, "2 owners (a, b); sync them all")
+
+	code, body = f.get("/groups/client/a", false)
+	require.Equal(t, http.StatusOK, code)
+	require.NotContains(t, body, "sync them all")
+
+	// A suspension whose selector spans owners: the row's Resume is judged on
+	// everything it would lift, not on the row alone.
+	_, loc := f.post("suspend", url.Values{keySel: {"node=a-2"}, keyReason: {"x"}, keyConf: {on}, keyNext: {"/"}})
+	require.Contains(t, loc, "flash=Suspended")
+
+	f.auth.set(api.Identity{Name: dev, Owners: []string{"b"}}, nil)
+	code, body = f.get("/nodes/a-2", false)
+	require.Equal(t, http.StatusOK, code)
+	require.Contains(t, body, `disabled title="you&#39;re not listed under a" title="Lifts node=a-2"`)
 }

@@ -76,15 +76,17 @@ func TestValidateAndHook(t *testing.T) {
 	ctx := context.Background()
 
 	out.Reset()
-	require.NoError(t, runHook(ctx, &out, cfg, "inspect", "a/x", ""))
+	require.NoError(t, runHook(ctx, &out, cfg, "inspect", "a/x", "", "sha256:abc"))
+	require.Contains(t, out.String(), "sha256:abc")
 	require.Contains(t, out.String(), "sha256:abc")
 
-	require.NoError(t, runHook(ctx, &out, cfg, "environment", "", ""))
-	require.ErrorContains(t, runHook(ctx, &out, cfg, "ready", "a/x", ""), "did not pass")
-	require.ErrorContains(t, runHook(ctx, &out, cfg, "soak", "a/x", ""), "no program configured")
-	require.ErrorContains(t, runHook(ctx, &out, cfg, "inspect", "nope", ""), "not in the targets files")
-	require.Error(t, runHook(ctx, &out, cfg, "inspect", "a/x", "missing-program"))
-	require.Error(t, runHook(ctx, &out, filepath.Join(dir, "missing.yaml"), "inspect", "a/x", ""))
+	require.NoError(t, runHook(ctx, &out, cfg, "environment", "", "", ""))
+	require.ErrorContains(t, runHook(ctx, &out, cfg, "ready", "a/x", "", "sha256:abc"), "did not pass")
+	require.ErrorContains(t, runHook(ctx, &out, cfg, "soak", "a/x", "", ""), "no program configured")
+	require.ErrorContains(t, runHook(ctx, &out, cfg, "inspect", "nope", "", ""), "not in the targets files")
+	require.Error(t, runHook(ctx, &out, cfg, "inspect", "a/x", "missing-program", "sha256:abc"))
+	require.ErrorContains(t, runHook(ctx, &out, cfg, "inspect", "a/x", "", ""), "pass --desired to skip")
+	require.Error(t, runHook(ctx, &out, filepath.Join(dir, "missing.yaml"), "inspect", "a/x", "", ""))
 }
 
 func TestRootCommand(t *testing.T) {
@@ -99,7 +101,7 @@ func TestRootCommand(t *testing.T) {
 	require.Contains(t, out.String(), "ok:")
 
 	root = newRoot()
-	root.SetArgs([]string{"hook", "inspect", "--target", "a/x", "--config", cfg})
+	root.SetArgs([]string{"hook", "inspect", "--target", "a/x", "--desired", "sha256:abc", "--config", cfg})
 	root.SetOut(&out)
 	require.NoError(t, root.Execute())
 }
