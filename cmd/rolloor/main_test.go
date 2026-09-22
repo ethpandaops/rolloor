@@ -104,11 +104,22 @@ func TestRootCommand(t *testing.T) {
 	require.NoError(t, root.Execute())
 }
 
-func TestServeRefusesOIDCUntilBuilt(t *testing.T) {
+func TestServeOIDCNeedsSecretsAndAnIssuer(t *testing.T) {
 	dir, _ := writeFixture(t)
 	cfg := filepath.Join(dir, "oidc.yaml")
-	require.NoError(t, os.WriteFile(cfg, []byte("environment: t\nauth: {mode: oidc, issuer: i, clientId: c, redirectUrl: r}\n"), 0o644))
-	require.ErrorContains(t, serve(context.Background(), cfg), "auth.mode")
+	require.NoError(t, os.WriteFile(cfg, []byte("environment: t\ntargetsDir: "+filepath.Join(dir, "targets.d")+"\nhooks: {dir: "+filepath.Join(dir, "hooks")+"}\nlabels: {group: client, owner: owner}\nteamsFile: "+filepath.Join(dir, "teams.yaml")+"\nauth: {mode: oidc, issuer: http://127.0.0.1:1, clientId: c, redirectUrl: r, clientSecretEnv: T_OIDC_SECRET, sessionSecretEnv: T_SESSION}\n"), 0o644))
+
+	require.ErrorContains(t, serve(context.Background(), cfg), "T_OIDC_SECRET is not set")
+
+	t.Setenv("T_OIDC_SECRET", "s")
+	require.ErrorContains(t, serve(context.Background(), cfg), "T_SESSION is not set")
+
+	t.Setenv("T_SESSION", "0123456789abcdef0123456789abcdef")
+	require.ErrorContains(t, serve(context.Background(), cfg), "discover")
+
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "teams.yaml"), []byte("- broken\n"), 0o644))
+	require.ErrorContains(t, serve(context.Background(), cfg), "teams")
+
 	require.Error(t, serve(context.Background(), filepath.Join(dir, "missing.yaml")))
 }
 

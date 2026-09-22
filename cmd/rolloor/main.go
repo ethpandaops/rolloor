@@ -22,6 +22,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/ethpandaops/rolloor/internal/api"
+	"github.com/ethpandaops/rolloor/internal/auth"
 	"github.com/ethpandaops/rolloor/internal/config"
 	"github.com/ethpandaops/rolloor/internal/hooks"
 	"github.com/ethpandaops/rolloor/internal/metrics"
@@ -237,10 +238,6 @@ func serve(ctx context.Context, configPath string) error {
 		return err
 	}
 
-	if cfg.Auth.Mode != "none" {
-		return errors.New("auth.mode oidc is not available in this build; set auth.mode: none")
-	}
-
 	log, err := observability.NewLogger(cfg.Log.Level, cfg.Log.Format)
 	if err != nil {
 		return err
@@ -248,6 +245,11 @@ func serve(ctx context.Context, configPath string) error {
 
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	authorizer, teams, err := buildAuthorizer(ctx, cfg, log)
+	if err != nil {
+		return err
+	}
 
 	db, err := store.Open(ctx, cfg.DataDir)
 	if err != nil {
@@ -288,7 +290,7 @@ func serve(ctx context.Context, configPath string) error {
 
 	reg.MustRegister(metrics.NewCollector(controller))
 
-	server := api.New(cfg, controller, watcher.Current, api.OpenAccess{}, events, version, log)
+	server := api.New(cfg, controller, watcher.Current, authorizer, events, version, log)
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
@@ -303,6 +305,11 @@ func serve(ctx context.Context, configPath string) error {
 	g.Go(func() error { return controller.RunInspector(gctx) })
 	g.Go(func() error { return controller.Run(gctx, tickEvery) })
 	g.Go(func() error { return watcher.Run(gctx) })
+
+	if teams != nil {
+		g.Go(func() error { return teams.Run(gctx, watchEvery) })
+	}
+
 	g.Go(func() error {
 		if serveErr := httpServer.ListenAndServe(); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
 			return serveErr
@@ -327,6 +334,43 @@ func serve(ctx context.Context, configPath string) error {
 	}
 
 	return err
+}
+
+// buildAuthorizer picks open access or OIDC from the config. The OIDC client
+// secret and the session key come from the environment variables the config
+// names.
+func buildAuthorizer(ctx context.Context, cfg *config.Config, log observability.ContextualLogger) (api.Authorizer, *auth.Teams, error) {
+	if cfg.Auth.Mode == "none" {
+		return api.OpenAccess{}, nil, nil
+	}
+
+	var teams *auth.Teams
+
+	if cfg.TeamsFile != "" {
+		loaded, err := auth.LoadTeams(cfg.TeamsFile, log)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		teams = loaded
+	}
+
+	secret := os.Getenv(cfg.Auth.ClientSecretEnv)
+	if secret == "" {
+		return nil, nil, fmt.Errorf("auth: %s is not set", cfg.Auth.ClientSecretEnv)
+	}
+
+	sessionKey := os.Getenv(cfg.Auth.SessionSecretEnv)
+	if sessionKey == "" {
+		return nil, nil, fmt.Errorf("auth: %s is not set", cfg.Auth.SessionSecretEnv)
+	}
+
+	oidcAuth, err := auth.NewOIDC(ctx, &cfg.Auth, secret, sessionKey, teams, log)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return oidcAuth, teams, nil
 }
 
 // forgetRemoved drops live state for targets that left the files.
