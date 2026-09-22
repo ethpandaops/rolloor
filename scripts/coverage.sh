@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs the tests with coverage and enforces a floor per package.
+# Runs the tests with coverage and enforces a statement-coverage floor per package.
 #
 # Packages that make decisions must be fully covered. Packages that are thin
 # wiring over I/O (main, the HTTP mux, the SQLite driver) are exercised by the
@@ -27,15 +27,24 @@ trap 'rm -f "$profile"' EXIT
 
 go test -race -timeout 5m -coverprofile="$profile" -covermode=atomic ./... >/dev/null
 
+module=github.com/ethpandaops/rolloor
 fail=0
 
-for pkg in "${!floor[@]}"; do
+# Statement coverage per package: sum of statements in blocks hit at least once
+# over all statements. The profile format is file:start,end numStmts hitCount.
+pct_for() {
+  awk -v p="${module}/$1/" '
+    NR > 1 && index($1, p) == 1 {
+      n = split($1, parts, "/"); file = parts[n]
+      if (index(file, "/") == 0) { total += $2; if ($3 > 0) hit += $2 }
+    }
+    END { if (total == 0) print "0.0"; else printf "%.1f", 100 * hit / total }' "$profile"
+}
+
+for pkg in $(printf '%s\n' "${!floor[@]}" | sort); do
   [ -d "$pkg" ] || continue
 
-  pct=$(go tool cover -func="$profile" | awk -v p="github.com/ethpandaops/rolloor/${pkg}/" '
-    index($1, p) == 1 { split($3, a, "%"); sum += a[1]; n++ }
-    END { if (n == 0) print "0.0"; else printf "%.1f", sum / n }')
-
+  pct=$(pct_for "$pkg")
   want=${floor[$pkg]}
 
   if awk -v a="$pct" -v b="$want" 'BEGIN { exit !(a < b) }'; then
@@ -48,12 +57,16 @@ done
 
 if [ "$fail" -ne 0 ]; then
   echo
-  echo "uncovered statements in packages below their floor:"
+  echo "functions below 100% in failing packages:"
 
-  for pkg in "${!floor[@]}"; do
+  for pkg in $(printf '%s\n' "${!floor[@]}" | sort); do
     [ -d "$pkg" ] || continue
-    go tool cover -func="$profile" | awk -v p="github.com/ethpandaops/rolloor/${pkg}/" -v want="${floor[$pkg]}" '
-      index($1, p) == 1 { split($3, a, "%"); if (a[1] + 0 < want + 0) print "  " $1 " " $2 " " $3 }'
+
+    pct=$(pct_for "$pkg")
+    if awk -v a="$pct" -v b="${floor[$pkg]}" 'BEGIN { exit !(a < b) }'; then
+      go tool cover -func="$profile" | awk -v p="${module}/${pkg}/" '
+        index($1, p) == 1 && $3 != "100.0%" { print "  " $1 " " $2 " " $3 }'
+    fi
   done
 
   exit 1

@@ -68,6 +68,9 @@ type fakeRegistry struct {
 const (
 	keyDigest      = "digest"
 	keyConfig      = "config"
+	keyManifests   = "manifests"
+	bearerTok      = "Bearer tok-123"
+	tagJunk        = "junk"
 	indexDigest    = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
 	manifestDigest = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
 	configDigest   = "sha256:3333333333333333333333333333333333333333333333333333333333333333"
@@ -88,7 +91,7 @@ func newFakeRegistry(t *testing.T, requireToken, digestHeader bool) *fakeRegistr
 	})
 
 	mux.HandleFunc("/v2/", func(w http.ResponseWriter, r *http.Request) {
-		if f.requireTk && r.Header.Get("Authorization") != "Bearer tok-123" {
+		if f.requireTk && r.Header.Get("Authorization") != bearerTok {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="`+f.srv.URL+`/token",service="fake"`)
 			w.WriteHeader(http.StatusUnauthorized)
 
@@ -105,7 +108,7 @@ func newFakeRegistry(t *testing.T, requireToken, digestHeader bool) *fakeRegistr
 
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"mediaType": "application/vnd.oci.image.index.v1+json",
-				"manifests": []map[string]any{
+				keyManifests: []map[string]any{
 					{keyDigest: "sha256:arm", "platform": map[string]string{"os": "linux", "architecture": "arm64"}},
 					{keyDigest: manifestDigest, "platform": map[string]string{"os": "linux", "architecture": "amd64"}},
 				},
@@ -262,8 +265,8 @@ func TestTokenEndpointFailures(t *testing.T) {
 			w.WriteHeader(http.StatusInternalServerError)
 		case "empty":
 			_, _ = w.Write([]byte(`{}`))
-		case "junk":
-			_, _ = w.Write([]byte(`junk`))
+		case tagJunk:
+			_, _ = w.Write([]byte(tagJunk))
 		case "access":
 			_, _ = w.Write([]byte(`{"access_token":"tok-123"}`))
 		}
@@ -272,7 +275,7 @@ func TestTokenEndpointFailures(t *testing.T) {
 	var srv *httptest.Server
 
 	mux.HandleFunc("/v2/", func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "Bearer tok-123" {
+		if r.Header.Get("Authorization") != bearerTok {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="`+srv.URL+`/token"`)
 			w.WriteHeader(http.StatusUnauthorized)
 
@@ -288,7 +291,7 @@ func TestTokenEndpointFailures(t *testing.T) {
 
 	host := strings.TrimPrefix(srv.URL, "http://")
 
-	for _, m := range []string{"500", "empty", "junk"} {
+	for _, m := range []string{"500", "empty", tagJunk} {
 		mode = m
 
 		r, err := NewResolver(Options{PlainHTTP: []string{host}}, logrus.New())

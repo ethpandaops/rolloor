@@ -141,6 +141,10 @@ func (w *Watcher) report(err error) {
 	}
 }
 
+// statFile is os.Stat, replaceable so the race between listing and stating a
+// file that is being removed can be exercised in tests.
+var statFile = os.Stat
+
 // fingerprint summarises the directory's yaml files by name, size and mtime.
 func fingerprint(dir string) (string, error) {
 	paths, err := listFiles(dir)
@@ -151,7 +155,7 @@ func fingerprint(dir string) (string, error) {
 	var b strings.Builder
 
 	for _, p := range paths {
-		info, err := os.Stat(p)
+		info, err := statFile(p)
 		if err != nil {
 			return "", fmt.Errorf("targets: stat %s: %w", p, err)
 		}

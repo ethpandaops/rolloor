@@ -8,10 +8,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+const (
+	labelClient = "client"
+	labelOwner  = "owner"
+	labelWave   = "wave"
+)
+
 var testRules = Rules{
-	GroupLabel: "client",
-	OwnerLabel: "owner",
-	WaveLabel:  "wave",
+	GroupLabel: labelClient,
+	OwnerLabel: labelOwner,
+	WaveLabel:  labelWave,
 	KnownHooks: []string{"inspect", "update", "ready", "soak"},
 }
 
@@ -51,6 +57,7 @@ func TestParseAndIndexes(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, 0, s.Wave(&tgt))
 	require.Equal(t, "a", s.Group(&tgt))
+	require.Equal(t, "a", s.Owner(&tgt))
 
 	el, _ := s.Get("a-1/el")
 	require.Equal(t, 1, s.Wave(&el))

@@ -6,6 +6,12 @@ import (
 	"strings"
 )
 
+// Selector keys that address a target's own fields rather than a label.
+const (
+	KeyID   = "id"
+	KeyNode = "node"
+)
+
 // Selector matches targets by label values. The keys "id" and "node" match
 // the target's own fields; every other key is a label.
 type Selector map[string]string
@@ -35,11 +41,11 @@ func ParseSelector(s string) (Selector, error) {
 func (sel Selector) Match(t *Target) bool {
 	for k, v := range sel {
 		switch k {
-		case "id":
+		case KeyID:
 			if t.ID != v {
 				return false
 			}
-		case "node":
+		case KeyNode:
 			if t.Node != v {
 				return false
 			}

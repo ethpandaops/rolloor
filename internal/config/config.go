@@ -132,6 +132,9 @@ type Log struct {
 	Format string `yaml:"format" default:"json"`
 }
 
+// applyDefaults is defaults.Set, replaceable so its failure path is testable.
+var applyDefaults = defaults.Set
+
 // Load reads a YAML file, applies defaults, and validates.
 func Load(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
@@ -145,7 +148,7 @@ func Load(path string) (*Config, error) {
 // Parse decodes YAML bytes with unknown fields rejected.
 func Parse(raw []byte) (*Config, error) {
 	cfg := &Config{}
-	if err := defaults.Set(cfg); err != nil {
+	if err := applyDefaults(cfg); err != nil {
 		return nil, fmt.Errorf("apply defaults: %w", err)
 	}
 

@@ -257,7 +257,7 @@ func (r *Resolver) revision(ctx context.Context, ref Reference, digest string, b
 
 func (r *Resolver) baseURL(ref Reference) string {
 	scheme := "https"
-	if slices.Contains(r.plainHTTP, ref.APIHost()) || slices.Contains(r.plainHTTP, ref.Host) {
+	if slices.Contains(r.plainHTTP, ref.APIHost()) {
 		scheme = "http"
 	}
 
@@ -316,15 +316,10 @@ func (r *Resolver) send(ctx context.Context, method, u, accept, token string, re
 		req.Header.Set("Accept", accept)
 	}
 
-	switch {
+	switch creds := r.creds(ref); {
 	case token != "":
 		req.Header.Set("Authorization", "Bearer "+token)
-	case r.auths[ref.Host] != "" || r.auths[ref.APIHost()] != "":
-		creds := r.auths[ref.Host]
-		if creds == "" {
-			creds = r.auths[ref.APIHost()]
-		}
-
+	case creds != "":
 		req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(creds)))
 	}
 
@@ -334,6 +329,16 @@ func (r *Resolver) send(ctx context.Context, method, u, accept, token string, re
 	}
 
 	return resp, nil
+}
+
+// creds returns "user:pass" for the registry, by the host as written or by
+// the API host it maps to.
+func (r *Resolver) creds(ref Reference) string {
+	if c := r.auths[ref.Host]; c != "" {
+		return c
+	}
+
+	return r.auths[ref.APIHost()]
 }
 
 // fetchToken follows a Bearer challenge: realm, service and scope.
@@ -362,7 +367,7 @@ func (r *Resolver) fetchToken(ctx context.Context, ref Reference, challenge stri
 		return "", fmt.Errorf("registry: build token request: %w", err)
 	}
 
-	if creds := r.auths[ref.Host]; creds != "" {
+	if creds := r.creds(ref); creds != "" {
 		req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(creds)))
 	}
 
