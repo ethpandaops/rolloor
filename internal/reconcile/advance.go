@@ -3,6 +3,7 @@ package reconcile
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -103,8 +104,9 @@ func (c *Controller) planRollout(ctx context.Context, now time.Time, r *Rollout,
 	}
 }
 
-// retryBatch reopens a halted batch. Its failed targets go back to waiting
-// for their digest to show, so nothing is claimed that was not observed; the
+// retryBatch reopens a halted batch. A failed target already running the
+// digest goes back to waiting for inspect to confirm it, so nothing is claimed
+// that was not observed; one that is not gets its update run again. The
 // batch's earlier soak attempts stay on the record.
 func (c *Controller) retryBatch(ctx context.Context, now time.Time, r *Rollout) {
 	r.RetryPending = false
@@ -123,6 +125,10 @@ func (c *Controller) retryBatch(ctx context.Context, now time.Time, r *Rollout) 
 		if rt.Phase == PhaseFailed {
 			rt.Phase, rt.Reason, rt.UpdatedAt = PhaseUpdating, "retrying: waiting for the digest", now
 			rt.UpdateDone, rt.Updated = true, false
+
+			if live, known := c.liveKnown(id); !known || !slices.Contains(sortedValues(r.Desired), live) {
+				rt.Phase, rt.Reason, rt.UpdateDone = PhasePending, "retrying: running the update again", false
+			}
 
 			delete(c.degraded, id)
 			_ = c.persist(ctx, c.store.ClearDegraded(ctx, id))
@@ -421,11 +427,15 @@ func (c *Controller) halt(ctx context.Context, now time.Time, r *Rollout, culpri
 	b.EndedAt = now
 	b.Soak = cloneSoak(&r.Soak)
 
+	held := 0
+
 	for _, id := range b.Targets {
 		rt := r.target(id)
 		if rt.Phase == PhaseSkipped || rt.Phase == PhasePassed {
 			continue
 		}
+
+		held++
 
 		reason := why
 		if culprit != "" && id != culprit {
@@ -437,9 +447,9 @@ func (c *Controller) halt(ctx context.Context, now time.Time, r *Rollout, culpri
 		_ = c.persist(ctx, c.store.SaveDegraded(ctx, id, reason))
 	}
 
-	msg := fmt.Sprintf("Halted at batch %d: %s. %d targets left running %s for debugging.", b.Number, why, len(b.Targets), r.DigestShort())
+	msg := fmt.Sprintf("Halted at batch %d: %s. %d targets quarantined on %s for debugging.", b.Number, why, held, r.DigestShort())
 	if culprit != "" {
-		msg = fmt.Sprintf("Halted at batch %d: %s %s. %d targets left running %s for debugging.", b.Number, culprit, why, len(b.Targets), r.DigestShort())
+		msg = fmt.Sprintf("Halted at batch %d: %s %s. %d targets quarantined on %s for debugging.", b.Number, culprit, why, held, r.DigestShort())
 	}
 
 	c.setState(ctx, now, r, Halted, msg)

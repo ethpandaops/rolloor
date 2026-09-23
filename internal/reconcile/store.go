@@ -37,6 +37,9 @@ type Store interface {
 	ClearAborted(ctx context.Context, group string) error
 	SaveHookRun(ctx context.Context, id string, run *HookRun) error
 	DeleteHookRuns(ctx context.Context, id string) error
+	// ReplaceDecisions rewrites rollouts, quarantines, abort markers,
+	// suspensions and desired digests to exactly the snapshot's, in one step.
+	ReplaceDecisions(ctx context.Context, snap *Snapshot) error
 	AppendEvent(ctx context.Context, e *Event) error
 	Events(ctx context.Context, q EventQuery) ([]Event, error)
 }
@@ -48,7 +51,9 @@ type EventQuery struct {
 	Target  string
 	// After returns only events with a greater id, oldest first, for replay.
 	After int64
-	Limit int
+	// Before returns only events with a smaller id, for paging back.
+	Before int64
+	Limit  int
 }
 
 // Notifier receives every event as it happens, for live streams.
@@ -361,6 +366,32 @@ func (m *MemoryStore) ClearAborted(_ context.Context, group string) error {
 	return nil
 }
 
+// ReplaceDecisions swaps in the snapshot's decisions.
+func (m *MemoryStore) ReplaceDecisions(_ context.Context, snap *Snapshot) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.Fail != nil {
+		return m.Fail
+	}
+
+	for _, r := range snap.Rollouts {
+		m.rollouts[r.ID] = cloneRollout(r)
+	}
+
+	m.degraded = maps.Clone(snap.Degraded)
+	m.aborted = maps.Clone(snap.Aborted)
+	m.suspensions = map[string]Suspension{}
+
+	for _, sp := range snap.Suspensions {
+		m.suspensions[sp.ID] = sp
+	}
+
+	maps.Copy(m.desired, snap.Desired)
+
+	return nil
+}
+
 // AppendEvent adds to history.
 func (m *MemoryStore) AppendEvent(_ context.Context, e *Event) error {
 	m.mu.Lock()
@@ -407,6 +438,10 @@ func (m *MemoryStore) Events(_ context.Context, q EventQuery) ([]Event, error) {
 		}
 
 		if q.Target != "" && e.Target != q.Target {
+			continue
+		}
+
+		if q.Before > 0 && e.ID >= q.Before {
 			continue
 		}
 

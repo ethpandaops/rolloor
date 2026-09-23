@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,7 +17,8 @@ import (
 )
 
 // Teams maps owner values to the identities allowed to act on them. It is a
-// YAML file, reloaded when its modification time changes.
+// YAML file, reloaded when its modification time changes. Identities compare
+// without regard to case.
 type Teams struct {
 	path string
 	log  observability.ContextualLogger
@@ -72,7 +74,8 @@ func (t *Teams) Reload() error {
 
 	for owner, idents := range parsed {
 		for _, id := range idents {
-			byIdent[id] = append(byIdent[id], owner)
+			key := strings.ToLower(id)
+			byIdent[key] = append(byIdent[key], owner)
 		}
 	}
 
@@ -95,7 +98,7 @@ func (t *Teams) Owners(identity string) []string {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	return append([]string(nil), t.byIdent[identity]...)
+	return append([]string(nil), t.byIdent[strings.ToLower(identity)]...)
 }
 
 // Run reloads on the interval until ctx ends. It blocks.

@@ -40,6 +40,7 @@ type issuer struct {
 	fail   bool
 	codes  []string
 	claim  string
+	nonce  string
 	expiry time.Duration
 }
 
@@ -94,6 +95,10 @@ func (is *issuer) token(t *testing.T, name string) string {
 	}
 	if name != "" {
 		claims[is.claim] = name
+	}
+
+	if is.nonce != "" {
+		claims["nonce"] = is.nonce
 	}
 
 	raw, err := jwt.Signed(signer).Claims(claims).Serialize()
@@ -234,6 +239,7 @@ func TestLoginFlow(t *testing.T) {
 
 	state := loc.Query().Get("state")
 	require.NotEmpty(t, state)
+	require.NotEmpty(t, loc.Query().Get("nonce"))
 
 	var stateCk *http.Cookie
 
@@ -255,6 +261,18 @@ func TestLoginFlow(t *testing.T) {
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+	// A token minted for another login's nonce is refused.
+	is.nonce = "someone-else"
+	req, _ = http.NewRequestWithContext(context.Background(), http.MethodGet, app.URL+CallbackPath+"?state="+url.QueryEscape(state)+"&code=replayed", http.NoBody)
+	req.AddCookie(stateCk)
+	resp, err = client.Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusBadGateway, resp.StatusCode)
+
+	is.nonce = loc.Query().Get("nonce")
+	is.codes = nil
 
 	// Callback with the right state exchanges the code and sets the session.
 	req, _ = http.NewRequestWithContext(context.Background(), http.MethodGet, app.URL+CallbackPath+"?state="+url.QueryEscape(state)+"&code=the-code", http.NoBody)
@@ -419,6 +437,7 @@ func TestInjectedFailures(t *testing.T) {
 	require.Equal(t, http.StatusInternalServerError, resp.StatusCode)
 
 	// Encoding failing only for the session, after a good exchange.
+	is.nonce = "x"
 	state, err := o.sessions.encode(map[string]any{"n": "x", "next": "/", "e": time.Now().Add(time.Hour)})
 	require.NoError(t, err)
 
@@ -488,6 +507,7 @@ func TestTeams(t *testing.T) {
 	teams, err := LoadTeams(path, logrus.New())
 	require.NoError(t, err)
 	require.Equal(t, []string{lighthouse, operators}, teams.Owners(sam))
+	require.Equal(t, []string{lighthouse, operators}, teams.Owners(strings.ToUpper(sam)), "identities compare without case")
 	require.Empty(t, teams.Owners("nobody"))
 
 	// Unchanged file: no reload.

@@ -334,7 +334,7 @@ func (c *Controller) Abort(ctx context.Context, actor, rolloutID string) error {
 	return nil
 }
 
-// Retry re-runs the soak of a halted rollout's batch.
+// Retry reopens a halted rollout's batch; see retryBatch.
 func (c *Controller) Retry(ctx context.Context, actor, rolloutID, reason string) error {
 	if reason == "" {
 		return errors.New("a reason is required")
@@ -415,13 +415,6 @@ func (c *Controller) EventsAbout(ctx context.Context, about []targets.Target, q 
 		limit = 200
 	}
 
-	q.Limit = 0
-
-	all, err := c.store.Events(ctx, q)
-	if err != nil {
-		return nil, err
-	}
-
 	set := c.targets()
 	ids := map[string]struct{}{}
 	groups := map[string]struct{}{}
@@ -441,20 +434,43 @@ func (c *Controller) EventsAbout(ctx context.Context, about []targets.Target, q 
 	c.mu.RUnlock()
 
 	out := make([]Event, 0, limit)
+	q.Limit = eventPage
 
-	for i := range all {
-		e := &all[i]
-		if eventConcerns(e, about, ids, groups, rolloutGroups) {
-			out = append(out, *e)
+	for scanned := 0; scanned < eventScanLimit; {
+		page, err := c.store.Events(ctx, q)
+		if err != nil {
+			return nil, err
 		}
 
-		if len(out) >= limit {
+		for i := range page {
+			e := &page[i]
+			if eventConcerns(e, about, ids, groups, rolloutGroups) {
+				out = append(out, *e)
+			}
+
+			if len(out) >= limit {
+				return out, nil
+			}
+		}
+
+		scanned += len(page)
+
+		if len(page) < eventPage {
 			break
 		}
+
+		q.Before = page[len(page)-1].ID
 	}
 
 	return out, nil
 }
+
+// History is read back a page at a time, and a search gives up after
+// eventScanLimit events so one query cannot read the whole table.
+const (
+	eventPage      = 1000
+	eventScanLimit = 50 * eventPage
+)
 
 func eventConcerns(e *Event, about []targets.Target, ids, groups map[string]struct{}, rolloutGroups map[string]string) bool {
 	if e.Target != "" {

@@ -493,21 +493,19 @@ func (c *Controller) flush(ctx context.Context) bool {
 
 	c.dirty = false
 
+	snap := &Snapshot{Degraded: c.degraded, Aborted: c.aborted, Desired: c.desired}
+
 	for _, r := range c.rollouts {
-		_ = c.saveRollout(ctx, r)
+		snap.Rollouts = append(snap.Rollouts, r)
 	}
 
-	for id, reason := range c.degraded {
-		_ = c.persist(ctx, c.store.SaveDegraded(ctx, id, reason))
+	for _, sp := range c.suspensions {
+		snap.Suspensions = append(snap.Suspensions, sp)
 	}
 
-	for g, key := range c.aborted {
-		_ = c.persist(ctx, c.store.SaveAborted(ctx, g, key))
-	}
-
-	for img, d := range c.desired {
-		_ = c.persist(ctx, c.store.SaveDesired(ctx, img, d))
-	}
+	// Deletions are decisions too: a lifted quarantine or abort marker must
+	// not come back after a restart, so the tables are replaced whole.
+	_ = c.persist(ctx, c.store.ReplaceDecisions(ctx, snap))
 
 	if c.dirty {
 		c.log.WithContext(ctx).Warn("store still failing; no programs run this tick")

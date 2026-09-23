@@ -15,9 +15,11 @@ import (
 )
 
 const (
-	r1  = "r1"
-	t1  = "t1"
-	sha = "sha256:1"
+	img   = "img"
+	worse = "worse"
+	r1    = "r1"
+	t1    = "t1"
+	sha   = "sha256:1"
 )
 
 func open(t *testing.T) (*SQLite, string) {
@@ -38,7 +40,7 @@ func TestRoundTrip(t *testing.T) {
 	s, dir := open(t)
 
 	now := time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
-	r := &reconcile.Rollout{ID: r1, Group: "a", State: reconcile.Running, Desired: map[string]string{"img": sha}, CreatedAt: now,
+	r := &reconcile.Rollout{ID: r1, Group: "a", State: reconcile.Running, Desired: map[string]string{img: sha}, CreatedAt: now,
 		Targets: []reconcile.RolloutTarget{{ID: t1, Node: "n1", Phase: reconcile.PhasePending}}}
 	require.NoError(t, s.SaveRollout(ctx, r))
 
@@ -63,8 +65,8 @@ func TestRoundTrip(t *testing.T) {
 	require.NoError(t, s.SaveHookRun(ctx, "t2", &reconcile.HookRun{Hook: "inspect"}))
 	require.NoError(t, s.DeleteHookRuns(ctx, "t2"))
 
-	require.NoError(t, s.SaveDesired(ctx, "img", reconcile.Desired{Digest: sha, Revision: "r"}))
-	require.NoError(t, s.SaveDesired(ctx, "img", reconcile.Desired{Digest: "sha256:2"}))
+	require.NoError(t, s.SaveDesired(ctx, img, reconcile.Desired{Digest: sha, Revision: "r"}))
+	require.NoError(t, s.SaveDesired(ctx, img, reconcile.Desired{Digest: "sha256:2"}))
 	require.NoError(t, s.SaveAborted(ctx, "a", "img=sha256:2"))
 	require.NoError(t, s.SaveAborted(ctx, "b", "x"))
 	require.NoError(t, s.ClearAborted(ctx, "b"))
@@ -95,7 +97,7 @@ func TestRoundTrip(t *testing.T) {
 	require.Equal(t, sha, snap.Live[t1].Digest)
 	require.Len(t, snap.Live, 1)
 	require.Equal(t, map[string]string{t1: "worse"}, snap.Degraded)
-	require.Equal(t, "sha256:2", snap.Desired["img"].Digest)
+	require.Equal(t, "sha256:2", snap.Desired[img].Digest)
 	require.Equal(t, "still no", snap.HookRuns[t1]["update"].Result.Reason)
 	require.NotContains(t, snap.HookRuns, "t2")
 
@@ -237,4 +239,72 @@ func TestCorruptRowsAreErrors(t *testing.T) {
 	require.NoError(t, err)
 	_, err = s.Events(ctx, reconcile.EventQuery{})
 	require.ErrorContains(t, err, "bad timestamp")
+}
+
+func TestReplaceDecisionsDropsWhatMemoryNoLongerHolds(t *testing.T) {
+	ctx := context.Background()
+	s, _ := open(t)
+
+	require.NoError(t, s.SaveDegraded(ctx, t1, "bad"))
+	require.NoError(t, s.SaveAborted(ctx, "a", "k"))
+	require.NoError(t, s.SaveSuspension(ctx, &reconcile.Suspension{ID: "s1"}))
+
+	now := time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
+	require.NoError(t, s.ReplaceDecisions(ctx, &reconcile.Snapshot{
+		Rollouts:    []*reconcile.Rollout{{ID: r1, Group: "a", State: reconcile.Running, CreatedAt: now}},
+		Degraded:    map[string]string{"t2": worse},
+		Aborted:     map[string]string{},
+		Suspensions: []reconcile.Suspension{{ID: "s2"}},
+		Desired:     map[string]reconcile.Desired{img: {Digest: sha}},
+	}))
+
+	snap, err := s.Load(ctx)
+	require.NoError(t, err)
+	require.Equal(t, map[string]string{"t2": worse}, snap.Degraded)
+	require.Empty(t, snap.Aborted)
+	require.Len(t, snap.Suspensions, 1)
+	require.Equal(t, "s2", snap.Suspensions[0].ID)
+	require.Len(t, snap.Rollouts, 1)
+	require.Equal(t, sha, snap.Desired[img].Digest)
+
+	// Any refused write rolls the whole replacement back.
+	full := &reconcile.Snapshot{
+		Rollouts:    []*reconcile.Rollout{{ID: r1, CreatedAt: now}},
+		Degraded:    map[string]string{t1: worse},
+		Aborted:     map[string]string{"a": "k"},
+		Suspensions: []reconcile.Suspension{{ID: "s3"}},
+		Desired:     map[string]reconcile.Desired{img: {Digest: sha}},
+	}
+
+	for _, table := range []string{"rollouts", "degraded", "aborted", "suspensions", "desired"} {
+		_, err = s.db.ExecContext(ctx, `CREATE TRIGGER refuse_`+table+` BEFORE INSERT ON `+table+` BEGIN SELECT RAISE(ABORT, 'refused'); END`)
+		require.NoError(t, err)
+		require.ErrorContains(t, s.ReplaceDecisions(ctx, full), "refused", table)
+		_, err = s.db.ExecContext(ctx, `DROP TRIGGER refuse_`+table)
+		require.NoError(t, err)
+	}
+
+	_, err = s.db.ExecContext(ctx, `DROP TABLE aborted`)
+	require.NoError(t, err)
+	require.Error(t, s.ReplaceDecisions(ctx, full))
+
+	_, err = s.Load(ctx)
+	require.Error(t, err, "the aborted table is gone")
+
+	require.NoError(t, s.Close())
+	require.Error(t, s.ReplaceDecisions(ctx, &reconcile.Snapshot{}))
+}
+
+func TestEventsPageBackWithBefore(t *testing.T) {
+	ctx := context.Background()
+	s, _ := open(t)
+
+	for i := int64(1); i <= 5; i++ {
+		require.NoError(t, s.AppendEvent(ctx, &reconcile.Event{ID: i, At: time.Now(), Actor: "a", Action: "x"}))
+	}
+
+	got, err := s.Events(ctx, reconcile.EventQuery{Before: 3})
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	require.Equal(t, int64(2), got[0].ID)
 }

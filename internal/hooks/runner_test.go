@@ -49,3 +49,19 @@ func TestRun(t *testing.T) {
 	_, err = r.Run(context.Background(), "../x", "ready", "t-1", nil)
 	require.Error(t, err)
 }
+
+func TestHiddenVariablesNeverReachPrograms(t *testing.T) {
+	t.Setenv("ROLLOOR_TEST_SECRET", "hunter2")
+	t.Setenv("ROLLOOR_TEST_PLAIN", "visible")
+
+	dir := t.TempDir()
+	writeScript(t, dir, "env", `echo "[$ROLLOOR_TEST_SECRET][$ROLLOOR_TEST_PLAIN]"`)
+
+	r, err := NewRunner(dir, 2*time.Second, "env-1", logrus.New())
+	require.NoError(t, err)
+	r.Hide("ROLLOOR_TEST_SECRET", "")
+
+	res, err := r.Run(context.Background(), "env", "ready", "t-1", nil)
+	require.NoError(t, err)
+	require.Equal(t, "[][visible]", res.Reason)
+}

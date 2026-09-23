@@ -291,6 +291,8 @@ func serve(ctx context.Context, configPath string) error {
 		return err
 	}
 
+	runner.Hide(cfg.Auth.ClientSecretEnv, cfg.Auth.SessionSecretEnv)
+
 	resolver, err := registry.NewResolver(registry.Options{AuthFile: cfg.Registry.AuthFile, PlainHTTP: cfg.Registry.PlainHTTP, Timeout: cfg.Registry.Timeout}, log)
 	if err != nil {
 		return err

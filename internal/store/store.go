@@ -51,6 +51,20 @@ CREATE INDEX IF NOT EXISTS events_target ON events(target, id);
 // SQLite is the store. One process writes it.
 type SQLite struct {
 	db *sql.DB
+	// tx, when set, carries writes instead of db.
+	tx *sql.Tx
+}
+
+func (s *SQLite) exec(ctx context.Context, query string, args ...any) error {
+	if s.tx != nil {
+		_, err := s.tx.ExecContext(ctx, query, args...)
+
+		return err
+	}
+
+	_, err := s.db.ExecContext(ctx, query, args...)
+
+	return err
 }
 
 var _ reconcile.Store = (*SQLite)(nil)
@@ -256,7 +270,7 @@ func (s *SQLite) SaveRollout(ctx context.Context, r *reconcile.Rollout) error {
 		return fmt.Errorf("store: encode rollout: %w", err)
 	}
 
-	_, err = s.db.ExecContext(ctx, `INSERT INTO rollouts (id, group_name, state, created_at, data) VALUES (?, ?, ?, ?, ?)
+	err = s.exec(ctx, `INSERT INTO rollouts (id, group_name, state, created_at, data) VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET group_name = excluded.group_name, state = excluded.state, data = excluded.data`,
 		r.ID, r.Group, string(r.State), r.CreatedAt.UTC().Format(time.RFC3339Nano), raw)
 	if err != nil {
@@ -273,7 +287,7 @@ func (s *SQLite) SavePolicy(ctx context.Context, group string, p reconcile.Polic
 		return fmt.Errorf("store: encode policy: %w", err)
 	}
 
-	if _, err := s.db.ExecContext(ctx, `INSERT INTO policies (group_name, data) VALUES (?, ?) ON CONFLICT(group_name) DO UPDATE SET data = excluded.data`, group, raw); err != nil {
+	if err := s.exec(ctx, `INSERT INTO policies (group_name, data) VALUES (?, ?) ON CONFLICT(group_name) DO UPDATE SET data = excluded.data`, group, raw); err != nil {
 		return fmt.Errorf("store: save policy %s: %w", group, err)
 	}
 
@@ -287,7 +301,7 @@ func (s *SQLite) SaveSuspension(ctx context.Context, sp *reconcile.Suspension) e
 		return fmt.Errorf("store: encode suspension: %w", err)
 	}
 
-	if _, err := s.db.ExecContext(ctx, `INSERT INTO suspensions (id, data) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data`, sp.ID, raw); err != nil {
+	if err := s.exec(ctx, `INSERT INTO suspensions (id, data) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data`, sp.ID, raw); err != nil {
 		return fmt.Errorf("store: save suspension %s: %w", sp.ID, err)
 	}
 
@@ -296,7 +310,7 @@ func (s *SQLite) SaveSuspension(ctx context.Context, sp *reconcile.Suspension) e
 
 // DeleteSuspension removes one.
 func (s *SQLite) DeleteSuspension(ctx context.Context, id string) error {
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM suspensions WHERE id = ?`, id); err != nil {
+	if err := s.exec(ctx, `DELETE FROM suspensions WHERE id = ?`, id); err != nil {
 		return fmt.Errorf("store: delete suspension %s: %w", id, err)
 	}
 
@@ -310,7 +324,7 @@ func (s *SQLite) SaveLive(ctx context.Context, id string, l *reconcile.Live) err
 		return fmt.Errorf("store: encode live: %w", err)
 	}
 
-	if _, err := s.db.ExecContext(ctx, `INSERT INTO live (target_id, data) VALUES (?, ?) ON CONFLICT(target_id) DO UPDATE SET data = excluded.data`, id, raw); err != nil {
+	if err := s.exec(ctx, `INSERT INTO live (target_id, data) VALUES (?, ?) ON CONFLICT(target_id) DO UPDATE SET data = excluded.data`, id, raw); err != nil {
 		return fmt.Errorf("store: save live %s: %w", id, err)
 	}
 
@@ -319,7 +333,7 @@ func (s *SQLite) SaveLive(ctx context.Context, id string, l *reconcile.Live) err
 
 // DeleteLive forgets a target.
 func (s *SQLite) DeleteLive(ctx context.Context, id string) error {
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM live WHERE target_id = ?`, id); err != nil {
+	if err := s.exec(ctx, `DELETE FROM live WHERE target_id = ?`, id); err != nil {
 		return fmt.Errorf("store: delete live %s: %w", id, err)
 	}
 
@@ -328,7 +342,7 @@ func (s *SQLite) DeleteLive(ctx context.Context, id string) error {
 
 // SaveDegraded records a quarantine.
 func (s *SQLite) SaveDegraded(ctx context.Context, id, reason string) error {
-	if _, err := s.db.ExecContext(ctx, `INSERT INTO degraded (target_id, reason) VALUES (?, ?) ON CONFLICT(target_id) DO UPDATE SET reason = excluded.reason`, id, reason); err != nil {
+	if err := s.exec(ctx, `INSERT INTO degraded (target_id, reason) VALUES (?, ?) ON CONFLICT(target_id) DO UPDATE SET reason = excluded.reason`, id, reason); err != nil {
 		return fmt.Errorf("store: save degraded %s: %w", id, err)
 	}
 
@@ -337,7 +351,7 @@ func (s *SQLite) SaveDegraded(ctx context.Context, id, reason string) error {
 
 // ClearDegraded lifts a quarantine.
 func (s *SQLite) ClearDegraded(ctx context.Context, id string) error {
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM degraded WHERE target_id = ?`, id); err != nil {
+	if err := s.exec(ctx, `DELETE FROM degraded WHERE target_id = ?`, id); err != nil {
 		return fmt.Errorf("store: clear degraded %s: %w", id, err)
 	}
 
@@ -351,7 +365,7 @@ func (s *SQLite) SaveHookRun(ctx context.Context, id string, run *reconcile.Hook
 		return fmt.Errorf("store: encode hook run: %w", err)
 	}
 
-	if _, err := s.db.ExecContext(ctx, `INSERT INTO hook_runs (target_id, hook, data) VALUES (?, ?, ?) ON CONFLICT(target_id, hook) DO UPDATE SET data = excluded.data`, id, run.Hook, raw); err != nil {
+	if err := s.exec(ctx, `INSERT INTO hook_runs (target_id, hook, data) VALUES (?, ?, ?) ON CONFLICT(target_id, hook) DO UPDATE SET data = excluded.data`, id, run.Hook, raw); err != nil {
 		return fmt.Errorf("store: save hook run %s/%s: %w", id, run.Hook, err)
 	}
 
@@ -360,7 +374,7 @@ func (s *SQLite) SaveHookRun(ctx context.Context, id string, run *reconcile.Hook
 
 // DeleteHookRuns removes a target's hook results.
 func (s *SQLite) DeleteHookRuns(ctx context.Context, id string) error {
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM hook_runs WHERE target_id = ?`, id); err != nil {
+	if err := s.exec(ctx, `DELETE FROM hook_runs WHERE target_id = ?`, id); err != nil {
 		return fmt.Errorf("store: delete hook runs %s: %w", id, err)
 	}
 
@@ -374,7 +388,7 @@ func (s *SQLite) SaveDesired(ctx context.Context, image string, d reconcile.Desi
 		return fmt.Errorf("store: encode desired: %w", err)
 	}
 
-	if _, err := s.db.ExecContext(ctx, `INSERT INTO desired (image, data) VALUES (?, ?) ON CONFLICT(image) DO UPDATE SET data = excluded.data`, image, raw); err != nil {
+	if err := s.exec(ctx, `INSERT INTO desired (image, data) VALUES (?, ?) ON CONFLICT(image) DO UPDATE SET data = excluded.data`, image, raw); err != nil {
 		return fmt.Errorf("store: save desired %s: %w", image, err)
 	}
 
@@ -383,7 +397,7 @@ func (s *SQLite) SaveDesired(ctx context.Context, image string, d reconcile.Desi
 
 // SaveAborted records an abort that must hold across restarts.
 func (s *SQLite) SaveAborted(ctx context.Context, group, key string) error {
-	if _, err := s.db.ExecContext(ctx, `INSERT INTO aborted (group_name, key) VALUES (?, ?) ON CONFLICT(group_name) DO UPDATE SET key = excluded.key`, group, key); err != nil {
+	if err := s.exec(ctx, `INSERT INTO aborted (group_name, key) VALUES (?, ?) ON CONFLICT(group_name) DO UPDATE SET key = excluded.key`, group, key); err != nil {
 		return fmt.Errorf("store: save aborted %s: %w", group, err)
 	}
 
@@ -392,8 +406,62 @@ func (s *SQLite) SaveAborted(ctx context.Context, group, key string) error {
 
 // ClearAborted lifts an abort.
 func (s *SQLite) ClearAborted(ctx context.Context, group string) error {
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM aborted WHERE group_name = ?`, group); err != nil {
+	if err := s.exec(ctx, `DELETE FROM aborted WHERE group_name = ?`, group); err != nil {
 		return fmt.Errorf("store: clear aborted %s: %w", group, err)
+	}
+
+	return nil
+}
+
+// ReplaceDecisions rewrites the decision tables to the snapshot's in one
+// transaction.
+func (s *SQLite) ReplaceDecisions(ctx context.Context, snap *reconcile.Snapshot) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("store: begin: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // a no-op after commit
+
+	for _, q := range []string{`DELETE FROM degraded`, `DELETE FROM aborted`, `DELETE FROM suspensions`} {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("store: replace: %w", err)
+		}
+	}
+
+	w := &SQLite{tx: tx}
+
+	for _, r := range snap.Rollouts {
+		if err := w.SaveRollout(ctx, r); err != nil {
+			return err
+		}
+	}
+
+	for id, reason := range snap.Degraded {
+		if err := w.SaveDegraded(ctx, id, reason); err != nil {
+			return err
+		}
+	}
+
+	for g, key := range snap.Aborted {
+		if err := w.SaveAborted(ctx, g, key); err != nil {
+			return err
+		}
+	}
+
+	for i := range snap.Suspensions {
+		if err := w.SaveSuspension(ctx, &snap.Suspensions[i]); err != nil {
+			return err
+		}
+	}
+
+	for img, d := range snap.Desired {
+		if err := w.SaveDesired(ctx, img, d); err != nil {
+			return err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: commit: %w", err)
 	}
 
 	return nil
@@ -401,7 +469,7 @@ func (s *SQLite) ClearAborted(ctx context.Context, group string) error {
 
 // AppendEvent adds one line of history.
 func (s *SQLite) AppendEvent(ctx context.Context, e *reconcile.Event) error {
-	if _, err := s.db.ExecContext(ctx, `INSERT INTO events (id, at, actor, action, group_name, rollout, target, selector, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	if err := s.exec(ctx, `INSERT INTO events (id, at, actor, action, group_name, rollout, target, selector, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		e.ID, e.At.UTC().Format(time.RFC3339Nano), e.Actor, e.Action, e.Group, e.Rollout, e.Target, e.Selector, e.Reason); err != nil {
 		return fmt.Errorf("store: append event %d: %w", e.ID, err)
 	}
@@ -429,6 +497,11 @@ func (s *SQLite) Events(ctx context.Context, q reconcile.EventQuery) ([]reconcil
 	if q.Target != "" {
 		where = append(where, "target = ?")
 		args = append(args, q.Target)
+	}
+
+	if q.Before > 0 {
+		where = append(where, "id < ?")
+		args = append(args, q.Before)
 	}
 
 	order := "DESC"

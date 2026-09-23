@@ -120,9 +120,16 @@ func (o *OIDC) identityFor(name string) api.Identity {
 
 // nameFromToken verifies an ID token against the issuer and reads the claim.
 func (o *OIDC) nameFromToken(ctx context.Context, raw string) (string, error) {
+	name, _, err := o.verify(ctx, raw)
+
+	return name, err
+}
+
+// verify checks an ID token and returns the claim and the token's nonce.
+func (o *OIDC) verify(ctx context.Context, raw string) (name, nonce string, err error) {
 	tok, err := o.verifier.Verify(ctx, raw)
 	if err != nil {
-		return "", fmt.Errorf("%w: %w", ErrNotSignedIn, err)
+		return "", "", fmt.Errorf("%w: %w", ErrNotSignedIn, err)
 	}
 
 	// A verified token's payload is always a JSON object, so this cannot fail;
@@ -130,12 +137,12 @@ func (o *OIDC) nameFromToken(ctx context.Context, raw string) (string, error) {
 	claims := map[string]any{}
 	_ = tok.Claims(&claims)
 
-	name, _ := claims[o.claim].(string)
+	name, _ = claims[o.claim].(string)
 	if name == "" {
-		return "", fmt.Errorf("%w: token has no %q claim", ErrNotSignedIn, o.claim)
+		return "", "", fmt.Errorf("%w: token has no %q claim", ErrNotSignedIn, o.claim)
 	}
 
-	return name, nil
+	return name, tok.Nonce, nil
 }
 
 // Middleware serves the login, callback and logout routes and passes
@@ -172,7 +179,7 @@ func (o *OIDC) login(w http.ResponseWriter, r *http.Request) {
 	}
 
 	setCookie(w, r, stateCookie, state, int(stateTTL.Seconds()))
-	http.Redirect(w, r, o.oauth.AuthCodeURL(state), http.StatusFound)
+	http.Redirect(w, r, o.oauth.AuthCodeURL(state, oidc.Nonce(nonce)), http.StatusFound)
 }
 
 func (o *OIDC) callback(w http.ResponseWriter, r *http.Request) {
@@ -184,6 +191,7 @@ func (o *OIDC) callback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var st struct {
+		Nonce   string    `json:"n"`
 		Next    string    `json:"next"`
 		Expires time.Time `json:"e"`
 	}
@@ -206,7 +214,11 @@ func (o *OIDC) callback(w http.ResponseWriter, r *http.Request) {
 
 	rawID, _ := tok.Extra("id_token").(string)
 
-	name, err := o.nameFromToken(r.Context(), rawID)
+	name, nonce, err := o.verify(r.Context(), rawID)
+	if err == nil && nonce != st.Nonce {
+		err = errors.New("nonce does not match the login")
+	}
+
 	if err != nil {
 		o.log.WithContext(r.Context()).WithError(err).Warn("id token rejected")
 		http.Error(w, "the issuer's token could not be verified", http.StatusBadGateway)

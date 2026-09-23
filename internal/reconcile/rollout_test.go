@@ -126,7 +126,7 @@ func TestSoakFailureHaltsQuarantinesAndRetries(t *testing.T) {
 	r := h.active("a")
 	require.Equal(t, Halted, r.State)
 	require.Contains(t, r.Reason, "soak soak-a failed 2 times: 61% vs 98%")
-	require.Contains(t, r.Reason, "2 targets left running 2222222")
+	require.Contains(t, r.Reason, "2 targets quarantined on 2222222")
 	require.Equal(t, PhaseFailed, h.phases(r)[tA1])
 	require.Equal(t, Degraded, h.view(tA1).Health)
 	require.Equal(t, Degraded, h.c.Fleet().Groups[0].Health)

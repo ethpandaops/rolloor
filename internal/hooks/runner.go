@@ -69,7 +69,36 @@ type Runner struct {
 	dir         string
 	timeout     time.Duration
 	environment string
+	hidden      map[string]struct{}
 	log         observability.ContextualLogger
+}
+
+// Hide keeps the named environment variables, such as the process's own
+// secrets, away from every program.
+func (r *Runner) Hide(names ...string) {
+	if r.hidden == nil {
+		r.hidden = map[string]struct{}{}
+	}
+
+	for _, n := range names {
+		if n != "" {
+			r.hidden[n] = struct{}{}
+		}
+	}
+}
+
+func (r *Runner) environ() []string {
+	env := os.Environ()
+	out := env[:0]
+
+	for _, kv := range env {
+		name, _, _ := strings.Cut(kv, "=")
+		if _, hide := r.hidden[name]; !hide {
+			out = append(out, kv)
+		}
+	}
+
+	return out
 }
 
 // NewRunner returns a runner. dir must exist.
@@ -114,7 +143,7 @@ func (r *Runner) Run(ctx context.Context, program, hook, targetID string, input 
 	cmd.Stdin = bytes.NewReader(stdin)
 	isolate(cmd)
 
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(r.environ(),
 		"ROLLOOR_HOOK="+hook,
 		"ROLLOOR_ENVIRONMENT="+r.environment,
 		"ROLLOOR_TARGET_ID="+targetID,
