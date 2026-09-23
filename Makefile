@@ -13,7 +13,7 @@ cover:
 lint: words
 	golangci-lint run --timeout=10m
 
-# The binary must not know the workload. See tasks/prd.md §1.
+# Nothing in the repository may be workload-specific. See tasks/prd.md §1.
 words:
 	./scripts/lint-words.sh
 
