@@ -23,9 +23,13 @@ declare -A floor=(
 )
 
 profile=$(mktemp)
-trap 'rm -f "$profile"' EXIT
+output=$(mktemp)
+trap 'rm -f "$profile" "$output"' EXIT
 
-go test -race -timeout 5m -coverprofile="$profile" -covermode=atomic ./... >/dev/null
+if ! go test -race -timeout 5m -coverprofile="$profile" -covermode=atomic ./... >"$output" 2>&1; then
+  grep -vE '^ok|no test files' "$output" >&2
+  exit 1
+fi
 
 module=github.com/ethpandaops/rolloor
 fail=0
