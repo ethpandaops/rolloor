@@ -20,6 +20,8 @@ declare -A floor=(
   [internal/ui]=80
   [internal/observability]=0
   [cmd/rolloor]=0
+  [contrib/ethpandaops]=100
+  [contrib/ethpandaops/cmd/rolloor-ethpandaops]=0
 )
 
 profile=$(mktemp)
@@ -35,8 +37,8 @@ fail=0
 pct_for() {
   awk -v p="${module}/$1/" '
     NR > 1 && index($1, p) == 1 {
-      n = split($1, parts, "/"); file = parts[n]
-      if (index(file, "/") == 0) { total += $2; if ($3 > 0) hit += $2 }
+      rest = substr($1, length(p) + 1)
+      if (index(rest, "/") == 0) { total += $2; if ($3 > 0) hit += $2 }
     }
     END { if (total == 0) print "0.0"; else printf "%.1f", 100 * hit / total }' "$profile"
 }

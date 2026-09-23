@@ -1,0 +1,73 @@
+{#
+  rolloor targets for one ethpandaops devnet, rendered from the inventory.
+  Every host with ethereum_node_el or ethereum_node_cl becomes a node with
+  up to four targets: execution, beacon, a separate validator client when
+  <cl>_validator_container_name is set, and xatu-sentry when enabled. A
+  beacon node running its validators in-process soaks on them instead.
+
+  Weight is the host's validator count. Waves: hosts without validators 0,
+  with validators 1, bootnodes 2.
+
+  Inputs besides the usual inventory variables:
+    rolloor_updater_prefix   default "wt-"; the updater's virtual host prefix
+    rolloor_owners           optional client -> owner value map (e.g. nimbusel: nimbus)
+    rolloor_sidecar_owner    default "operators"
+#}
+{%- set updater_prefix = rolloor_updater_prefix | default('wt-') -%}
+{%- set owners = rolloor_owners | default({}) -%}
+{%- set sidecar_owner = rolloor_sidecar_owner | default('operators') -%}
+# Written by ansible from the inventory; edits are overwritten.
+{% for host in groups['all'] | sort if hostvars[host].ethereum_node_el is defined or hostvars[host].ethereum_node_cl is defined %}
+{%-   set hv = hostvars[host] -%}
+{%-   set subdomain = hv.network_server_subdomain -%}
+{%-   set has_validators = hv.validator_start is defined and hv.validator_end is defined -%}
+{%-   set weight = ((hv.validator_end | int) - (hv.validator_start | int)) if has_validators else 0 -%}
+{%-   set wave = 2 if host in groups.get('bootnode', []) else (1 if has_validators else 0) -%}
+{%-   set updater = 'https://' ~ updater_prefix ~ host ~ '.' ~ subdomain -%}
+{%-   set beacon = 'https://' ~ hv.ethereum_node_beacon_prefix ~ host ~ '.' ~ subdomain -%}
+{%-   set rpc = 'https://' ~ hv.ethereum_node_rpc_prefix ~ host ~ '.' ~ subdomain %}
+{%-   if hv.ethereum_node_el is defined %}
+{%-     set el = hv.ethereum_node_el %}
+- id: {{ host }}/execution
+  node: {{ host }}
+  address: {{ host }}.{{ subdomain }}
+  weight: {{ weight }}
+  image: {{ hv[el ~ '_container_image'] }}
+  labels: {client: {{ el }}, owner: {{ owners.get(el, el) }}, role: el, wave: "{{ wave }}"}
+  probes: {ready: ready-execution, soak: soak-execution}
+  extra: {container: {{ hv[el ~ '_container_name'] | default('execution') }}, updater: "{{ updater }}", rpc: "{{ rpc }}"}
+{%-   endif %}
+{%-   if hv.ethereum_node_cl is defined %}
+{%-     set cl = hv.ethereum_node_cl %}
+{%-     set separate_vc = has_validators and hv[cl ~ '_validator_container_name'] is defined %}
+{%-     set in_process = has_validators and not separate_vc %}
+- id: {{ host }}/beacon
+  node: {{ host }}
+  address: {{ host }}.{{ subdomain }}
+  weight: {{ weight }}
+  image: {{ hv[cl ~ '_container_image'] }}
+  labels: {client: {{ cl }}, owner: {{ owners.get(cl, cl) }}, role: cl, wave: "{{ wave }}"}
+  probes: {ready: ready-beacon, soak: {{ 'soak-validator' if in_process else 'soak-beacon' }}}
+  extra: {container: {{ hv[cl ~ '_container_name'] | default('beacon') }}, updater: "{{ updater }}", beacon: "{{ beacon }}"{% if in_process %}, validators: "{{ hv.validator_start }}-{{ hv.validator_end }}"{% endif %}}
+{%-     if separate_vc %}
+- id: {{ host }}/validator
+  node: {{ host }}
+  address: {{ host }}.{{ subdomain }}
+  weight: {{ weight }}
+  image: {{ hv[cl ~ '_validator_container_image'] | default(hv[cl ~ '_container_image']) }}
+  labels: {client: {{ cl }}, owner: {{ owners.get(cl, cl) }}, role: vc, wave: "{{ wave }}"}
+  probes: {ready: ready-running, soak: soak-validator}
+  extra: {container: {{ hv[cl ~ '_validator_container_name'] }}, updater: "{{ updater }}", validators: "{{ hv.validator_start }}-{{ hv.validator_end }}"}
+{%-     endif %}
+{%-   endif %}
+{%-   if hv.ethereum_node_xatu_sentry_enabled | default(false) | bool %}
+- id: {{ host }}/xatu-sentry
+  node: {{ host }}
+  address: {{ host }}.{{ subdomain }}
+  weight: {{ weight }}
+  image: {{ hv.xatu_sentry_container_image }}
+  labels: {client: xatu-sentry, owner: {{ sidecar_owner }}, role: sidecar, wave: "{{ wave }}"}
+  probes: {ready: ready-running}
+  extra: {container: xatu-sentry, updater: "{{ updater }}"}
+{%-   endif %}
+{% endfor %}
