@@ -120,7 +120,8 @@ func newWorld() *world {
 	}
 }
 
-// gate makes the next call of kind ("resolve" or a hook name) block until
+// gate makes the next call of kind ("resolve", a hook name, or
+// "hook:target" for one target's) block until
 // the returned function is called, so a test can overlap two operations.
 func (w *world) gate(kind string) (entered <-chan struct{}, release func()) {
 	in := make(chan struct{})
@@ -175,6 +176,7 @@ func (w *world) Resolve(_ context.Context, ref string) (registry.Resolved, error
 
 func (w *world) Run(_ context.Context, program, hook, targetID string, input any) (hooks.Result, error) {
 	w.wait(hook)
+	w.wait(hook + ":" + targetID)
 
 	w.mu.Lock()
 	defer w.mu.Unlock()

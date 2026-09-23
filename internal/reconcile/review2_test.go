@@ -272,7 +272,7 @@ func TestLateInspectionOfAForgottenTargetIsDropped(t *testing.T) {
 		"- {id: a-1/cl, node: a-1, weight: 0,   image: org/a:t, labels: {client: a, owner: a, role: cl, wave: \"0\"}, hooks: {soak: soak-a}}", ""), &rules)
 	require.NoError(t, err)
 
-	entered, release := h.world.gate("inspect")
+	entered, release := h.world.gate("inspect:" + tA1)
 
 	var wg sync.WaitGroup
 
