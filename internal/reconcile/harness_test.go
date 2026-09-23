@@ -20,7 +20,7 @@ import (
 
 const (
 	actor     = "sam"
-	other     = "nflaig"
+	other     = "robin"
 	speedTest = "test"
 	speedAll  = "all"
 	labelWave = "wave"
@@ -322,6 +322,24 @@ type harness struct {
 	notes *notes
 	c     *Controller
 	ids   int
+	// setMu guards set for tests that swap it while programs are running.
+	setMu sync.Mutex
+}
+
+// current is the controller's view of the targets.
+func (h *harness) current() *targets.Set {
+	h.setMu.Lock()
+	defer h.setMu.Unlock()
+
+	return h.set
+}
+
+// swap replaces the targets while the controller may be reading them.
+func (h *harness) swap(set *targets.Set) {
+	h.setMu.Lock()
+	defer h.setMu.Unlock()
+
+	h.set = set
 }
 
 func newHarness(t *testing.T, cfgYAML, targetsYAML string) *harness {
@@ -352,7 +370,7 @@ func (h *harness) newController() *Controller {
 	h.t.Helper()
 
 	c, err := New(h.ctx, &Options{
-		Config: h.cfg, Targets: func() *targets.Set { return h.set }, Resolver: h.world, Runner: h.world,
+		Config: h.cfg, Targets: h.current, Resolver: h.world, Runner: h.world,
 		Store: h.store, Notifier: h.notes, Clock: h.clock, Log: logrus.New(),
 		NewID: func() string {
 			h.ids++

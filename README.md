@@ -6,7 +6,6 @@ rolloor watches the image tags a set of containers run, and when a tag moves it 
 
 - `tasks/prd.md` is the spec this is built from: inputs, the reconcile loop, hooks, API, storage.
 - `examples/generic/` runs the whole loop against six nginx containers on a local registry. CI runs it on every change.
-- `contrib/ethpandaops/` holds the first real workload's scripts and targets template.
 
 ## Run the example
 
@@ -21,11 +20,11 @@ Needs docker, curl and jq. It builds four variants of an image, watches rolloor 
 ```sh
 make test     # go test -race
 make cover    # statement coverage floors per package
-make lint     # golangci-lint, plus the workload-word lint on the Go tree
+make lint     # golangci-lint, plus the workload-word lint
 make words    # the word lint alone
 ```
 
-The Go tree must never mention the workload. `scripts/lint-words.sh` fails the build if it does.
+Nothing in this repository is specific to a workload; deployments bring their own hooks and targets. `scripts/lint-words.sh` fails the build if the first workload's words appear in any tracked file.
 
 ## Configure
 

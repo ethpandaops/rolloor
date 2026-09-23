@@ -535,7 +535,7 @@ func TestSuspendResumeAndExpiry(t *testing.T) {
 
 	v := h.view(tA1)
 	require.Equal(t, Suspended, v.Health)
-	require.Contains(t, v.Reason, "suspended by nflaig until")
+	require.Contains(t, v.Reason, "suspended by robin until")
 	require.Contains(t, v.Reason, "debugging peer churn")
 	require.Equal(t, Suspended, h.c.Fleet().Groups[0].Health)
 

@@ -81,10 +81,6 @@ linters:
           - gosec
           - wsl
         path: _test\.go
-      # Field names there are the node APIs' own.
-      - linters:
-          - tagliatelle
-        path: contrib/ethpandaops/
     paths:
       - third_party$
       - builtin$

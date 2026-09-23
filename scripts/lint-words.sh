@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Fails if a workload word appears in the Go tree. The controller is generic;
-# these words belong in contrib/ and examples/ only.
+# Fails if a word from the first workload appears in any tracked file. Nothing
+# in this repository is workload-specific; deployments bring their own hooks.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-words='beacon|validator|slot|epoch|finality|watchtower|ethereum|cartographoor|coredevs|authentik'
+words='beacon|validators?|slots?|epochs?|finality|watchtower|ethereum|cartographoor|coredevs|authentik|devnets?|lighthouse|prysm|teku|nimbus|lodestar|grandine|besu|nethermind|erigon|geth'
 
-if hits=$(grep -rniE --include='*.go' --include='*.html' --include='*.sql' "\b(${words})\b" cmd internal 2>/dev/null); then
-  echo "workload words found in the Go tree:" >&2
+if hits=$(git grep -nIiwE "(${words})" -- . ':!scripts/lint-words.sh' ':!go.sum' ':!internal/ui/static/htmx.min.js'); then
+  echo "workload words found:" >&2
   echo "$hits" >&2
   exit 1
 fi

@@ -28,7 +28,7 @@ const (
 	sessionKey = "0123456789abcdef0123456789abcdef"
 	sam        = "sam"
 	operators  = "operators"
-	lighthouse = "lighthouse"
+	alpha      = "alpha"
 )
 
 // issuer is a fake OpenID provider: discovery, JWKS, and a token endpoint
@@ -140,7 +140,7 @@ func TestNewOIDCErrors(t *testing.T) {
 
 func TestBearerTokens(t *testing.T) {
 	is := newIssuer(t)
-	teams, err := LoadTeams(writeTeams(t, "lighthouse: [sam, paul]\noperators: [sam]\n"), logrus.New())
+	teams, err := LoadTeams(writeTeams(t, "alpha: [sam, paul]\noperators: [sam]\n"), logrus.New())
 	require.NoError(t, err)
 
 	o := newOIDC(t, is, teams)
@@ -151,13 +151,13 @@ func TestBearerTokens(t *testing.T) {
 	id, err := o.Identity(req)
 	require.NoError(t, err)
 	require.Equal(t, sam, id.Name)
-	require.Equal(t, []string{lighthouse, operators}, id.Owners)
+	require.Equal(t, []string{alpha, operators}, id.Owners)
 	require.True(t, id.Admin)
 
 	req.Header.Set("Authorization", "Bearer "+is.token(t, "paul"))
 	id, err = o.Identity(req)
 	require.NoError(t, err)
-	require.Equal(t, []string{lighthouse}, id.Owners)
+	require.Equal(t, []string{alpha}, id.Owners)
 	require.False(t, id.Admin)
 
 	// Someone the teams file does not know owns nothing.
@@ -502,12 +502,12 @@ func TestCodec(t *testing.T) {
 }
 
 func TestTeams(t *testing.T) {
-	path := writeTeams(t, "lighthouse: [sam, paul]\noperators: [sam]\n")
+	path := writeTeams(t, "alpha: [sam, paul]\noperators: [sam]\n")
 
 	teams, err := LoadTeams(path, logrus.New())
 	require.NoError(t, err)
-	require.Equal(t, []string{lighthouse, operators}, teams.Owners(sam))
-	require.Equal(t, []string{lighthouse, operators}, teams.Owners(strings.ToUpper(sam)), "identities compare without case")
+	require.Equal(t, []string{alpha, operators}, teams.Owners(sam))
+	require.Equal(t, []string{alpha, operators}, teams.Owners(strings.ToUpper(sam)), "identities compare without case")
 	require.Empty(t, teams.Owners("nobody"))
 
 	// Unchanged file: no reload.
@@ -518,14 +518,14 @@ func TestTeams(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, []byte("- not a map\n"), 0o644))
 	require.NoError(t, os.Chtimes(path, time.Now(), time.Now().Add(time.Second)))
 	require.Error(t, teams.Reload())
-	require.Equal(t, []string{lighthouse, operators}, teams.Owners(sam))
+	require.Equal(t, []string{alpha, operators}, teams.Owners(sam))
 
 	// A good rewrite replaces it.
-	require.NoError(t, os.WriteFile(path, []byte("teku: [paul]\n"), 0o644))
+	require.NoError(t, os.WriteFile(path, []byte("beta: [paul]\n"), 0o644))
 	require.NoError(t, os.Chtimes(path, time.Now(), time.Now().Add(2*time.Second)))
 	require.NoError(t, teams.Reload())
 	require.Empty(t, teams.Owners(sam))
-	require.Equal(t, []string{"teku"}, teams.Owners("paul"))
+	require.Equal(t, []string{"beta"}, teams.Owners("paul"))
 
 	// Missing file.
 	_, err = LoadTeams(filepath.Join(t.TempDir(), "missing.yaml"), logrus.New())

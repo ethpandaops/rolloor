@@ -158,7 +158,7 @@ func TestSuspendedDuringItsUpdateDoesNotHaltTheBatch(t *testing.T) {
 	r := h.active("a")
 	require.NotEqual(t, Halted, r.State, "the refused update belonged to a target that was no longer in play")
 	require.Equal(t, PhaseSkipped, h.phases(r)[tA1])
-	require.Contains(t, r.Targets[0].Reason, "suspended by nflaig")
+	require.Contains(t, r.Targets[0].Reason, "suspended by robin")
 	require.Equal(t, PhaseUpdating, h.phases(r)[tA2])
 }
 
@@ -286,7 +286,7 @@ func TestLateInspectionOfAForgottenTargetIsDropped(t *testing.T) {
 
 	<-entered
 
-	h.set = without
+	h.swap(without)
 	h.c.Forget(h.ctx, []string{tA1})
 	release()
 	wg.Wait()

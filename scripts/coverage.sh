@@ -20,8 +20,6 @@ declare -A floor=(
   [internal/ui]=80
   [internal/observability]=0
   [cmd/rolloor]=0
-  [contrib/ethpandaops]=100
-  [contrib/ethpandaops/cmd/rolloor-ethpandaops]=0
 )
 
 profile=$(mktemp)

@@ -58,7 +58,7 @@ func TestSuspensionAndGroupMoveMidBatch(t *testing.T) {
 
 	got := h.active("a")
 	require.Equal(t, PhaseSkipped, h.phases(got)[tA1])
-	require.Contains(t, got.Targets[0].Reason, "suspended by nflaig")
+	require.Contains(t, got.Targets[0].Reason, "suspended by robin")
 	require.Equal(t, PhaseSkipped, h.phases(got)[tA2])
 	require.Equal(t, "moved to group b", got.Targets[1].Reason)
 	require.Equal(t, Suspended, h.view(tA1).Health)

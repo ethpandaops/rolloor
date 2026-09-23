@@ -24,7 +24,7 @@ jobs:
           go mod tidy
           go mod verify
           git diff --exit-code go.mod go.sum
-      - name: workload words stay out of the binary
+      - name: workload words stay out of the repository
         run: ./scripts/lint-words.sh
       - name: tests with coverage floors
         run: ./scripts/coverage.sh

@@ -16,7 +16,7 @@ In the binary:
 - HTTP API, server-rendered UI, SQLite, history, events, metrics
 - OIDC login and owner-based authorisation
 
-Not in the binary, ever: any word from the workload. A lint fails the build if `beacon`, `validator`, `slot`, `epoch`, `finality`, `watchtower`, `ethereum`, `cartographoor`, `coredevs` or `authentik` appear under `cmd/` or `internal/`. The ethpandaops scripts live in `contrib/ethpandaops/`, outside the lint.
+Not in this repository, ever: anything specific to a workload. Hooks, targets templates and team lists for a real deployment live with that deployment. If a deployment cannot express what it needs through the files and programs described here, the binary is missing a generic feature; the fix goes there, not into workload code here. `scripts/lint-words.sh` fails the build if words from the first workload appear in any tracked file.
 
 Scope guards: five hooks, no plugin registry, no step language, no high availability, no policy editor in the UI, no cross-environment knowledge.
 
@@ -25,7 +25,7 @@ Scope guards: five hooks, no plugin registry, no step language, no high availabi
 ### 2.1 `config.yaml`
 
 ```yaml
-environment: devnet-11            # shown in the header; the only place the name appears
+environment: prod-eu              # shown in the header; the only place the name appears
 listen: ":8080"
 dataDir: /var/lib/rolloor         # rolloor.db lives here
 
@@ -33,7 +33,7 @@ targetsDir: /etc/rolloor/targets.d    # *.yaml, merged, reloaded on change
 teamsFile: /etc/rolloor/teams.yaml    # optional
 
 labels:
-  group: client                   # tiles, policies and rollouts are per value of this label
+  group: app                      # tiles, policies and rollouts are per value of this label
   owner: owner                    # authorisation is per value of this label
   section: role                   # optional: fleet page headings
   hiddenGroups: []               # group values folded away on the fleet page by default
@@ -73,7 +73,7 @@ auth:
   issuer: https://auth.example/application/o/rolloor/
   clientId: rolloor
   clientSecretEnv: ROLLOOR_OIDC_CLIENT_SECRET
-  redirectUrl: https://rolloor.devnet-11.example/auth/callback
+  redirectUrl: https://rolloor.prod-eu.example/auth/callback
   identityClaim: preferred_username
   adminOwner: operators          # members of this owner value may act on anything
 ```
@@ -85,14 +85,14 @@ Unknown fields are an error. `budget` and batch fractions accept `N%` or an abso
 One or more YAML files in `targets_dir`. A list of targets:
 
 ```yaml
-- id: lighthouse-besu-4/cl
-  node: lighthouse-besu-4
-  address: lighthouse-besu-4.devnet-11.example
+- id: web-4/frontend
+  node: web-4
+  address: web-4.prod-eu.example
   weight: 1200
-  image: ethpandaops/lighthouse:unstable
-  labels: {client: lighthouse, role: cl, owner: lighthouse, wave: "1"}
-  probes: {ready: beacon-syncing, soak: attestation-effectiveness}
-  extra: {container: lighthouse}        # opaque, passed through to hooks
+  image: registry.example/shop/frontend:stable
+  labels: {app: frontend, role: web, owner: shop, wave: "1"}
+  probes: {ready: http-ok, soak: error-rate}
+  extra: {container: frontend}          # opaque, passed through to hooks
 ```
 
 Rules:
@@ -108,8 +108,8 @@ Rules:
 ### 2.3 Teams file
 
 ```yaml
-lighthouse: [michaelsproul, paulhauner]
-operators: [samcm, pk910]
+shop: [alice, bob]
+operators: [carol]
 ```
 
 Owner value → list of identity-claim values. Without the file, a claim value equal to an owner value grants. With `auth.mode: none`, everyone is `admin_owner` and history records the remote address.
@@ -156,7 +156,7 @@ If the effective soak duration is 0, the batch passes when all its targets are r
 ```json
 {"updated": [targets in this batch using this program],
  "remaining": [rollout targets not yet updated, same program, not Suspended or Unknown],
- "rollout": {"id": "...", "group": "lighthouse", "batch": 1, "wave": 1}}
+ "rollout": {"id": "...", "group": "frontend", "batch": 1, "wave": 1}}
 ```
 
 Exit 0 is a pass. Stdout's first line is shown as the reason; a second line of the form `updated=<num> remaining=<num> unit=<text>` is shown as the two numbers. The batch passes after `passes` consecutive passes with no more than `grace` failures in total; the `grace+1`th failure halts. A pass on stored evidence needs the last completed check to be no older than two intervals, so a process that was away re-checks before passing; a check that was dispatched but never answered is not evidence. A batch whose targets have no soak programs left passes at once. Each batch keeps its own soak record. `remaining` may be empty on the last batch; the program decides what that means.
@@ -259,7 +259,6 @@ internal/api/           handlers, SSE
 internal/ui/            templates, static, handlers
 internal/observability/ logger, metrics
 examples/generic/       compose file, targets.yaml, hooks that use docker + curl, ci script
-contrib/ethpandaops/    hooks/, targets.yaml.j2, teams refresh script, README
 scripts/lint-words.sh
 ```
 
@@ -280,12 +279,5 @@ Each is one or a few PRs and ends with something running.
 
 - **M1 core.** config, targets, registry, hooks, reconcile, store, API (reads + actions), metrics, `validate`, the generic example green in CI, word lint. No UI, no auth.
 - **M2 UI + auth.** templates for every route and state in the brief, OIDC, teams file, disabled-with-reason.
-- **M3 ethpandaops.** `contrib/ethpandaops/`: hook scripts (update/inspect via the node's updater API, ready per role, soak via Prometheus, environment via the beacon API), targets template, teams refresh from coredevs; the ansible role in `ansible-collection-general` that deploys one instance per devnet; trial on a throwaway devnet.
+- **M3 first deployment.** Its hooks, targets template and teams refresh live with the deployment, outside this repository; anything it cannot express through configuration becomes a generic feature here. Trial on a throwaway environment.
 - **M4 panda.** `panda rollout` command group against the API; panda-pulse message per rollout and halt alert.
-
-## 14. To confirm during M3 (does not block M1/M2)
-
-- The node updater's per-container update parameter and which endpoint reports a container's running digest. Both live in `contrib/ethpandaops/hooks/`.
-- The digest reported by the node for a multi-arch tag matches the registry's manifest-list digest; if it reports the platform manifest digest instead, `registry` must resolve to the platform digest for the node's `arch` label.
-- One OIDC client at Authentik for rolloor with per-devnet redirect URIs and the username claim carrying the GitHub handle.
-- Default budgets per devnet class.

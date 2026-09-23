@@ -8,7 +8,7 @@ import (
 )
 
 func TestParseMinimal(t *testing.T) {
-	cfg, err := Parse([]byte("environment: devnet-1\n"))
+	cfg, err := Parse([]byte("environment: env-1\n"))
 	require.NoError(t, err)
 	require.Equal(t, ":8080", cfg.Listen)
 	require.Equal(t, 60*time.Second, cfg.Registry.Poll)
