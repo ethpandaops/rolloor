@@ -50,31 +50,35 @@ type GroupView struct {
 type RolloutView struct {
 	Rollout
 
-	Digest        string        `json:"digest"`
-	Revision      string        `json:"revision,omitempty"`
-	OnNewBuild    int           `json:"onNewBuild"`
-	NotReached    int           `json:"notReached"`
-	Total         int           `json:"total"`
-	BudgetInUse   float64       `json:"budgetInUse"`
-	BudgetTotal   float64       `json:"budgetTotal"`
-	BudgetPercent string        `json:"budgetPercent"`
-	Running       time.Duration `json:"running"`
+	Digest     string `json:"digest"`
+	Revision   string `json:"revision,omitempty"`
+	OnNewBuild int    `json:"onNewBuild"`
+	NotReached int    `json:"notReached"`
+	Total      int    `json:"total"`
+	// UnavailableWeight is the weight mid-update now, across every rollout;
+	// MaxUnavailableWeight is what the disruption budget allows.
+	UnavailableWeight    float64       `json:"unavailableWeight"`
+	MaxUnavailableWeight float64       `json:"maxUnavailableWeight"`
+	Unavailable          string        `json:"unavailable"`
+	Running              time.Duration `json:"running"`
 }
 
 // FleetView is the whole environment.
 type FleetView struct {
-	Environment string            `json:"environment"`
-	Groups      []GroupView       `json:"groups"`
-	Targets     int               `json:"targets"`
-	Nodes       int               `json:"nodes"`
-	Weight      float64           `json:"weight"`
-	Budget      string            `json:"budget"`
-	BudgetInUse string            `json:"budgetInUse"`
-	EnvOK       bool              `json:"environmentOk"`
-	EnvReason   string            `json:"environmentReason"`
-	EnvCheck    string            `json:"environmentCheck,omitempty"`
-	Resolve     map[string]string `json:"registryErrors,omitempty"`
-	At          time.Time         `json:"at"`
+	Environment string      `json:"environment"`
+	Groups      []GroupView `json:"groups"`
+	Targets     int         `json:"targets"`
+	Nodes       int         `json:"nodes"`
+	Weight      float64     `json:"weight"`
+	// MaxUnavailable is the disruption budget as configured; Unavailable
+	// is the share of weight mid-update now.
+	MaxUnavailable string            `json:"maxUnavailable"`
+	Unavailable    string            `json:"unavailable"`
+	EnvOK          bool              `json:"environmentOk"`
+	EnvReason      string            `json:"environmentReason"`
+	EnvCheck       string            `json:"environmentCheck,omitempty"`
+	Resolve        map[string]string `json:"registryErrors,omitempty"`
+	At             time.Time         `json:"at"`
 }
 
 // NodeView is one machine.
@@ -305,8 +309,8 @@ func (c *Controller) Fleet() FleetView {
 	defer c.mu.RUnlock()
 
 	f := FleetView{Environment: c.cfg.Environment, Targets: set.Len(), Nodes: len(set.Nodes()), Weight: set.TotalWeight(),
-		Budget: c.cfg.Budget.String(), EnvOK: c.envOK, EnvReason: c.envReason, EnvCheck: c.cfg.Hooks.Environment.Program, At: now}
-	f.BudgetInUse = pct(c.inFlightWeight(set), set.TotalWeight())
+		MaxUnavailable: c.cfg.DisruptionBudget.MaxUnavailable.String(), EnvOK: c.envOK, EnvReason: c.envReason, EnvCheck: c.cfg.Hooks.Environment.Program, At: now}
+	f.Unavailable = pct(c.inFlightWeight(set), set.TotalWeight())
 
 	if len(c.resolveErrors) > 0 {
 		f.Resolve = map[string]string{}
@@ -425,9 +429,9 @@ func (c *Controller) rolloutViewLocked(set *targets.Set, r *Rollout) RolloutView
 		}
 	}
 
-	v.BudgetTotal = c.cfg.Budget.OfWeight(set.TotalWeight())
-	v.BudgetInUse = c.inFlightWeight(set)
-	v.BudgetPercent = pct(v.BudgetInUse, set.TotalWeight()) + " of " + c.cfg.Budget.String()
+	v.MaxUnavailableWeight = c.cfg.DisruptionBudget.MaxUnavailable.OfWeight(set.TotalWeight())
+	v.UnavailableWeight = c.inFlightWeight(set)
+	v.Unavailable = pct(v.UnavailableWeight, set.TotalWeight()) + " of " + c.cfg.DisruptionBudget.MaxUnavailable.String()
 
 	end := r.EndedAt
 	if end.IsZero() {

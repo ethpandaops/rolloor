@@ -17,15 +17,15 @@ func TestSyncWithSpeedCreatesRolloutAtThatSpeed(t *testing.T) {
 	h.release(imgA, d2)
 	require.NoError(t, h.c.Abort(h.ctx, actor, h.active("a").ID))
 
-	ids, err := h.c.Sync(h.ctx, SyncRequest{Actor: actor, Selector: mustSel("client=a"), Speed: speedAll})
+	ids, err := h.c.Sync(h.ctx, SyncRequest{Actor: actor, Selector: mustSel("client=a"), Strategy: speedAll})
 	require.NoError(t, err)
-	require.Equal(t, speedAll, h.rollout(ids[0]).Speed)
+	require.Equal(t, speedAll, h.rollout(ids[0]).Strategy)
 }
 
 func TestNoWavePolicyFlattensWavesAtCreation(t *testing.T) {
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
-	require.NoError(t, h.c.SetPolicy(h.ctx, actor, "a", Policy{Mode: ModeAutomated, Speed: speedAll}))
+	require.NoError(t, h.c.SetPolicy(h.ctx, actor, "a", Policy{Mode: ModeAutomated, Strategy: speedAll}))
 	h.release(imgA, d2)
 
 	r := h.active("a")
@@ -38,7 +38,7 @@ func TestNoWavePolicyFlattensWavesAtCreation(t *testing.T) {
 }
 
 func TestTwoTargetsOnOneNodeSortByID(t *testing.T) {
-	doc := testTargets + "- {id: a-3/vc, node: a-3, weight: 100, image: org/a:t, labels: {client: a, owner: a, role: vc, wave: \"1\"}, probes: {soak: soak-a}}\n"
+	doc := testTargets + "- {id: a-3/vc, node: a-3, weight: 100, image: org/a:t, labels: {client: a, owner: a, role: vc, wave: \"1\"}, hooks: {soak: soak-a}}\n"
 	h := newHarness(t, testConfig, doc)
 	h.prime()
 	h.release(imgA, d2)
@@ -54,12 +54,12 @@ func TestTwoTargetsOnOneNodeSortByID(t *testing.T) {
 	h.tick()
 	r = h.active("a")
 	require.Equal(t, []string{tA3, "a-3/vc"}, r.Batches[1].Targets)
-	require.Equal(t, "20.0% of 50%", r.BudgetPercent)
+	require.Equal(t, "20.0% of 50%", r.Unavailable)
 }
 
 func TestMixedSoakProgramsInOneBatch(t *testing.T) {
 	doc := replaceLine(testTargets,
-		"- {id: a-2/cl, node: a-2, weight: 0,   image: org/a:t, labels: {client: a, owner: a, role: cl, wave: \"0\"}, probes: {soak: soak-a}}",
+		"- {id: a-2/cl, node: a-2, weight: 0,   image: org/a:t, labels: {client: a, owner: a, role: cl, wave: \"0\"}, hooks: {soak: soak-a}}",
 		"- {id: a-2/cl, node: a-2, weight: 0,   image: org/a:t, labels: {client: a, owner: a, role: cl, wave: \"0\"}}")
 	h := newHarness(t, testConfig, doc)
 	h.prime()
@@ -80,7 +80,7 @@ func TestMixedSoakProgramsInOneBatch(t *testing.T) {
 func TestCarefulWithNothingLeftDoesNotPause(t *testing.T) {
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
-	require.NoError(t, h.c.SetPolicy(h.ctx, actor, "side", Policy{Mode: ModeAutomated, Speed: "careful"}))
+	require.NoError(t, h.c.SetPolicy(h.ctx, actor, "side", Policy{Mode: ModeAutomated, Strategy: "careful"}))
 	h.release(imgS, d2)
 
 	r := h.active("side")
@@ -96,7 +96,7 @@ func TestHaltSkipsRemovedTargetInBatch(t *testing.T) {
 
 	rules := h.set.Rules()
 	smaller, err := parseTargets(replaceLine(testTargets,
-		"- {id: a-2/cl, node: a-2, weight: 0,   image: org/a:t, labels: {client: a, owner: a, role: cl, wave: \"0\"}, probes: {soak: soak-a}}", ""), &rules)
+		"- {id: a-2/cl, node: a-2, weight: 0,   image: org/a:t, labels: {client: a, owner: a, role: cl, wave: \"0\"}, hooks: {soak: soak-a}}", ""), &rules)
 	require.NoError(t, err)
 
 	h.set = smaller
@@ -165,16 +165,14 @@ func TestSoakPassDecidedAtApplyTime(t *testing.T) {
 	require.True(t, h.active("a").Batches[0].Passed)
 }
 
-func TestSoakRunsPastDurationUntilStreakIsMet(t *testing.T) {
-	cfg := replaceLine(testConfig,
-		"  test:    {batch: [2], soak: {duration: 60s, interval: 20s, passes: 2, grace: 1}}",
-		"  test:    {batch: [2], soak: {duration: 60s, interval: 20s, passes: 2, grace: 3}}")
+func TestSoakRunsPastDurationUntilACheckPasses(t *testing.T) {
+	cfg := replaceLine(testConfig, "failureLimit: 1}}", "failureLimit: 3}}")
 	h := newHarness(t, cfg, testTargets)
 	h.prime()
 	h.release(imgA, d2)
 	h.ticks(5, 0)
 
-	// Three failures at 20, 40 and 60 seconds exhaust the duration without a streak.
+	// Three failures at 20, 40 and 60 seconds use up the duration.
 	h.world.set(func(w *world) { w.soakFail[soakA] = true })
 
 	for i := 0; i < 3; i++ {
@@ -182,24 +180,22 @@ func TestSoakRunsPastDurationUntilStreakIsMet(t *testing.T) {
 		h.tick()
 	}
 
-	require.Equal(t, 3, h.active("a").Soak.Failures)
-	require.Equal(t, Soaking, h.active("a").State)
+	r := h.active("a")
+	require.Equal(t, 3, r.Soak.Failures)
+	require.Equal(t, Soaking, r.State)
+	require.Contains(t, r.Reason, "0s left; 3 checks failed of 3 allowed")
 
-	// The soak keeps checking past the duration until the streak is met.
+	// The soak keeps checking past the duration until a check passes.
 	h.world.set(func(w *world) { w.soakFail[soakA] = false })
 	h.clock.Advance(20 * time.Second)
 	h.tick()
 
-	r := h.active("a")
-	require.Equal(t, Soaking, r.State)
-	require.Contains(t, r.Reason, "0s left, 1 of 2 checks passed")
-
-	h.clock.Advance(20 * time.Second)
-	h.tick()
-	require.True(t, h.active("a").Batches[0].Passed)
+	r = h.active("a")
+	require.True(t, r.Batches[0].Passed)
+	require.Equal(t, "soak passed: 5 checks, 3 failed", r.Targets[0].Reason)
 }
 
-func TestRestoreBringsBackQuarantineAndPresetFallback(t *testing.T) {
+func TestRestoreBringsBackQuarantineAndStrategyFallback(t *testing.T) {
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
 	h.world.set(func(w *world) { w.soakFail[soakA] = true })
@@ -213,8 +209,8 @@ func TestRestoreBringsBackQuarantineAndPresetFallback(t *testing.T) {
 	require.Equal(t, Degraded, mustView(t, restarted, tA1).Health)
 	require.Equal(t, Halted, restarted.Rollouts()[0].State)
 
-	// A stored speed whose preset has since been removed falls back to the default.
-	require.Equal(t, h.cfg.Presets[speedTest], restarted.preset("gone"))
+	// A stored strategy that has since been removed falls back to the default.
+	require.Equal(t, h.cfg.Strategy, restarted.strategy("gone"))
 }
 
 func TestRunWithCancelledContextAndTickerPaths(t *testing.T) {
@@ -230,7 +226,7 @@ func TestRunWithCancelledContextAndTickerPaths(t *testing.T) {
 
 	// Environment check due under a cancelled context reports it.
 	cfg := replaceLine(testConfig, "  defaults: {soak: \"\"}", "  defaults: {soak: \"\"}\n  environment: {program: env, interval: 30s}")
-	cfg = replaceLine(cfg, "inspect: {interval: 30s, concurrency: 4, unknownAfter: 2}", "inspect: {interval: 5ms, concurrency: 4, unknownAfter: 2}")
+	cfg = replaceLine(cfg, "inspect: {interval: 30s, concurrency: 4, failureThreshold: 2}", "inspect: {interval: 5ms, concurrency: 4, failureThreshold: 2}")
 	h2 := newHarness(t, cfg, testTargets)
 	h2.tick()
 	h2.clock.Advance(30 * time.Second)
@@ -257,8 +253,8 @@ func TestRemovingEveryTargetOfAnImageMidRollout(t *testing.T) {
 	r := h.active("b")
 
 	rules := h.set.Rules()
-	doc := replaceLine(testTargets, "- {id: a-3/el, node: a-3, weight: 100, image: org/b:t, labels: {client: b, owner: b, role: el, wave: \"1\"}, probes: {soak: soak-b}}", "")
-	doc = replaceLine(doc, "- {id: b-1/el, node: b-1, weight: 100, image: org/b:t, labels: {client: b, owner: b, role: el, wave: \"1\"}, probes: {soak: soak-b}}", "")
+	doc := replaceLine(testTargets, "- {id: a-3/el, node: a-3, weight: 100, image: org/b:t, labels: {client: b, owner: b, role: el, wave: \"1\"}, hooks: {soak: soak-b}}", "")
+	doc = replaceLine(doc, "- {id: b-1/el, node: b-1, weight: 100, image: org/b:t, labels: {client: b, owner: b, role: el, wave: \"1\"}, hooks: {soak: soak-b}}", "")
 	smaller, err := parseTargets(doc, &rules)
 	require.NoError(t, err)
 

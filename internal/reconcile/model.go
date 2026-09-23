@@ -69,8 +69,9 @@ const (
 
 // Policy is what a group has chosen.
 type Policy struct {
-	Mode  string `json:"mode"`
-	Speed string `json:"speed"`
+	Mode string `json:"mode"`
+	// Strategy names a configured strategy; empty is the default.
+	Strategy string `json:"strategy,omitempty"`
 	// Pins hold an image at a digest regardless of the tag.
 	Pins map[string]string `json:"pins,omitempty"`
 }
@@ -176,9 +177,9 @@ type SoakProgress struct {
 
 // Rollout is one group's convergence toward a set of digests.
 type Rollout struct {
-	ID    string `json:"id"`
-	Group string `json:"group"`
-	Speed string `json:"speed"`
+	ID       string `json:"id"`
+	Group    string `json:"group"`
+	Strategy string `json:"strategy,omitempty"`
 	// Desired is image → digest at creation; the rollout moves targets here.
 	Desired   map[string]string `json:"desired"`
 	Revisions map[string]string `json:"revisions,omitempty"`

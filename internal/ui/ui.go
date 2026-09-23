@@ -252,7 +252,6 @@ type rolloutData struct {
 	LastCheck  *reconcile.SoakCheck
 	GroupLabel string
 	Can        can
-	Preset     config.Preset
 }
 
 // wave is a rollout's targets in one wave, batched and not yet.
@@ -283,7 +282,7 @@ func (s *Server) rollout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data := rolloutData{Rollout: v, GroupLabel: s.cfg.Labels.Group, Can: s.canAct(&id, s.ownersOf(s.targets().InGroup(v.Group))), Preset: s.cfg.Presets[v.Speed]}
+	data := rolloutData{Rollout: v, GroupLabel: s.cfg.Labels.Group, Can: s.canAct(&id, s.ownersOf(s.targets().InGroup(v.Group)))}
 	byID := map[string]reconcile.RolloutTarget{}
 	waves := map[int]*wave{}
 
@@ -542,7 +541,7 @@ func (s *Server) perform(r *http.Request, id *api.Identity) (string, error) {
 
 		switch verb {
 		case verbSync:
-			ids, err := s.c.Sync(ctx, reconcile.SyncRequest{Actor: id.Name, Selector: sel, Force: f.Get("force") == checked, Speed: f.Get("speed")})
+			ids, err := s.c.Sync(ctx, reconcile.SyncRequest{Actor: id.Name, Selector: sel, Force: f.Get("force") == checked, Strategy: f.Get("strategy")})
 			if err != nil {
 				return "", err
 			}

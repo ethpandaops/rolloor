@@ -1,26 +1,45 @@
 # rolloor configuration for the generic example: six nginx containers on a
 # local registry, no workload knowledge anywhere.
+
+# Shown in the page header; the only place the environment's name appears.
 environment: example
+
+# Where the web UI, API and metrics listen.
 listen: "127.0.0.1:8080"
+
+# The SQLite database lives here.
 dataDir: /tmp/rolloor-example/data
+
+# Every *.yaml file here is read as a list of targets, and reloaded on change.
 targetsDir: examples/generic/targets.d
 
 labels:
+  # Rollouts, policies and fleet tiles are per value of this label.
   group: app
+  # People may act on targets whose value of this label they are listed for.
   owner: owner
+  # Optional: fleet page headings.
   section: tier
 
 registry:
+  # How often every image tag is resolved to a digest.
   poll: 5s
-  plainHttp: ["localhost:5050"]
+  # Registries spoken to over plain HTTP.
+  plainHttp:
+    - localhost:5050
 
-# Weight lives on the three "weighted" nodes (10 each, total 30); 40% is 12,
-# so one weighted node moves at a time.
-budget: 40%
+disruptionBudget:
+  # Share of total weight allowed to be mid-update at once, across every
+  # rollout. The three weighted nodes carry 10 each (30 in all); 40% is 12,
+  # so one weighted node moves at a time.
+  maxUnavailable: 40%
 
 hooks:
+  # Programs are bare names under this directory.
   dir: examples/generic/hooks
+  # Each program run is killed after this long.
   timeout: 5s
+  # Programs used for targets that do not name their own under `hooks`.
   defaults:
     inspect: inspect
     update: update
@@ -28,15 +47,30 @@ hooks:
     soak: soak
 
 inspect:
+  # How often every target's running digest is read.
   interval: 5s
+  # How many inspect programs run at once.
   concurrency: 4
-  unknownAfter: 2
+  # Inspections in a row that may fail before a target reads Unknown.
+  failureThreshold: 2
 
-presets:
-  test: {batch: [50%], soak: {duration: 10s, interval: 2s, passes: 2, grace: 1}}
-defaultPolicy: {mode: automated, speed: test}
+strategy:
+  # Size of every batch, as a share of the rollout's targets or a count.
+  batchSize: 50%
+  soak:
+    # How long each batch is watched before the next one starts.
+    duration: 10s
+    # How often the soak program runs during that time.
+    interval: 2s
+    # Failed checks tolerated before the rollout halts.
+    failureLimit: 1
+
+defaultPolicy:
+  # automated: rollouts start by themselves; manual: they wait for a sync.
+  mode: automated
 
 auth:
+  # No sign-in: everyone may act, and history records the remote address.
   mode: none
 
 log:

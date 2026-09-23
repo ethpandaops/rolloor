@@ -44,7 +44,8 @@ const (
 	keyReason = "reason"
 	keySel    = "selector"
 	keyMode   = "mode"
-	keySpeed  = "speed"
+	keySpeed  = "strategy"
+	slow      = "slow"
 	keyConf   = "confirm"
 	dev       = "dev"
 	hdrOrigin = "Origin"
@@ -57,18 +58,17 @@ var errFake = errors.New("fake")
 
 const testConfig = `
 environment: test
-budget: 100%
+disruptionBudget: {maxUnavailable: 100%}
 labels: {group: client, owner: owner, section: role, hiddenGroups: [side]}
 hooks: {dir: /tmp, defaults: {soak: ""}}
-presets:
-  fast: {batch: [100%], soak: {duration: 0s}}
-  slow: {batch: [1], soak: {duration: 1h, interval: 1s, passes: 2, grace: 1}}
-defaultPolicy: {speed: fast}
+strategy: {batchSize: 100%, soak: {duration: 0s}}
+strategies:
+  slow: {batchSize: 1, soak: {duration: 1h, interval: 1s, failureLimit: 1}}
 `
 
 const testTargets = `
-- {id: a-1/cl, node: a-1, weight: 0,   image: org/a:t, labels: {client: a, owner: a, role: cl, wave: "0"}, probes: {soak: soak-a}}
-- {id: a-2/cl, node: a-2, weight: 100, image: org/a:t, labels: {client: a, owner: a, role: cl, wave: "1"}, probes: {soak: soak-a}}
+- {id: a-1/cl, node: a-1, weight: 0,   image: org/a:t, labels: {client: a, owner: a, role: cl, wave: "0"}, hooks: {soak: soak-a}}
+- {id: a-2/cl, node: a-2, weight: 100, image: org/a:t, labels: {client: a, owner: a, role: cl, wave: "1"}, hooks: {soak: soak-a}}
 - {id: b-1/el, node: a-2, weight: 100, image: org/b:t, labels: {client: b, owner: b, role: el, wave: "1"}}
 - {id: c-1/x,  node: c-1, weight: 0,   image: org/c:t, labels: {client: c, owner: a, role: x, wave: "0"}}
 - {id: c-2/x,  node: c-2, weight: 0,   image: org/c:t, labels: {client: c, owner: b, role: x, wave: "0"}}
@@ -190,7 +190,7 @@ func newFixture(t *testing.T, loginURL func(string) string) *fixture {
 // Group a soaks under the slow preset; group b halts because b-1 refuses.
 func (f *fixture) release() {
 	f.t.Helper()
-	require.NoError(f.t, f.c.SetPolicy(f.ctx, "sam", "a", reconcile.Policy{Mode: reconcile.ModeAutomated, Speed: "slow"}))
+	require.NoError(f.t, f.c.SetPolicy(f.ctx, "sam", "a", reconcile.Policy{Mode: reconcile.ModeAutomated, Strategy: slow}))
 
 	f.world.mu.Lock()
 	f.world.digest = d2
@@ -435,7 +435,7 @@ func TestActionsRedirectWithFlashOrError(t *testing.T) {
 	require.Contains(t, loc, "error=", "nothing left to lift")
 
 	// Policy is not a page action.
-	_, loc = f.post("policy", url.Values{keyGroup: {"a"}, keyMode: {manual}, keySpeed: {"slow"}, keyNext: {"/"}})
+	_, loc = f.post("policy", url.Values{keyGroup: {"a"}, keyMode: {manual}, keySpeed: {slow}, keyNext: {"/"}})
 	require.Contains(t, loc, "error=unknown+action+%22policy%22")
 
 	// A malformed return path falls back to the root before anything runs.
@@ -449,11 +449,11 @@ func TestActionsRedirectWithFlashOrError(t *testing.T) {
 	f.world.digest = d2
 	f.world.mu.Unlock()
 
-	_, loc = f.post("sync", url.Values{keySel: {selA}, "force": {on}, keySpeed: {"fast"}, keyNext: {"/"}})
+	_, loc = f.post("sync", url.Values{keySel: {selA}, "force": {on}, keySpeed: {slow}, keyNext: {"/"}})
 	require.Contains(t, loc, "flash=Syncing+client%3Da+%281+rollouts%29.")
 
 	_, loc = f.post("sync", url.Values{keySel: {selA}, keySpeed: {"warp"}, keyNext: {"/"}})
-	require.Contains(t, loc, "error=speed")
+	require.Contains(t, loc, "error=strategy")
 
 	// Rollout verbs.
 	r := f.rolloutFor("a")

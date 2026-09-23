@@ -33,16 +33,31 @@ type Config struct {
 	TargetsDir  string `yaml:"targetsDir" default:"/etc/rolloor/targets.d"`
 	TeamsFile   string `yaml:"teamsFile"`
 
-	Labels   Labels            `yaml:"labels"`
-	Registry Registry          `yaml:"registry"`
-	Budget   Fraction          `yaml:"budget"`
-	Hooks    Hooks             `yaml:"hooks"`
-	Inspect  Inspect           `yaml:"inspect"`
-	Presets  map[string]Preset `yaml:"presets"`
+	Labels           Labels           `yaml:"labels"`
+	Registry         Registry         `yaml:"registry"`
+	DisruptionBudget DisruptionBudget `yaml:"disruptionBudget"`
+	Hooks            Hooks            `yaml:"hooks"`
+	Inspect          Inspect          `yaml:"inspect"`
+	// Strategy is how every group rolls out unless its policy names one of
+	// Strategies. A named strategy starts from Strategy and overrides only
+	// the fields it sets.
+	Strategy   Strategy            `yaml:"strategy"`
+	Strategies map[string]Strategy `yaml:"-"`
 	// DefaultPolicy applies to every group without a stored policy.
 	DefaultPolicy Policy `yaml:"defaultPolicy"`
 	Auth          Auth   `yaml:"auth"`
 	Log           Log    `yaml:"log"`
+
+	// RawStrategies holds the strategies section until each is decoded on
+	// top of Strategy.
+	RawStrategies map[string]yaml.Node `yaml:"strategies"`
+}
+
+// DisruptionBudget limits how much of the environment may be changing at
+// once, across every rollout.
+type DisruptionBudget struct {
+	// MaxUnavailable is a share of total weight ("10%") or an absolute weight.
+	MaxUnavailable Fraction `yaml:"maxUnavailable"`
 }
 
 // Labels names the labels the controller gives meaning to.
@@ -80,57 +95,54 @@ type EnvironmentHook struct {
 
 // Inspect paces live-state observation.
 type Inspect struct {
-	Interval     time.Duration `yaml:"interval" default:"30s"`
-	Concurrency  int           `yaml:"concurrency" default:"16"`
-	UnknownAfter int           `yaml:"unknownAfter" default:"3"`
+	Interval    time.Duration `yaml:"interval" default:"30s"`
+	Concurrency int           `yaml:"concurrency" default:"16"`
+	// FailureThreshold is how many inspections in a row may fail before a
+	// target reads Unknown.
+	FailureThreshold int `yaml:"failureThreshold" default:"3"`
 }
 
-// Preset is a named speed.
-type Preset struct {
-	Batch           []Fraction `yaml:"batch"`
-	Soak            Soak       `yaml:"soak"`
-	PauseAfterFirst bool       `yaml:"pauseAfterFirst"`
-	// Waves nil means true.
+// Strategy is how a rollout cuts batches and watches them.
+type Strategy struct {
+	// FirstBatch is the size of batch 1; omitted means BatchSize.
+	FirstBatch Fraction `yaml:"firstBatch"`
+	// BatchSize is the size of every later batch, of the rollout's targets.
+	BatchSize Fraction `yaml:"batchSize"`
+	// PauseAfterFirstBatch waits for a promote once batch 1 has passed.
+	PauseAfterFirstBatch bool `yaml:"pauseAfterFirstBatch"`
+	// Waves nil means true: batches follow the wave label.
 	Waves *bool `yaml:"waves"`
+	Soak  Soak  `yaml:"soak"`
 }
 
-// UsesWaves reports whether the preset honours the wave label.
-func (p Preset) UsesWaves() bool {
-	return p.Waves == nil || *p.Waves
+// BatchFor returns how many of total targets batch n (from 1) takes.
+func (s *Strategy) BatchFor(n, total int) int {
+	if n == 1 && s.FirstBatch.set {
+		return s.FirstBatch.Of(total)
+	}
+
+	return s.BatchSize.Of(total)
 }
 
-// Soak is the after-batch comparison schedule. Duration zero disables it.
-// Passes and Grace are pointers so that an explicit zero is kept and only an
-// omitted value takes the default.
+// UsesWaves reports whether batches follow the wave label.
+func (s *Strategy) UsesWaves() bool {
+	return s.Waves == nil || *s.Waves
+}
+
+// Soak is how long each batch is watched after it is ready, and how often
+// the soak program runs. Duration zero skips it.
 type Soak struct {
-	Duration time.Duration `yaml:"duration"`
-	Interval time.Duration `yaml:"interval"`
-	Passes   *int          `yaml:"passes"`
-	Grace    *int          `yaml:"grace"`
-}
-
-// PassesN is the number of consecutive passes required.
-func (s Soak) PassesN() int {
-	if s.Passes == nil {
-		return 2
-	}
-
-	return *s.Passes
-}
-
-// GraceN is how many failures are tolerated before a halt.
-func (s Soak) GraceN() int {
-	if s.Grace == nil {
-		return 1
-	}
-
-	return *s.Grace
+	Duration time.Duration `yaml:"duration" default:"10m"`
+	Interval time.Duration `yaml:"interval" default:"1m"`
+	// FailureLimit is how many checks may fail before the rollout halts.
+	FailureLimit int `yaml:"failureLimit" default:"1"`
 }
 
 // Policy is a group's stored policy; here it is the default.
 type Policy struct {
-	Mode  string `yaml:"mode" default:"automated"`
-	Speed string `yaml:"speed" default:"normal"`
+	Mode string `yaml:"mode" default:"automated"`
+	// Strategy names one of the configured strategies; empty is the default.
+	Strategy string `yaml:"strategy"`
 }
 
 // Auth configures sign-in.
@@ -179,7 +191,9 @@ func Parse(raw []byte) (*Config, error) {
 		return nil, fmt.Errorf("decode config: %w", err)
 	}
 
-	applyPresetDefaults(cfg)
+	if err := applyStrategyDefaults(cfg); err != nil {
+		return nil, err
+	}
 
 	if err := cfg.Validate(); err != nil {
 		return nil, err
@@ -188,20 +202,38 @@ func Parse(raw []byte) (*Config, error) {
 	return cfg, nil
 }
 
-// applyPresetDefaults fills the built-in presets when the file names none, and
-// completes soak schedules for the ones it does name.
-func applyPresetDefaults(cfg *Config) {
-	if cfg.Presets == nil {
-		cfg.Presets = BuiltinPresets()
+// applyStrategyDefaults completes the default strategy and builds every
+// named one on top of it.
+func applyStrategyDefaults(cfg *Config) error {
+	if !cfg.Strategy.BatchSize.set {
+		cfg.Strategy.BatchSize = Fraction{Percent: 10, IsPercent: true, set: true}
 	}
 
-	for name, p := range cfg.Presets {
-		if p.Soak.Interval == 0 {
-			p.Soak.Interval = 60 * time.Second
+	cfg.Strategies = map[string]Strategy{}
+
+	for name := range cfg.RawStrategies {
+		node := cfg.RawStrategies[name]
+
+		// A node the decoder just produced always encodes again.
+		raw, _ := yaml.Marshal(&node)
+
+		st := cfg.Strategy
+		if st.Waves != nil {
+			w := *st.Waves
+			st.Waves = &w
 		}
 
-		cfg.Presets[name] = p
+		dec := yaml.NewDecoder(bytes.NewReader(raw))
+		dec.KnownFields(true)
+
+		if err := dec.Decode(&st); err != nil {
+			return fmt.Errorf("config: strategies.%s: %w", name, err)
+		}
+
+		cfg.Strategies[name] = st
 	}
+
+	cfg.RawStrategies = nil
 
 	if cfg.Hooks.Defaults == nil {
 		cfg.Hooks.Defaults = map[string]string{}
@@ -213,35 +245,22 @@ func applyPresetDefaults(cfg *Config) {
 		}
 	}
 
-	if !cfg.Budget.set {
-		cfg.Budget = Fraction{Percent: 10, IsPercent: true, set: true}
+	if !cfg.DisruptionBudget.MaxUnavailable.set {
+		cfg.DisruptionBudget.MaxUnavailable = Fraction{Percent: 10, IsPercent: true, set: true}
 	}
+
+	return nil
 }
 
-// BuiltinPresets are the four speeds every install has.
-func BuiltinPresets() map[string]Preset {
-	no := false
-
-	return map[string]Preset{
-		"careful": {
-			Batch:           []Fraction{{Count: 1}, {Percent: 10, IsPercent: true}},
-			Soak:            Soak{Duration: 12 * time.Minute, Interval: 60 * time.Second},
-			PauseAfterFirst: true,
-		},
-		"normal": {
-			Batch: []Fraction{{Percent: 10, IsPercent: true}},
-			Soak:  Soak{Duration: 6 * time.Minute, Interval: 60 * time.Second},
-		},
-		"fast": {
-			Batch: []Fraction{{Percent: 50, IsPercent: true}},
-			Soak:  Soak{Interval: 60 * time.Second},
-		},
-		"all": {
-			Batch: []Fraction{{Percent: 100, IsPercent: true}},
-			Soak:  Soak{Interval: 60 * time.Second},
-			Waves: &no,
-		},
+// StrategyNamed returns a named strategy, or the default one for "".
+func (c *Config) StrategyNamed(name string) (Strategy, bool) {
+	if name == "" {
+		return c.Strategy, true
 	}
+
+	st, ok := c.Strategies[name]
+
+	return st, ok
 }
 
 // Validate checks constraints after defaults and overrides.
@@ -262,8 +281,8 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("config: hooks.timeout must be positive")
 	}
 
-	if c.Inspect.Interval <= 0 || c.Inspect.Concurrency <= 0 || c.Inspect.UnknownAfter <= 0 {
-		return fmt.Errorf("config: inspect.interval, concurrency and unknown_after must be positive")
+	if c.Inspect.Interval <= 0 || c.Inspect.Concurrency <= 0 || c.Inspect.FailureThreshold <= 0 {
+		return fmt.Errorf("config: inspect.interval, concurrency and failureThreshold must be positive")
 	}
 
 	for h := range c.Hooks.Defaults {
@@ -272,49 +291,33 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	if len(c.Presets) == 0 {
-		return fmt.Errorf("config: at least one preset is required")
+	if err := c.Strategy.validate("strategy"); err != nil {
+		return err
 	}
 
-	for name, p := range c.Presets {
-		if len(p.Batch) == 0 {
-			return fmt.Errorf("config: presets.%s.batch is required", name)
+	for name, st := range c.Strategies {
+		if name == "" {
+			return fmt.Errorf("config: strategies need a name")
 		}
 
-		for i, b := range p.Batch {
-			if b.Of(100) == 0 {
-				return fmt.Errorf("config: presets.%s.batch[%d] selects nothing", name, i)
-			}
-		}
-
-		if p.Soak.Duration > 0 {
-			if p.Soak.Interval <= 0 || p.Soak.Interval > p.Soak.Duration {
-				return fmt.Errorf("config: presets.%s.soak.interval must be positive and within duration", name)
-			}
-
-			if p.Soak.PassesN() <= 0 {
-				return fmt.Errorf("config: presets.%s.soak.passes must be positive", name)
-			}
-
-			if p.Soak.GraceN() < 0 {
-				return fmt.Errorf("config: presets.%s.soak.grace must not be negative", name)
-			}
+		if err := st.validate("strategies." + name); err != nil {
+			return err
 		}
 	}
 
-	if _, ok := c.Presets[c.DefaultPolicy.Speed]; !ok {
-		return fmt.Errorf("config: default_policy.speed %q is not a preset (have %v)", c.DefaultPolicy.Speed, c.PresetNames())
+	if _, ok := c.StrategyNamed(c.DefaultPolicy.Strategy); !ok {
+		return fmt.Errorf("config: defaultPolicy.strategy %q is not a strategy (have %v)", c.DefaultPolicy.Strategy, c.StrategyNames())
 	}
 
 	if c.DefaultPolicy.Mode != "automated" && c.DefaultPolicy.Mode != "manual" {
-		return fmt.Errorf("config: default_policy.mode must be automated or manual")
+		return fmt.Errorf("config: defaultPolicy.mode must be automated or manual")
 	}
 
 	switch c.Auth.Mode {
 	case "none":
 	case "oidc":
 		if c.Auth.Issuer == "" || c.Auth.ClientID == "" || c.Auth.RedirectURL == "" {
-			return fmt.Errorf("config: auth.issuer, client_id and redirect_url are required for oidc")
+			return fmt.Errorf("config: auth.issuer, clientId and redirectUrl are required for oidc")
 		}
 	default:
 		return fmt.Errorf("config: auth.mode must be none or oidc")
@@ -323,16 +326,36 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// PresetNames lists presets sorted, for messages.
-func (c *Config) PresetNames() []string {
-	names := make([]string, 0, len(c.Presets))
-	for n := range c.Presets {
+// StrategyNames lists the named strategies sorted, for messages.
+func (c *Config) StrategyNames() []string {
+	names := make([]string, 0, len(c.Strategies))
+	for n := range c.Strategies {
 		names = append(names, n)
 	}
 
 	sort.Strings(names)
 
 	return names
+}
+
+func (s *Strategy) validate(field string) error {
+	if s.BatchSize.Of(100) == 0 {
+		return fmt.Errorf("config: %s.batchSize selects nothing", field)
+	}
+
+	if s.FirstBatch.set && s.FirstBatch.Of(100) == 0 {
+		return fmt.Errorf("config: %s.firstBatch selects nothing", field)
+	}
+
+	if s.Soak.Duration > 0 && (s.Soak.Interval <= 0 || s.Soak.Interval > s.Soak.Duration) {
+		return fmt.Errorf("config: %s.soak.interval must be positive and within duration", field)
+	}
+
+	if s.Soak.FailureLimit < 0 {
+		return fmt.Errorf("config: %s.soak.failureLimit must not be negative", field)
+	}
+
+	return nil
 }
 
 func isTargetHook(h string) bool {

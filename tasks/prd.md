@@ -1,6 +1,6 @@
 # rolloor — build spec
 
-One instance per environment. It converges a set of containers toward the current digest of their image tags, a batch at a time, under a weight budget, comparing each batch against the containers it hasn't reached yet, and stopping when they do worse. It knows nothing about what the containers are. Everything domain-specific arrives as a file it reads or a program it runs.
+One instance per environment. It converges a set of containers toward the current digest of their image tags, a batch at a time, under a disruption budget, comparing each batch against the containers it hasn't reached yet, and stopping when they do worse. It knows nothing about what the containers are. Everything domain-specific arrives as a file it reads or a program it runs.
 
 This document is the spec to build from; when the milestones below are merged it is finished.
 
@@ -11,7 +11,7 @@ In the binary:
 - targets and teams files, reloaded on change
 - registry polling: tag → digest, revision label
 - live state via the `inspect` hook
-- the reconcile loop: sort, batch under budget, update, ready, soak, advance or halt
+- the reconcile loop: sort, batch under the disruption budget, update, ready, soak, advance or halt
 - policies per group, suspensions, pause points
 - HTTP API, server-rendered UI, SQLite, history, events, metrics
 - OIDC login and owner-based authorisation
@@ -25,74 +25,136 @@ Scope guards: five hooks, no plugin registry, no step language, no high availabi
 ### 2.1 `config.yaml`
 
 ```yaml
-environment: prod-eu              # shown in the header; the only place the name appears
+# Shown in the page header; the only place the environment's name appears.
+environment: prod-eu
 listen: ":8080"
-dataDir: /var/lib/rolloor         # rolloor.db lives here
+# rolloor.db lives here.
+dataDir: /var/lib/rolloor
 
-targetsDir: /etc/rolloor/targets.d    # *.yaml, merged, reloaded on change
-teamsFile: /etc/rolloor/teams.yaml    # optional
+# Every *.yaml file here is a list of targets; merged, reloaded on change.
+targetsDir: /etc/rolloor/targets.d
+# Optional: owner value -> identities allowed to act on it.
+teamsFile: /etc/rolloor/teams.yaml
 
 labels:
-  group: app                      # tiles, policies and rollouts are per value of this label
-  owner: owner                    # authorisation is per value of this label
-  section: role                   # optional: fleet page headings
-  hiddenGroups: []               # group values folded away on the fleet page by default
+  # Tiles, policies and rollouts are per value of this label.
+  group: app
+  # Authorisation is per value of this label.
+  owner: owner
+  # Optional: fleet page headings.
+  section: role
+  # Group values folded away on the fleet page by default.
+  hiddenGroups: []
 
 registry:
+  # How often every tag is resolved to a digest.
   poll: 60s
-  authFile: /etc/rolloor/registry-auth.json   # optional; docker config.json shape
+  # Optional; docker config.json shape.
+  authFile: /etc/rolloor/registry-auth.json
 
-budget: 10%                       # of total weight mid-update at once
+disruptionBudget:
+  # Share of total weight allowed to be mid-update at once, across every
+  # rollout ("10%"), or an absolute weight.
+  maxUnavailable: 10%
 
 hooks:
+  # Program names are resolved under this directory.
   dir: /etc/rolloor/hooks
+  # Each run is killed after this long.
   timeout: 60s
-  defaults:                       # program names, resolved under hooks.dir
+  # Programs for targets that name none of their own.
+  defaults:
     inspect: inspect
     update: update
     ready: ready
-    soak: ""                      # empty = no soak unless a target names one
+    # Empty: no soak unless a target names one.
+    soak: ""
   environment:
-    program: ""                   # empty = no environment check
+    # Empty: no environment check.
+    program: ""
     interval: 30s
 
 inspect:
+  # How often every target's running digest is read.
   interval: 30s
   concurrency: 16
-  unknownAfter: 3                # consecutive failures before a target shows Unknown
+  # Inspections in a row that may fail before a target shows Unknown.
+  failureThreshold: 3
 
-presets:
-  careful: {batch: [1, 10%], soak: {duration: 12m, interval: 60s, passes: 2, grace: 1}, pauseAfterFirst: true}
-  normal:  {batch: [10%],    soak: {duration: 6m,  interval: 60s, passes: 2, grace: 1}}
-  fast:    {batch: [50%],    soak: {duration: 0s}}
-  all:     {batch: [100%],   soak: {duration: 0s}, waves: false}
-defaultPolicy: {mode: automated, speed: normal}
+strategy:
+  # Size of batch 1; omitted means batchSize.
+  firstBatch: 1
+  # Size of every later batch, of the rollout's targets ("10%") or a count.
+  batchSize: 10%
+  # Wait for a promote once batch 1 has passed.
+  pauseAfterFirstBatch: true
+  # false: ignore the wave label and treat the rollout as one wave.
+  waves: true
+  soak:
+    # How long each batch is watched before the next starts; 0s skips it.
+    duration: 12m
+    # How often the soak programs run.
+    interval: 1m
+    # Failed checks tolerated before the rollout halts.
+    failureLimit: 1
+
+# Optional named strategies, chosen by a group's policy or by sync. Each
+# starts from `strategy` and overrides only what it sets.
+strategies:
+  fast:
+    batchSize: 50%
+    pauseAfterFirstBatch: false
+    soak:
+      duration: 0s
+
+defaultPolicy:
+  # automated: rollouts start by themselves; manual: they wait for a sync.
+  mode: automated
+  # Empty: `strategy`.
+  strategy: ""
 
 auth:
-  mode: oidc                      # oidc | none
+  # oidc or none.
+  mode: oidc
   issuer: https://auth.example/application/o/rolloor/
   clientId: rolloor
   clientSecretEnv: ROLLOOR_OIDC_CLIENT_SECRET
   redirectUrl: https://rolloor.prod-eu.example/auth/callback
   identityClaim: preferred_username
-  adminOwner: operators          # members of this owner value may act on anything
+  # Members of this owner value may act on anything.
+  adminOwner: operators
 ```
 
-Unknown fields are an error. `budget` and batch fractions accept `N%` or an absolute number. The file is the only source of configuration; defaults fill what it leaves out. There are no flag or environment overrides.
+Unknown fields are an error. `maxUnavailable` and batch sizes accept `N%` or an absolute number. The file is the only source of configuration; defaults fill what it leaves out. There are no flag or environment overrides.
 
 ### 2.2 Targets file
 
 One or more YAML files in `targets_dir`. A list of targets:
 
 ```yaml
+# Unique across every file.
 - id: web-4/frontend
+  # The machine it runs on; its weight is counted once however many targets it has.
   node: web-4
+  # For people and hooks; rolloor does not connect to it.
   address: web-4.prod-eu.example
+  # The node's share of what the disruption budget protects.
   weight: 1200
+  # repository:tag; rolloor follows the tag's digest.
   image: registry.example/shop/frontend:stable
-  labels: {app: frontend, role: web, owner: shop, wave: "1"}
-  probes: {ready: http-ok, soak: error-rate}
-  extra: {container: frontend}          # opaque, passed through to hooks
+  labels:
+    app: frontend
+    role: web
+    owner: shop
+    # Lower waves update first.
+    wave: "1"
+  # Programs for this target; the rest come from hooks.defaults.
+  hooks:
+    ready: http-ok
+    soak: error-rate
+  # Opaque; passed through to every hook.
+  extra:
+    container: frontend
 ```
 
 Rules:
@@ -101,7 +163,7 @@ Rules:
 - `image` is `repository:tag` with an optional registry host. Digests are not allowed here; pinning is a policy, not a file edit.
 - `labels` are string → string. The configured group and owner labels must be present.
 - `wave` is a label. Sort order is numeric ascending; missing means `1`.
-- `probes` names programs under `hooks.dir` for any of `inspect`, `update`, `ready`, `soak`. Unnamed falls back to `hooks.defaults`. A named program that doesn't exist fails validation.
+- `hooks` names programs under `hooks.dir` for any of `inspect`, `update`, `ready`, `soak`. Unnamed falls back to `hooks.defaults`. A named program that doesn't exist fails validation.
 - A reload that fails validation keeps the previous set and raises an event.
 - Targets that disappear from the files are removed from the fleet along with their live state; their history stays.
 
@@ -119,9 +181,9 @@ Owner value → list of identity-claim values. Without the file, a claim value e
 - **Target**: a row from the file plus live state. `desired` (the tag's current digest, or a pinned one), `live` (from `inspect`), `sync` = `Synced | OutOfSync | Unknown`, `health` = `Healthy | Progressing | Degraded | Suspended`. JSON field names are camelCase throughout the API.
 - **Node**: the set of targets sharing `node`. Weight counted once.
 - **Group**: the set of targets sharing the group label value. One policy, at most one active rollout.
-- **Policy** (per group, stored): `mode: automated | manual`, `speed: <preset>`, `pins: {image: digest}` optional.
+- **Policy** (per group, stored): `mode: automated | manual`, `strategy: <name>` (empty is the default strategy), `pins: {image: digest}` optional.
 - **Rollout**: the convergence of one group's OutOfSync targets toward their desired digests. Created by the controller, never by a person. Identified by a random 12-hex-character id; displayed by the short form of the digest it moves to (first changed image if several).
-- **Suspension**: selector, reason, actor, expires_at. Matching targets are `Suspended`: skipped by rollouts, excluded from budget and from the comparison group.
+- **Suspension**: selector, reason, actor, expires_at. Matching targets are `Suspended`: skipped by rollouts, excluded from the disruption budget and from the comparison group.
 - **Event**: who (identity or `controller`), what (verb or transition), on what (selector, rollout, target), why (reason), when. Append-only. This is history.
 
 ## 4. Reconcile loop
@@ -139,11 +201,11 @@ The loop ticks every few seconds (a fixed cadence in `main`), and at once on `sy
 
 Rollout targets are the group's OutOfSync targets at creation, minus Suspended and Unknown. Order: `Degraded` first, then by `wave` ascending, then by node name, then by `id`. Targets on the same node are adjacent so they land in the same batch when the fraction allows.
 
-A wave is the run of targets sharing a `wave` value. Batches are cut inside a wave. If the preset has `waves: false`, the whole rollout is one wave.
+A wave is the run of targets sharing a `wave` value. Batches are cut inside a wave. If the strategy has `waves: false`, the whole rollout is one wave.
 
-Batch size: the preset's `batch` list gives the fraction (or count) for batch 1, batch 2, …; the last entry repeats. The fraction applies to the rollout's target count. The batch is then trimmed to the budget: walk the sorted list, adding a target if its node is already in the batch or if adding the node's weight keeps in-flight weight ≤ budget. A batch is never empty when budget allows any node; if nothing fits, the rollout waits with reason `budget` and the numbers.
+Batch size: `firstBatch` for batch 1 (if set), `batchSize` for every batch after, as a share of the rollout's target count or a count. The batch is then trimmed to the disruption budget: walk the sorted list, adding a target if its node is already in the batch or if adding the node's weight keeps unavailable weight ≤ `maxUnavailable`. A batch is never empty when the budget allows any node; if nothing fits, the rollout waits in `WaitingForBudget` with the numbers.
 
-In-flight weight = sum over nodes with any target `Progressing`, across all rollouts in the environment, excluding nodes that were `Degraded` before their update began. Weight-zero nodes never consume budget. Total weight = sum of all nodes' weights, including Suspended and Unknown.
+Unavailable weight = sum over nodes with any target `Progressing`, across all rollouts in the environment, excluding nodes that were `Degraded` before their update began. Weight-zero nodes never use the budget. Total weight = sum of all nodes' weights, including Suspended and Unknown.
 
 ### 4.2 Update, ready
 
@@ -151,7 +213,7 @@ For each target in the batch: mark `Progressing`; run `update` with the target p
 
 ### 4.3 Soak
 
-If the effective soak duration is 0, the batch passes when all its targets are ready. Otherwise, for `duration`, every `interval`: group the batch's targets by soak program (target's `probes.soak`, else default; targets with none pass automatically) and run each program once with:
+If the effective soak duration is 0, the batch passes when all its targets are ready. Otherwise, for `duration`, every `interval`: group the batch's targets by soak program (target's `hooks.soak`, else default; targets with none pass automatically) and run each program once with:
 
 ```json
 {"updated": [targets in this batch using this program],
@@ -159,21 +221,21 @@ If the effective soak duration is 0, the batch passes when all its targets are r
  "rollout": {"id": "...", "group": "frontend", "batch": 1, "wave": 1}}
 ```
 
-Exit 0 is a pass. Stdout's first line is shown as the reason; a second line of the form `updated=<num> remaining=<num> unit=<text>` is shown as the two numbers. The batch passes after `passes` consecutive passes with no more than `grace` failures in total; the `grace+1`th failure halts. A pass on stored evidence needs the last completed check to be no older than two intervals, so a process that was away re-checks before passing; a check that was dispatched but never answered is not evidence. A batch whose targets have no soak programs left passes at once. Each batch keeps its own soak record. `remaining` may be empty on the last batch; the program decides what that means.
+Exit 0 is a pass. Stdout's first line is shown as the reason; a second line of the form `updated=<num> remaining=<num> unit=<text>` is shown as the two numbers. The batch passes once `duration` has elapsed and the last check passed; failing checks beyond `failureLimit` halt it, and a soak that has run its duration keeps checking until one passes. A pass on stored evidence needs the last completed check to be no older than two intervals, so a process that was away re-checks before passing; a check that was dispatched but never answered is not evidence. A batch whose targets have no soak programs left passes at once. Each batch keeps its own soak record. `remaining` may be empty on the last batch; the program decides what that means.
 
 ### 4.4 Advance, pause, halt
 
-After a pass: if `pause_after_first` and this was batch 1, or a `pause` is pending, the rollout is `Paused` with the reason. `promote` or `resume` continues. Otherwise the next batch starts. After the last batch the rollout is `Complete`.
+After a pass: if `pauseAfterFirstBatch` and this was batch 1, or a `pause` is pending, the rollout is `Paused` with the reason. `promote` or `resume` continues. Otherwise the next batch starts. After the last batch the rollout is `Complete`.
 
-`Halted`: the failed batch's targets stay `Degraded` on the new digest. Nothing else moves. The halt belongs to the desired digests at the time; when any of them changes, the rollout closes as `Superseded` and a new one is created with the Degraded targets sorted first. `retry` (reason required) reopens the halted batch: its failed targets are inspected again before readiness and the soak, and the failed soak stays on the batch's record. `abort` closes the rollout; the group stays OutOfSync and the controller creates no new rollout for it until `sync` or a new digest. The abort is persisted with the digests it applies to and survives a restart; the marker is written before the rollout, and on restart the marker wins over a rollout the store still shows active. When a rollout ends (abort or supersede) while an `update` has been dispatched and its digest has not shown, that target's node stays counted against the budget for the update deadline (`hooks.timeout × 5`), so the next rollout cannot admit another node on top of it.
+`Halted`: the failed batch's targets stay `Degraded` on the new digest. Nothing else moves. The halt belongs to the desired digests at the time; when any of them changes, the rollout closes as `Superseded` and a new one is created with the Degraded targets sorted first. `retry` (reason required) reopens the halted batch: a failed target already running the digest is inspected again before readiness and the soak, one that is not gets its `update` again, and the failed soak stays on the batch's record. `abort` closes the rollout; the group stays OutOfSync and the controller creates no new rollout for it until `sync` or a new digest. The abort is persisted with the digests it applies to and survives a restart; the marker is written before the rollout, and on restart the marker wins over a rollout the store still shows active. When a rollout ends (abort or supersede) while an `update` has been dispatched and its digest has not shown, that target's node stays counted against the disruption budget for the update deadline (`hooks.timeout × 5`), so the next rollout cannot admit another node on top of it.
 
 Pause never carries across digests: a new digest supersedes a paused rollout too.
 
-`sync --force` skips ready and soak for that rollout. It never skips the budget. It is recorded.
+`sync --force` skips ready and soak for that rollout. It never skips the disruption budget. It is recorded.
 
 ## 5. Rollout states
 
-`WaitingForSync → Running → Soaking → Running … → Complete`, with `Paused`, `WaitingForBudget`, `WaitingForEnvironment`, `Halted`, `Aborted`, `Superseded` reachable as the rules above say. Every non-terminal state carries a one-line `reason` string built by the controller, e.g. `Waiting for budget: 9.5% of 10% in use; next batch needs 1.2%`. The same string is served by the API, the UI, and the metrics label-free `reason` event.
+`WaitingForSync → Running → Soaking → Running … → Complete`, with `Paused`, `WaitingForBudget`, `WaitingForEnvironment`, `Halted`, `Aborted`, `Superseded` reachable as the rules above say. Every non-terminal state carries a one-line `reason` string built by the controller, e.g. `Waiting for the disruption budget: 9.5% of 10% unavailable; the next batch needs 1.2%.`. The same string is served by the API, the UI, and the metrics label-free `reason` event.
 
 ## 6. Hooks
 
@@ -194,16 +256,16 @@ The target document is the target's row from the file plus `desired` (the digest
 JSON under `/api/v1`. Reads are open to any signed-in identity. Writes check the owner rule for every target the selector matches; a selector spanning more than one owner value requires `confirm: true` in the body.
 
 ```
-GET  /fleet                         groups with counts, sync/health roll-up, reason line, budget, environment check
+GET  /fleet                         groups with counts, sync/health roll-up, reason line, disruption budget, environment check
 GET  /groups/{label}/{value}         the group: policy, roll-up, current rollout, targets
 GET  /nodes/{node}                   the node: weight, labels, targets
 GET  /targets?selector=k=v,k=v       targets matching
 GET  /rollouts                       all rollouts, newest first
 GET  /rollouts/{id}                  the rollout: waves, batches, soak results, reason
 GET  /history?selector=&node=&limit= events, filtered to targets the selector or node matches
-GET  /policies/{group}               PUT replaces mode, speed, pins (a PUT without pins unpins)
+GET  /policies/{group}               PUT replaces mode, strategy, pins (a PUT without pins unpins)
 GET  /events                         SSE: every event as it happens; a client that falls behind gets `event: gap` and reconnects with `Last-Event-ID` to have the rest replayed from the store
-POST /actions/sync                   {selector, force?, speed?, confirm?}
+POST /actions/sync                   {selector, force?, strategy?, confirm?}
 POST /actions/refresh                re-resolve every tag now
 POST /actions/suspend                {selector, reason, expiresIn | expiresAt, confirm?}
 POST /actions/resume                 {selector, confirm?}            lifts suspensions
@@ -238,7 +300,7 @@ Prometheus at `/metrics`:
 - `rolloor_target_sync{id,group}` 0 synced, 1 out of sync, 2 unknown
 - `rolloor_target_health{id,group}` 0 healthy, 1 progressing, 2 degraded, 3 suspended
 - `rolloor_rollout_state{rollout,group,state}` 1 for the state a rollout is in
-- `rolloor_budget_ratio` in-flight / budget
+- `rolloor_disruption_budget_ratio` unavailable weight / what `maxUnavailable` allows
 - `rolloor_hook_duration_seconds{hook}` histogram, `rolloor_hook_runs_total{hook,outcome}`, `rolloor_hook_failures_total{hook}`
 - `rolloor_last_tick_timestamp_seconds`, `rolloor_environment_check_passing`, `rolloor_environment_checked_at_seconds`
 
@@ -252,7 +314,7 @@ internal/config/
 internal/targets/       file loading, validation, watching, selectors
 internal/registry/      OCI tag resolution, revision label
 internal/hooks/         runner
-internal/reconcile/     the loop, sort/batch/budget, rollout state machine   ← the tests that matter
+internal/reconcile/     the loop, sort/batch/disruption budget, rollout state machine   ← the tests that matter
 internal/store/         sqlite, migrations, events
 internal/auth/          oidc, teams file, owner checks
 internal/api/           handlers, SSE
@@ -269,7 +331,7 @@ Logging: logrus, JSON by default, contextual logger per component as the standar
 `examples/generic/` runs in CI on every PR with no workload words:
 
 1. Start a local `registry:2` and six `nginx`-based containers from image `localhost:5000/app:latest` at digest A, three of them "weighted" (weight 10) and three weight 0, on three "nodes" (compose service names).
-2. Start rolloor with `budget: 40%`, the `normal` preset, hooks: `inspect` = `docker inspect` RepoDigest, `update` = `docker pull && docker compose up -d <svc>`, `ready` = `curl -f localhost:<port>/`, `soak` = `updated` respond in under twice the median latency of `remaining`.
+2. Start rolloor with `maxUnavailable: 40%`, a 50% `batchSize` and a short soak, hooks: `inspect` = `docker inspect` RepoDigest, `update` = `docker pull && docker compose up -d <svc>`, `ready` = `curl -f localhost:<port>/`, `soak` = `updated` respond in under twice the median latency of `remaining`.
 3. Push digest B to the tag. Assert: wave 0 (weight 0) updates first; weighted targets update in batches that never exceed 40% of weight; a rollout reaches `Complete`; history has the transitions.
 4. Break B (a build that 500s), push as C. Assert: `Halted`, the batch is `Degraded`, the rest untouched, and pushing D supersedes and converges with the Degraded targets first.
 

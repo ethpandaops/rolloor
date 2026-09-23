@@ -15,7 +15,7 @@ import (
 func TestSyncLeavesNothingBehindWhenTheStoreRefuses(t *testing.T) {
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
-	require.NoError(t, h.c.SetPolicy(h.ctx, actor, "a", Policy{Mode: ModeManual, Speed: speedTest}))
+	require.NoError(t, h.c.SetPolicy(h.ctx, actor, "a", Policy{Mode: ModeManual}))
 	h.world.set(func(w *world) { w.registry[imgA] = d2 })
 
 	h.store.Fail = errFake
@@ -109,7 +109,7 @@ func TestBudgetStaysHeldWhileAnEndedRolloutMayStillBeLanding(t *testing.T) {
 
 	// Group b's rollout finds the budget still taken: a-3 is already counted
 	// so it costs nothing more, but b-1 would exceed the budget and waits.
-	require.Equal(t, "40.0%", h.c.Fleet().BudgetInUse)
+	require.Equal(t, "40.0%", h.c.Fleet().Unavailable)
 	h.world.set(func(w *world) { w.registry[imgB] = d2 })
 	h.c.Refresh(h.ctx, actor)
 	h.tick()
@@ -169,10 +169,10 @@ func TestTargetEditsMidRolloutRetireTheTarget(t *testing.T) {
 
 	rules := h.set.Rules()
 	edited, err := parseTargets(replaceLine(replaceLine(testTargets,
-		"- {id: a-1/cl, node: a-1, weight: 0,   image: org/a:t, labels: {client: a, owner: a, role: cl, wave: \"0\"}, probes: {soak: soak-a}}",
-		"- {id: a-1/cl, node: a-9, weight: 0,   image: org/a:t, labels: {client: a, owner: a, role: cl, wave: \"0\"}, probes: {soak: soak-a}}"),
-		"- {id: a-2/cl, node: a-2, weight: 0,   image: org/a:t, labels: {client: a, owner: a, role: cl, wave: \"0\"}, probes: {soak: soak-a}}",
-		"- {id: a-2/cl, node: a-2, weight: 0,   image: org/z:t, labels: {client: a, owner: a, role: cl, wave: \"0\"}, probes: {soak: soak-a}}"), &rules)
+		"- {id: a-1/cl, node: a-1, weight: 0,   image: org/a:t, labels: {client: a, owner: a, role: cl, wave: \"0\"}, hooks: {soak: soak-a}}",
+		"- {id: a-1/cl, node: a-9, weight: 0,   image: org/a:t, labels: {client: a, owner: a, role: cl, wave: \"0\"}, hooks: {soak: soak-a}}"),
+		"- {id: a-2/cl, node: a-2, weight: 0,   image: org/a:t, labels: {client: a, owner: a, role: cl, wave: \"0\"}, hooks: {soak: soak-a}}",
+		"- {id: a-2/cl, node: a-2, weight: 0,   image: org/z:t, labels: {client: a, owner: a, role: cl, wave: \"0\"}, hooks: {soak: soak-a}}"), &rules)
 	require.NoError(t, err)
 
 	h.set = edited
@@ -260,7 +260,7 @@ func TestDegradedNodeCostsNothingForAnotherGroup(t *testing.T) {
 	rb := h.active("b")
 	require.Equal(t, Running, rb.State)
 	require.Equal(t, []string{tA3el, "b-1/el"}, rb.Batches[0].Targets, "a-3 is free, so both weighted nodes fit")
-	require.Equal(t, "20.0% of 50%", rb.BudgetPercent)
+	require.Equal(t, "20.0% of 50%", rb.Unavailable)
 }
 
 func TestLateInspectionOfAForgottenTargetIsDropped(t *testing.T) {
@@ -269,7 +269,7 @@ func TestLateInspectionOfAForgottenTargetIsDropped(t *testing.T) {
 
 	rules := h.set.Rules()
 	without, err := parseTargets(replaceLine(testTargets,
-		"- {id: a-1/cl, node: a-1, weight: 0,   image: org/a:t, labels: {client: a, owner: a, role: cl, wave: \"0\"}, probes: {soak: soak-a}}", ""), &rules)
+		"- {id: a-1/cl, node: a-1, weight: 0,   image: org/a:t, labels: {client: a, owner: a, role: cl, wave: \"0\"}, hooks: {soak: soak-a}}", ""), &rules)
 	require.NoError(t, err)
 
 	entered, release := h.world.gate("inspect")

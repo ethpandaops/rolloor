@@ -25,7 +25,7 @@
   <div><dt>Selector</dt><dd><code>{{.GroupLabel}}={{.Rollout.Group}}</code></dd></div>
   <div><dt>From</dt><dd><code>{{short (first .Rollout.From)}}</code></dd></div>
   <div><dt>Started</dt><dd>{{ago .Rollout.CreatedAt}}</dd></div>
-  <div><dt>Speed</dt><dd>{{.Rollout.Speed}}</dd></div>
+  <div><dt>Strategy</dt><dd>{{if .Rollout.Strategy}}{{.Rollout.Strategy}}{{else}}default{{end}}</dd></div>
 </dl>
 
 {{if eq .Rollout.State "Halted"}}
@@ -42,7 +42,7 @@
 <div class="cards">
   <div class="card"><h3>Status</h3><div class="big">{{template "state-badge" .Rollout.State}}</div><p>{{.Rollout.Reason}}</p></div>
   <div class="card"><h3>On the new build</h3><div class="big">{{.Rollout.OnNewBuild}} of {{.Rollout.Total}} targets</div><p>{{.Rollout.NotReached}} have not been reached yet. They are the comparison group.</p></div>
-  <div class="card"><h3>Budget</h3><div class="big">{{.Rollout.BudgetPercent}}</div><p>A node with two targets moving counts once.</p></div>
+  <div class="card"><h3>Disruption budget</h3><div class="big">{{.Rollout.Unavailable}}</div><p>A node with two targets moving counts once.</p></div>
 </div>
 {{end}}
 

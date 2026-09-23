@@ -703,7 +703,7 @@ func (c *Controller) hookRunsFor(id string) map[string]HookRun {
 // liveKnown reports whether a target's running digest can be trusted.
 func (c *Controller) liveKnown(id string) (string, bool) {
 	l, ok := c.live[id]
-	if !ok || l.SeenAt.IsZero() || l.Failures >= c.cfg.Inspect.UnknownAfter {
+	if !ok || l.SeenAt.IsZero() || l.Failures >= c.cfg.Inspect.FailureThreshold {
 		return "", false
 	}
 
@@ -742,19 +742,21 @@ func (c *Controller) policyFor(group string) Policy {
 		return p
 	}
 
-	return Policy{Mode: c.cfg.DefaultPolicy.Mode, Speed: c.cfg.DefaultPolicy.Speed}
+	return Policy{Mode: c.cfg.DefaultPolicy.Mode, Strategy: c.cfg.DefaultPolicy.Strategy}
 }
 
-func (c *Controller) preset(name string) config.Preset {
-	if p, ok := c.cfg.Presets[name]; ok {
-		return p
+// strategy is a named strategy, or the default when the name is empty or no
+// longer configured.
+func (c *Controller) strategy(name string) config.Strategy {
+	if st, ok := c.cfg.StrategyNamed(name); ok {
+		return st
 	}
 
-	return c.cfg.Presets[c.cfg.DefaultPolicy.Speed]
+	return c.cfg.Strategy
 }
 
 func (c *Controller) programFor(t *targets.Target, hook string) string {
-	if p, ok := t.Probes[hook]; ok && p != "" {
+	if p, ok := t.Hooks[hook]; ok && p != "" {
 		return p
 	}
 

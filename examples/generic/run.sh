@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The generic end-to-end run. Six nginx containers on a local registry move
-# from build A to build B in waves and batches under the budget; a broken
+# from build A to build B in waves and batches under the disruption budget; a broken
 # build C halts and quarantines; build D supersedes and converges with the
 # quarantined targets first. Needs docker, curl and jq.
 set -euo pipefail
@@ -89,7 +89,7 @@ done
 [ "$synced" = "6" ] || { echo "expected 6 synced targets, got $synced" >&2; curl -fsS "$api/targets" | jq . >&2; exit 1; }
 [ "$(curl -fsS "$api/rollouts" | jq length)" = "0" ]
 
-log "build B: waves and batches under the budget"
+log "build B: waves and batches under the disruption budget"
 build B "build B"
 for _ in $(seq 1 30); do r1=$(active_rollout); [ -n "$r1" ] && break; sleep 1; done
 [ -n "$r1" ] || { echo "no rollout opened for B" >&2; exit 1; }
@@ -99,7 +99,7 @@ curl -fsS "$api/rollouts/$r1" | jq -r '.batches[] | "batch \(.number) wave \(.wa
 first_wave=$(curl -fsS "$api/rollouts/$r1" | jq -r '.batches[0].wave')
 [ "$first_wave" = "0" ] || { echo "wave 0 did not go first" >&2; exit 1; }
 weighted_per_batch=$(curl -fsS "$api/rollouts/$r1" | jq '[.batches[] | select(.wave == 1) | .targets | length] | max')
-[ "$weighted_per_batch" = "1" ] || { echo "budget allowed $weighted_per_batch weighted nodes at once, wanted 1" >&2; exit 1; }
+[ "$weighted_per_batch" = "1" ] || { echo "the disruption budget allowed $weighted_per_batch weighted nodes at once, wanted 1" >&2; exit 1; }
 [ "$(curl -fsS "$api/rollouts/$r1" | jq -r .revision)" = "B" ]
 
 log "build C is broken: halt and quarantine"

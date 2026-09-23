@@ -232,16 +232,16 @@ func (c *Controller) skipReason(r *Rollout, set *targets.Set, t *targets.Target,
 // batchReady is called once every target in the batch is ready: either the
 // soak begins or, with no soak, the batch passes.
 func (c *Controller) batchReady(ctx context.Context, now time.Time, r *Rollout, set *targets.Set) {
-	preset := c.preset(r.Speed)
+	st := c.strategy(r.Strategy)
 
-	if preset.Soak.Duration == 0 || r.Force || !c.batchHasSoak(r, set) {
+	if st.Soak.Duration == 0 || r.Force || !c.batchHasSoak(r, set) {
 		c.passBatch(ctx, now, r, "no soak")
 
 		return
 	}
 
 	r.Soak = SoakProgress{StartedAt: now}
-	c.setState(ctx, now, r, Soaking, fmt.Sprintf("Batch %d in soak for %s.", r.CurrentBatch().Number, preset.Soak.Duration))
+	c.setState(ctx, now, r, Soaking, fmt.Sprintf("Batch %d in soak for %s.", r.CurrentBatch().Number, st.Soak.Duration))
 }
 
 // batchHasSoak reports whether any target still active in the open batch
@@ -266,7 +266,7 @@ func (c *Controller) batchHasSoak(r *Rollout, set *targets.Set) bool {
 // intervals. A forced rollout, or a batch with no soak programs left, passes
 // at once.
 func (c *Controller) planSoak(ctx context.Context, now time.Time, r *Rollout, set *targets.Set) []job {
-	preset := c.preset(r.Speed)
+	st := c.strategy(r.Strategy)
 	b := r.CurrentBatch()
 
 	if r.Force {
@@ -281,13 +281,13 @@ func (c *Controller) planSoak(ctx context.Context, now time.Time, r *Rollout, se
 		return nil
 	}
 
-	if !r.Soak.LastCheckStartedAt.IsZero() && now.Sub(r.Soak.LastCheckStartedAt) < preset.Soak.Interval {
+	if !r.Soak.LastCheckStartedAt.IsZero() && now.Sub(r.Soak.LastCheckStartedAt) < st.Soak.Interval {
 		return nil
 	}
 
-	fresh := !r.Soak.LastCheckAt.IsZero() && now.Sub(r.Soak.LastCheckAt) <= 2*preset.Soak.Interval
-	if fresh && r.Soak.Streak >= preset.Soak.PassesN() && now.Sub(r.Soak.StartedAt) >= preset.Soak.Duration {
-		c.passBatch(ctx, now, r, fmt.Sprintf("%d checks passed", r.Soak.Streak))
+	fresh := !r.Soak.LastCheckAt.IsZero() && now.Sub(r.Soak.LastCheckAt) <= 2*st.Soak.Interval
+	if fresh && r.Soak.Streak > 0 && now.Sub(r.Soak.StartedAt) >= st.Soak.Duration {
+		c.passBatch(ctx, now, r, soakPassed(&r.Soak))
 
 		return nil
 	}
@@ -392,9 +392,9 @@ func (c *Controller) passBatch(ctx context.Context, now time.Time, r *Rollout, w
 	c.event(ctx, now, &Event{Actor: ControllerActor, Action: "batch.passed", Group: r.Group, Rollout: r.ID,
 		Reason: fmt.Sprintf("batch %d: %s", b.Number, why)})
 
-	preset := c.preset(r.Speed)
+	st := c.strategy(r.Strategy)
 
-	if r.PausePending || (preset.PauseAfterFirst && b.Number == 1 && c.hasRemaining(r)) {
+	if r.PausePending || (st.PauseAfterFirstBatch && b.Number == 1 && c.hasRemaining(r)) {
 		r.PausePending = false
 		c.setState(ctx, now, r, Paused, fmt.Sprintf("Paused after batch %d. Run promote to continue.", b.Number))
 
@@ -579,7 +579,7 @@ func (c *Controller) applySoak(ctx context.Context, now time.Time, r *Rollout, o
 		return
 	}
 
-	preset := c.preset(r.Speed)
+	st := c.strategy(r.Strategy)
 	allOK := true
 
 	for i := range outs {
@@ -612,25 +612,31 @@ func (c *Controller) applySoak(ctx context.Context, now time.Time, r *Rollout, o
 		return
 	}
 
-	if r.Soak.Failures > preset.Soak.GraceN() {
+	if r.Soak.Failures > st.Soak.FailureLimit {
 		last := r.Soak.Checks[len(r.Soak.Checks)-1]
 		c.halt(ctx, now, r, "", fmt.Sprintf("soak %s failed %d times: %s", last.Program, r.Soak.Failures, last.Reason))
 
 		return
 	}
 
-	if r.Soak.Streak >= preset.Soak.PassesN() && now.Sub(r.Soak.StartedAt) >= preset.Soak.Duration {
-		c.passBatch(ctx, now, r, fmt.Sprintf("%d checks passed", r.Soak.Streak))
+	if r.Soak.Streak > 0 && now.Sub(r.Soak.StartedAt) >= st.Soak.Duration {
+		c.passBatch(ctx, now, r, soakPassed(&r.Soak))
 
 		return
 	}
 
-	left := preset.Soak.Duration - now.Sub(r.Soak.StartedAt)
+	left := st.Soak.Duration - now.Sub(r.Soak.StartedAt)
 	if left < 0 {
 		left = 0
 	}
 
-	c.setState(ctx, now, r, Soaking, fmt.Sprintf("Batch %d in soak, %s left, %d of %d checks passed.", r.CurrentBatch().Number, left.Round(time.Second), r.Soak.Streak, preset.Soak.PassesN()))
+	c.setState(ctx, now, r, Soaking, fmt.Sprintf("Batch %d in soak, %s left; %d checks failed of %d allowed.",
+		r.CurrentBatch().Number, left.Round(time.Second), r.Soak.Failures, st.Soak.FailureLimit))
+}
+
+// soakPassed says how a soak ended well.
+func soakPassed(s *SoakProgress) string {
+	return fmt.Sprintf("soak passed: %d checks, %d failed", len(s.Checks), s.Failures)
 }
 
 // parseSoakNumbers reads the optional second stdout line

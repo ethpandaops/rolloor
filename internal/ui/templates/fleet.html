@@ -7,7 +7,7 @@
       {{else}}Environment check failing: {{.Fleet.EnvReason}}. Automated rollouts are paused; a person may still sync.{{end}}
     {{else}}No environment check configured.{{end}}
   </div>
-  <div class="budget">Budget: {{.Fleet.BudgetInUse}} of {{.Fleet.Budget}} in use</div>
+  <div class="budget">Disruption budget: {{.Fleet.Unavailable}} of {{.Fleet.MaxUnavailable}} unavailable</div>
 </div>
 
 {{range .Sections}}

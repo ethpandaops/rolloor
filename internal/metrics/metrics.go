@@ -43,7 +43,7 @@ func NewCollector(c *reconcile.Controller) *Collector {
 		targetSync:   prometheus.NewDesc(namespace+"_target_sync", "0 synced, 1 out of sync, 2 unknown.", []string{labelID, labelGroup}, nil),
 		targetHealth: prometheus.NewDesc(namespace+"_target_health", "0 healthy, 1 progressing, 2 degraded, 3 suspended.", []string{labelID, labelGroup}, nil),
 		rolloutState: prometheus.NewDesc(namespace+"_rollout_state", "1 for the state a rollout is in.", []string{"rollout", labelGroup, "state"}, nil),
-		budgetRatio:  prometheus.NewDesc(namespace+"_budget_ratio", "In-flight weight over the budget.", nil, nil),
+		budgetRatio:  prometheus.NewDesc(namespace+"_disruption_budget_ratio", "Weight mid-update over what the disruption budget allows.", nil, nil),
 		envPassing:   prometheus.NewDesc(namespace+"_environment_check_passing", "1 when the environment check passes.", nil, nil),
 		envCheckedAt: prometheus.NewDesc(namespace+"_environment_checked_at_seconds", "When the environment check last ran.", nil, nil),
 		lastTick:     prometheus.NewDesc(namespace+"_last_tick_timestamp_seconds", "When the reconcile loop last completed a pass.", nil, nil),
@@ -82,8 +82,8 @@ func (m *Collector) Collect(ch chan<- prometheus.Metric) {
 		if r.State.Active() {
 			ch <- prometheus.MustNewConstMetric(m.rolloutState, prometheus.GaugeValue, 1, r.ID, r.Group, string(r.State))
 
-			if r.BudgetTotal > 0 {
-				ratio = r.BudgetInUse / r.BudgetTotal
+			if r.MaxUnavailableWeight > 0 {
+				ratio = r.UnavailableWeight / r.MaxUnavailableWeight
 			}
 		}
 	}

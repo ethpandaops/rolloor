@@ -101,7 +101,7 @@ type fixture struct {
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
 
-	cfg, err := config.Parse([]byte("environment: test\nbudget: 100%\nlabels: {group: client, owner: owner}\nhooks: {dir: /tmp}\npresets:\n  fast: {batch: [100%], soak: {duration: 0s}}\ndefaultPolicy: {speed: fast}\n"))
+	cfg, err := config.Parse([]byte("environment: test\ndisruptionBudget: {maxUnavailable: 100%}\nlabels: {group: client, owner: owner}\nhooks: {dir: /tmp}\nstrategy: {batchSize: 100%, soak: {duration: 0s}}\nstrategies:\n  fast: {batchSize: 100%}\n"))
 	require.NoError(t, err)
 
 	set, err := targets.Parse([]byte(fleetYAML), &targets.Rules{GroupLabel: "client", OwnerLabel: "owner", WaveLabel: "wave", KnownHooks: config.TargetHooks})
@@ -225,7 +225,8 @@ func TestReadRoutes(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, code)
 	code, body, _ = f.do(http.MethodGet, "/api/v1/policies/a", "")
 	require.Equal(t, http.StatusOK, code)
-	require.Equal(t, "fast", body["speed"])
+	require.Equal(t, reconcile.ModeAutomated, body["mode"])
+	require.NotContains(t, body, "strategy", "the default strategy has no name")
 
 	code, _, raw = f.do(http.MethodGet, "/api/v1/suspensions", "")
 	require.Equal(t, http.StatusOK, code)
@@ -273,11 +274,11 @@ func TestRolloutRoutesAndVerbs(t *testing.T) {
 	require.Equal(t, "Aborted", body["state"])
 
 	// Sync recreates it.
-	code, body, _ = f.do(http.MethodPost, "/api/v1/actions/sync", `{"selector": "client=a", "force": true, "speed": "fast"}`)
+	code, body, _ = f.do(http.MethodPost, "/api/v1/actions/sync", `{"selector": "client=a", "force": true, "strategy": "fast"}`)
 	require.Equal(t, http.StatusOK, code)
 	require.Len(t, body["rollouts"], 1)
 
-	code, _, _ = f.do(http.MethodPost, "/api/v1/actions/sync", `{"selector": "client=a", "speed": "warp"}`)
+	code, _, _ = f.do(http.MethodPost, "/api/v1/actions/sync", `{"selector": "client=a", "strategy": "warp"}`)
 	require.Equal(t, http.StatusBadRequest, code)
 	code, _, _ = f.do(http.MethodPost, "/api/v1/actions/sync", `{"selector": "nope"}`)
 	require.Equal(t, http.StatusBadRequest, code)
@@ -320,13 +321,13 @@ func TestSuspendResumeAndPolicy(t *testing.T) {
 	require.Equal(t, http.StatusOK, code)
 	require.InDelta(t, 1, body["lifted"], 0)
 
-	code, _, _ = f.do(http.MethodPut, "/api/v1/policies/zzz", `{"mode": "manual", "speed": "fast"}`)
+	code, _, _ = f.do(http.MethodPut, "/api/v1/policies/zzz", `{"mode": "manual", "strategy": "fast"}`)
 	require.Equal(t, http.StatusNotFound, code)
 	code, _, _ = f.do(http.MethodPut, "/api/v1/policies/a", `{"mode": "manual"`)
 	require.Equal(t, http.StatusBadRequest, code)
-	code, _, _ = f.do(http.MethodPut, "/api/v1/policies/a", `{"mode": "manual", "speed": "warp"}`)
+	code, _, _ = f.do(http.MethodPut, "/api/v1/policies/a", `{"mode": "manual", "strategy": "warp"}`)
 	require.Equal(t, http.StatusBadRequest, code)
-	code, body, _ = f.do(http.MethodPut, "/api/v1/policies/a", `{"mode": "manual", "speed": "fast"}`)
+	code, body, _ = f.do(http.MethodPut, "/api/v1/policies/a", `{"mode": "manual", "strategy": "fast"}`)
 	require.Equal(t, http.StatusOK, code)
 	require.Equal(t, "manual", body["mode"])
 }
@@ -348,7 +349,7 @@ func TestAuthorization(t *testing.T) {
 
 	code, _, _ = f.do(http.MethodPost, "/api/v1/actions/pause", `{"rollout": "r-1"}`)
 	require.Equal(t, http.StatusForbidden, code)
-	code, _, _ = f.do(http.MethodPut, "/api/v1/policies/a", `{"mode": "manual", "speed": "fast"}`)
+	code, _, _ = f.do(http.MethodPut, "/api/v1/policies/a", `{"mode": "manual", "strategy": "fast"}`)
 	require.Equal(t, http.StatusForbidden, code)
 
 	code, _, _ = f.do(http.MethodPost, "/api/v1/actions/sync", `{"selector": "client=b"}`)

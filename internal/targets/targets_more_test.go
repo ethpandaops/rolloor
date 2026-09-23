@@ -45,7 +45,7 @@ func TestValidationMore(t *testing.T) {
 		"no node":         "- {id: q, weight: 1, image: a:b, labels: {client: a, owner: a}}\n",
 		"negative weight": "- {id: q, node: n, weight: -1, image: a:b, labels: {client: a, owner: a}}\n",
 		"no image":        "- {id: q, node: n, weight: 1, labels: {client: a, owner: a}}\n",
-		"empty probe":     "- {id: q, node: n, weight: 1, image: a:b, labels: {client: a, owner: a}, probes: {ready: \"\"}}\n",
+		"empty probe":     "- {id: q, node: n, weight: 1, image: a:b, labels: {client: a, owner: a}, hooks: {ready: \"\"}}\n",
 		"not a list":      "id: q\n",
 	}
 

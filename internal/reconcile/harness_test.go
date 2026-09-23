@@ -46,33 +46,32 @@ const (
 
 const testConfig = `
 environment: test
-budget: 50%
+disruptionBudget: {maxUnavailable: 50%}
 registry: {poll: 60s}
 hooks:
   dir: /tmp
   timeout: 10s
   defaults: {soak: ""}
-inspect: {interval: 30s, concurrency: 4, unknownAfter: 2}
+inspect: {interval: 30s, concurrency: 4, failureThreshold: 2}
 labels: {group: client, owner: owner, section: role, hiddenGroups: [side]}
-presets:
-  test:    {batch: [2], soak: {duration: 60s, interval: 20s, passes: 2, grace: 1}}
-  nosoak:  {batch: [50%], soak: {duration: 0s}}
-  careful: {batch: [1, 50%], soak: {duration: 0s}, pauseAfterFirst: true}
-  all:     {batch: [100%], soak: {duration: 0s}, waves: false}
-defaultPolicy: {speed: test}
+strategy: {batchSize: 2, soak: {duration: 60s, interval: 20s, failureLimit: 1}}
+strategies:
+  nosoak:  {batchSize: 50%, soak: {duration: 0s}}
+  careful: {firstBatch: 1, batchSize: 50%, soak: {duration: 0s}, pauseAfterFirstBatch: true}
+  all:     {batchSize: 100%, soak: {duration: 0s}, waves: false}
 `
 
 // The standard fleet. Weight lives on nodes a-3..a-6 and b-1 (100 each), so
 // the total is 500 and a 50% budget allows two weighted nodes at once.
 const testTargets = `
-- {id: a-1/cl, node: a-1, weight: 0,   image: org/a:t, labels: {client: a, owner: a, role: cl, wave: "0"}, probes: {soak: soak-a}}
-- {id: a-2/cl, node: a-2, weight: 0,   image: org/a:t, labels: {client: a, owner: a, role: cl, wave: "0"}, probes: {soak: soak-a}}
-- {id: a-3/cl, node: a-3, weight: 100, image: org/a:t, labels: {client: a, owner: a, role: cl, wave: "1"}, probes: {soak: soak-a}}
-- {id: a-4/cl, node: a-4, weight: 100, image: org/a:t, labels: {client: a, owner: a, role: cl, wave: "1"}, probes: {soak: soak-a}}
-- {id: a-5/cl, node: a-5, weight: 100, image: org/a:t, labels: {client: a, owner: a, role: cl, wave: "1"}, probes: {soak: soak-a}}
-- {id: a-6/cl, node: a-6, weight: 100, image: org/a:t, labels: {client: a, owner: a, role: cl, wave: "2"}, probes: {soak: soak-a}}
-- {id: a-3/el, node: a-3, weight: 100, image: org/b:t, labels: {client: b, owner: b, role: el, wave: "1"}, probes: {soak: soak-b}}
-- {id: b-1/el, node: b-1, weight: 100, image: org/b:t, labels: {client: b, owner: b, role: el, wave: "1"}, probes: {soak: soak-b}}
+- {id: a-1/cl, node: a-1, weight: 0,   image: org/a:t, labels: {client: a, owner: a, role: cl, wave: "0"}, hooks: {soak: soak-a}}
+- {id: a-2/cl, node: a-2, weight: 0,   image: org/a:t, labels: {client: a, owner: a, role: cl, wave: "0"}, hooks: {soak: soak-a}}
+- {id: a-3/cl, node: a-3, weight: 100, image: org/a:t, labels: {client: a, owner: a, role: cl, wave: "1"}, hooks: {soak: soak-a}}
+- {id: a-4/cl, node: a-4, weight: 100, image: org/a:t, labels: {client: a, owner: a, role: cl, wave: "1"}, hooks: {soak: soak-a}}
+- {id: a-5/cl, node: a-5, weight: 100, image: org/a:t, labels: {client: a, owner: a, role: cl, wave: "1"}, hooks: {soak: soak-a}}
+- {id: a-6/cl, node: a-6, weight: 100, image: org/a:t, labels: {client: a, owner: a, role: cl, wave: "2"}, hooks: {soak: soak-a}}
+- {id: a-3/el, node: a-3, weight: 100, image: org/b:t, labels: {client: b, owner: b, role: el, wave: "1"}, hooks: {soak: soak-b}}
+- {id: b-1/el, node: b-1, weight: 100, image: org/b:t, labels: {client: b, owner: b, role: el, wave: "1"}, hooks: {soak: soak-b}}
 - {id: a-3/side, node: a-3, weight: 100, image: org/s:t, labels: {client: side, owner: operators, role: sidecar}}
 `
 

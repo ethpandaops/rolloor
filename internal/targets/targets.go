@@ -24,7 +24,7 @@ type Target struct {
 	Weight  float64           `yaml:"weight" json:"weight"`
 	Image   string            `yaml:"image" json:"image"`
 	Labels  map[string]string `yaml:"labels" json:"labels"`
-	Probes  map[string]string `yaml:"probes,omitempty" json:"probes,omitempty"`
+	Hooks   map[string]string `yaml:"hooks,omitempty" json:"hooks,omitempty"`
 	Extra   map[string]any    `yaml:"extra,omitempty" json:"extra,omitempty"`
 }
 
@@ -163,18 +163,18 @@ func (s *Set) validate(t *Target) error {
 		}
 	}
 
-	for hook, prog := range t.Probes {
+	for hook, prog := range t.Hooks {
 		if !slices.Contains(s.rules.KnownHooks, hook) {
-			return fmt.Errorf("targets: %s: probes.%s is not a hook (want one of %s)", t.ID, hook, strings.Join(s.rules.KnownHooks, ", "))
+			return fmt.Errorf("targets: %s: hooks.%s is not a hook (want one of %s)", t.ID, hook, strings.Join(s.rules.KnownHooks, ", "))
 		}
 
 		if prog == "" || strings.ContainsAny(prog, `/\`) {
-			return fmt.Errorf("targets: %s: probes.%s=%q must be a bare program name", t.ID, hook, prog)
+			return fmt.Errorf("targets: %s: hooks.%s=%q must be a bare program name", t.ID, hook, prog)
 		}
 
 		if s.rules.HooksDir != "" {
 			if err := checkExecutable(filepath.Join(s.rules.HooksDir, prog)); err != nil {
-				return fmt.Errorf("targets: %s: probes.%s: %w", t.ID, hook, err)
+				return fmt.Errorf("targets: %s: hooks.%s: %w", t.ID, hook, err)
 			}
 		}
 	}

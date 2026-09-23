@@ -1,44 +1,98 @@
 # One target per compose service. The first three carry no weight and go in
 # wave 0; the other three carry weight and go in wave 1.
+
+# Unique across every targets file.
 - id: app1/web
+  # The machine it runs on. Targets on the same node share its weight and
+  # move in the same batch when they can.
   node: app1
+  # For people and hooks; rolloor does not connect to it.
   address: 127.0.0.1
+  # This node's share of what the disruption budget protects. Zero never
+  # uses the budget.
   weight: 0
+  # repository:tag. rolloor follows the tag's digest.
   image: localhost:5050/app:latest
-  labels: {app: web, owner: team, tier: edge, wave: "0"}
-  extra: {service: app1, port: "18081"}
+  labels:
+    # The group label: one rollout moves every target with the same value.
+    app: web
+    # The owner label: who may act on this target.
+    owner: team
+    # The section label, for fleet page headings.
+    tier: edge
+    # Lower waves update first.
+    wave: "0"
+  # Opaque to rolloor; handed to every hook program.
+  extra:
+    service: app1
+    port: "18081"
+
 - id: app2/web
   node: app2
   address: 127.0.0.1
   weight: 0
   image: localhost:5050/app:latest
-  labels: {app: web, owner: team, tier: edge, wave: "0"}
-  extra: {service: app2, port: "18082"}
+  labels:
+    app: web
+    owner: team
+    tier: edge
+    wave: "0"
+  extra:
+    service: app2
+    port: "18082"
+
 - id: app3/web
   node: app3
   address: 127.0.0.1
   weight: 0
   image: localhost:5050/app:latest
-  labels: {app: web, owner: team, tier: edge, wave: "0"}
-  extra: {service: app3, port: "18083"}
+  labels:
+    app: web
+    owner: team
+    tier: edge
+    wave: "0"
+  extra:
+    service: app3
+    port: "18083"
+
 - id: app4/web
   node: app4
   address: 127.0.0.1
   weight: 10
   image: localhost:5050/app:latest
-  labels: {app: web, owner: team, tier: core, wave: "1"}
-  extra: {service: app4, port: "18084"}
+  labels:
+    app: web
+    owner: team
+    tier: core
+    wave: "1"
+  extra:
+    service: app4
+    port: "18084"
+
 - id: app5/web
   node: app5
   address: 127.0.0.1
   weight: 10
   image: localhost:5050/app:latest
-  labels: {app: web, owner: team, tier: core, wave: "1"}
-  extra: {service: app5, port: "18085"}
+  labels:
+    app: web
+    owner: team
+    tier: core
+    wave: "1"
+  extra:
+    service: app5
+    port: "18085"
+
 - id: app6/web
   node: app6
   address: 127.0.0.1
   weight: 10
   image: localhost:5050/app:latest
-  labels: {app: web, owner: team, tier: core, wave: "1"}
-  extra: {service: app6, port: "18086"}
+  labels:
+    app: web
+    owner: team
+    tier: core
+    wave: "1"
+  extra:
+    service: app6
+    port: "18086"

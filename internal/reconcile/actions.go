@@ -20,7 +20,8 @@ type SyncRequest struct {
 	Actor    string
 	Selector targets.Selector
 	Force    bool
-	Speed    string
+	// Strategy names a configured strategy for a rollout this creates.
+	Strategy string
 }
 
 // Sync asks for the selected groups to converge now. Tags are re-resolved
@@ -30,9 +31,9 @@ type SyncRequest struct {
 func (c *Controller) Sync(ctx context.Context, req SyncRequest) ([]string, error) {
 	set := c.targets()
 
-	if req.Speed != "" {
-		if _, ok := c.cfg.Presets[req.Speed]; !ok {
-			return nil, fmt.Errorf("speed %q is not a preset", req.Speed)
+	if req.Strategy != "" {
+		if _, ok := c.cfg.Strategies[req.Strategy]; !ok {
+			return nil, fmt.Errorf("strategy %q is not configured", req.Strategy)
 		}
 	}
 
@@ -78,8 +79,8 @@ func (c *Controller) Sync(ctx context.Context, req SyncRequest) ([]string, error
 			}
 
 			policy := c.policyFor(group)
-			if req.Speed != "" {
-				policy.Speed = req.Speed
+			if req.Strategy != "" {
+				policy.Strategy = req.Strategy
 			}
 
 			r = c.newRollout(now, group, policy, eligible, desired, from, set)
@@ -90,8 +91,8 @@ func (c *Controller) Sync(ctx context.Context, req SyncRequest) ([]string, error
 			r.Human = true
 			r.Force = r.Force || req.Force
 
-			if req.Speed != "" {
-				r.Speed = req.Speed
+			if req.Strategy != "" {
+				r.Strategy = req.Strategy
 			}
 
 			if r.State == WaitingForSync || r.State == WaitingForEnvironment {
@@ -105,7 +106,7 @@ func (c *Controller) Sync(ctx context.Context, req SyncRequest) ([]string, error
 		if created {
 			c.rollouts[r.ID] = r
 			c.event(ctx, now, &Event{Actor: req.Actor, Action: "rollout.created", Group: group, Rollout: r.ID,
-				Reason: fmt.Sprintf("%d targets to %s (%s)", len(r.Targets), r.DigestShort(), r.Speed)})
+				Reason: fmt.Sprintf("%d targets to %s (%s)", len(r.Targets), r.DigestShort(), strategyLabel(r.Strategy))})
 		}
 
 		c.event(ctx, now, &Event{Actor: req.Actor, Action: "sync", Group: group, Rollout: r.ID, Selector: req.Selector.String(),
@@ -125,8 +126,8 @@ func syncReason(req SyncRequest) string {
 		s += " --force (readiness and soak skipped; budget still applies)"
 	}
 
-	if req.Speed != "" {
-		s += " --speed " + req.Speed
+	if req.Strategy != "" {
+		s += " --strategy " + req.Strategy
 	}
 
 	return s
@@ -374,8 +375,8 @@ func (c *Controller) SetPolicy(ctx context.Context, actor, group string, p Polic
 		return fmt.Errorf("mode must be %s or %s", ModeAutomated, ModeManual)
 	}
 
-	if _, ok := c.cfg.Presets[p.Speed]; !ok {
-		return fmt.Errorf("speed %q is not a preset", p.Speed)
+	if _, ok := c.cfg.StrategyNamed(p.Strategy); !ok {
+		return fmt.Errorf("strategy %q is not configured", p.Strategy)
 	}
 
 	set := c.targets()
@@ -394,7 +395,7 @@ func (c *Controller) SetPolicy(ctx context.Context, actor, group string, p Polic
 
 	c.policies[group] = p
 	c.event(ctx, now, &Event{Actor: actor, Action: "policy", Group: group,
-		Reason: fmt.Sprintf("mode=%s speed=%s pins=%d", p.Mode, p.Speed, len(p.Pins))})
+		Reason: fmt.Sprintf("mode=%s strategy=%s pins=%d", p.Mode, strategyLabel(p.Strategy), len(p.Pins))})
 	c.Nudge()
 
 	return nil

@@ -74,7 +74,7 @@ func TestCollector(t *testing.T) {
 
 	require.Contains(t, names, "rolloor_target_info")
 	require.Contains(t, names, "rolloor_rollout_state")
-	require.Contains(t, names, "rolloor_budget_ratio")
+	require.Contains(t, names, "rolloor_disruption_budget_ratio")
 	require.Contains(t, names, "rolloor_environment_check_passing")
 
 	out, err := testutil.GatherAndCount(reg)

@@ -48,8 +48,8 @@ func TestRoundTrip(t *testing.T) {
 	require.NoError(t, s.SaveRollout(ctx, r), "upsert")
 	require.NoError(t, s.SaveRollout(ctx, &reconcile.Rollout{ID: "r0", Group: "b", CreatedAt: now}))
 
-	require.NoError(t, s.SavePolicy(ctx, "a", reconcile.Policy{Mode: reconcile.ModeManual, Speed: "careful"}))
-	require.NoError(t, s.SavePolicy(ctx, "a", reconcile.Policy{Mode: reconcile.ModeAutomated, Speed: "fast"}))
+	require.NoError(t, s.SavePolicy(ctx, "a", reconcile.Policy{Mode: reconcile.ModeManual, Strategy: "careful"}))
+	require.NoError(t, s.SavePolicy(ctx, "a", reconcile.Policy{Mode: reconcile.ModeAutomated, Strategy: "fast"}))
 
 	sp := &reconcile.Suspension{ID: "s1", Selector: targets.Selector{"node": "n1"}, Reason: "x", Actor: "sam", CreatedAt: now, ExpiresAt: now.Add(time.Hour)}
 	require.NoError(t, s.SaveSuspension(ctx, sp))
@@ -91,7 +91,7 @@ func TestRoundTrip(t *testing.T) {
 	require.Equal(t, "r0", snap.Rollouts[0].ID)
 	require.Equal(t, reconcile.Complete, snap.Rollouts[1].State)
 	require.Equal(t, t1, snap.Rollouts[1].Targets[0].ID)
-	require.Equal(t, "fast", snap.Policies["a"].Speed)
+	require.Equal(t, "fast", snap.Policies["a"].Strategy)
 	require.Len(t, snap.Suspensions, 1)
 	require.Equal(t, "n1", snap.Suspensions[0].Selector["node"])
 	require.Equal(t, sha, snap.Live[t1].Digest)

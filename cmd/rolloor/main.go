@@ -131,8 +131,8 @@ func validate(out interface{ Write([]byte) (int, error) }, configPath string) er
 		}
 	}
 
-	fmt.Fprintf(out, "ok: %d targets on %d nodes in %d groups; total weight %g; budget %s\n",
-		set.Len(), len(set.Nodes()), len(set.Groups()), set.TotalWeight(), cfg.Budget.String())
+	fmt.Fprintf(out, "ok: %d targets on %d nodes in %d groups; total weight %g; maxUnavailable %s\n",
+		set.Len(), len(set.Nodes()), len(set.Groups()), set.TotalWeight(), cfg.DisruptionBudget.MaxUnavailable.String())
 
 	return nil
 }
@@ -228,7 +228,7 @@ func runHook(ctx context.Context, out interface{ Write([]byte) (int, error) }, c
 		}
 
 		if program == "" {
-			program = t.Probes[hook]
+			program = t.Hooks[hook]
 		}
 
 		if program == "" {

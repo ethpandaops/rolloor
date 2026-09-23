@@ -25,16 +25,13 @@ func TestLoadFile(t *testing.T) {
 
 func TestValidateRemainingBranches(t *testing.T) {
 	cases := map[string]string{
-		"empty group label":    "environment: x\nlabels: {group: \"\"}\n",
-		"zero poll":            "environment: x\nregistry: {poll: 0s}\n",
-		"zero hook timeout":    "environment: x\nhooks: {timeout: 0s}\n",
-		"zero inspect":         "environment: x\ninspect: {concurrency: 0}\n",
-		"no presets":           "environment: x\npresets: {}\n",
-		"batch selects none":   "environment: x\npresets: {p: {batch: [0]}}\ndefaultPolicy: {speed: p}\n",
-		"negative soak passes": "environment: x\npresets: {p: {batch: [1], soak: {duration: 1m, passes: -1}}}\ndefaultPolicy: {speed: p}\n",
-		"bad auth mode":        "environment: x\nauth: {mode: magic}\n",
-		"budget not scalar":    "environment: x\nbudget: [1]\n",
-		"bad budget":           "environment: x\nbudget: lots\n",
+		"empty group label": "environment: x\nlabels: {group: \"\"}\n",
+		"zero poll":         "environment: x\nregistry: {poll: 0s}\n",
+		"zero hook timeout": "environment: x\nhooks: {timeout: 0s}\n",
+		"zero inspect":      "environment: x\ninspect: {concurrency: 0}\n",
+		"bad auth mode":     "environment: x\nauth: {mode: magic}\n",
+		"budget not scalar": "environment: x\ndisruptionBudget: {maxUnavailable: [1]}\n",
+		"bad budget":        "environment: x\ndisruptionBudget: {maxUnavailable: lots}\n",
 	}
 
 	for name, raw := range cases {
@@ -44,9 +41,8 @@ func TestValidateRemainingBranches(t *testing.T) {
 		})
 	}
 
-	cfg, err := Parse([]byte("environment: x\nauth: {mode: oidc, issuer: i, clientId: c, redirectUrl: r}\n"))
+	_, err := Parse([]byte("environment: x\nauth: {mode: oidc, issuer: i, clientId: c, redirectUrl: r}\n"))
 	require.NoError(t, err)
-	require.Equal(t, []string{"all", "careful", "fast", "normal"}, cfg.PresetNames())
 }
 
 func TestDefaultsFailure(t *testing.T) {

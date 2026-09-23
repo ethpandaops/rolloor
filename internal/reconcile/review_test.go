@@ -6,8 +6,6 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-
-	"github.com/ethpandaops/rolloor/internal/config"
 )
 
 // These tests pin the behaviours the first review found missing.
@@ -17,7 +15,7 @@ func TestUpdateHookReceivesTheDesiredDigest(t *testing.T) {
 	h.prime()
 
 	// The tag moves to d2 but the group is pinned to d3: targets must end on d3.
-	require.NoError(t, h.c.SetPolicy(h.ctx, actor, "a", Policy{Mode: ModeAutomated, Speed: speedTest, Pins: map[string]string{imgA: d3}}))
+	require.NoError(t, h.c.SetPolicy(h.ctx, actor, "a", Policy{Mode: ModeAutomated, Pins: map[string]string{imgA: d3}}))
 	h.release(imgA, d2)
 
 	r := h.active("a")
@@ -49,8 +47,8 @@ func TestSuspensionAndGroupMoveMidBatch(t *testing.T) {
 	// Moving the other target to another group does the same.
 	rules := h.set.Rules()
 	moved, err := parseTargets(replaceLine(testTargets,
-		"- {id: a-2/cl, node: a-2, weight: 0,   image: org/a:t, labels: {client: a, owner: a, role: cl, wave: \"0\"}, probes: {soak: soak-a}}",
-		"- {id: a-2/cl, node: a-2, weight: 0,   image: org/a:t, labels: {client: b, owner: b, role: cl, wave: \"0\"}, probes: {soak: soak-a}}"), &rules)
+		"- {id: a-2/cl, node: a-2, weight: 0,   image: org/a:t, labels: {client: a, owner: a, role: cl, wave: \"0\"}, hooks: {soak: soak-a}}",
+		"- {id: a-2/cl, node: a-2, weight: 0,   image: org/a:t, labels: {client: b, owner: b, role: cl, wave: \"0\"}, hooks: {soak: soak-a}}"), &rules)
 	require.NoError(t, err)
 
 	h.set = moved
@@ -106,7 +104,7 @@ func TestStoreFailuresSurfaceOnActions(t *testing.T) {
 	require.ErrorIs(t, err, errFake)
 	require.Empty(t, h.c.Suspensions(), "not kept in memory either")
 
-	require.ErrorIs(t, h.c.SetPolicy(h.ctx, actor, "b", Policy{Mode: ModeManual, Speed: speedTest}), errFake)
+	require.ErrorIs(t, h.c.SetPolicy(h.ctx, actor, "b", Policy{Mode: ModeManual}), errFake)
 	require.Equal(t, ModeAutomated, h.c.Fleet().Groups[1].Policy.Mode)
 
 	require.ErrorIs(t, h.c.Pause(h.ctx, actor, r.ID), errFake)
@@ -192,9 +190,9 @@ func TestSoakWithNoProgramsLeftPasses(t *testing.T) {
 
 	rules := h.set.Rules()
 	noSoak, err := parseTargets(replaceLine(replaceLine(testTargets,
-		"- {id: a-1/cl, node: a-1, weight: 0,   image: org/a:t, labels: {client: a, owner: a, role: cl, wave: \"0\"}, probes: {soak: soak-a}}",
+		"- {id: a-1/cl, node: a-1, weight: 0,   image: org/a:t, labels: {client: a, owner: a, role: cl, wave: \"0\"}, hooks: {soak: soak-a}}",
 		"- {id: a-1/cl, node: a-1, weight: 0,   image: org/a:t, labels: {client: a, owner: a, role: cl, wave: \"0\"}}"),
-		"- {id: a-2/cl, node: a-2, weight: 0,   image: org/a:t, labels: {client: a, owner: a, role: cl, wave: \"0\"}, probes: {soak: soak-a}}",
+		"- {id: a-2/cl, node: a-2, weight: 0,   image: org/a:t, labels: {client: a, owner: a, role: cl, wave: \"0\"}, hooks: {soak: soak-a}}",
 		"- {id: a-2/cl, node: a-2, weight: 0,   image: org/a:t, labels: {client: a, owner: a, role: cl, wave: \"0\"}}"), &rules)
 	require.NoError(t, err)
 
@@ -282,11 +280,11 @@ func TestWavesAreContiguousAfterDegradedTargets(t *testing.T) {
 	require.True(t, r.Targets[0].DegradedBefore)
 	require.Equal(t, 2, r.Targets[0].Wave)
 	require.Equal(t, []string{tA6}, r.Batches[0].Targets, "the degraded wave-2 target goes alone")
-	require.Equal(t, "0.0% of 50%", r.BudgetPercent, "a degraded node costs nothing")
+	require.Equal(t, "0.0% of 50%", r.Unavailable, "a degraded node costs nothing")
 }
 
 func TestNodeDegradedCostsNothingForAllItsTargets(t *testing.T) {
-	doc := testTargets + "- {id: a-3/vc, node: a-3, weight: 100, image: org/a:t, labels: {client: a, owner: a, role: vc, wave: \"1\"}, probes: {soak: soak-a}}\n"
+	doc := testTargets + "- {id: a-3/vc, node: a-3, weight: 100, image: org/a:t, labels: {client: a, owner: a, role: vc, wave: \"1\"}, hooks: {soak: soak-a}}\n"
 	h := newHarness(t, testConfig, doc)
 	h.prime()
 
@@ -307,7 +305,7 @@ func TestNodeDegradedCostsNothingForAllItsTargets(t *testing.T) {
 
 	r := h.active("a")
 	require.Equal(t, []string{tA3, "a-3/vc"}, r.Batches[0].Targets)
-	require.Equal(t, "0.0% of 50%", r.BudgetPercent)
+	require.Equal(t, "0.0% of 50%", r.Unavailable)
 }
 
 func TestRestartRerunsInterruptedUpdates(t *testing.T) {
@@ -400,7 +398,7 @@ func TestViewHooksAreACopy(t *testing.T) {
 func TestSyncResolvesBeforeDeciding(t *testing.T) {
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
-	require.NoError(t, h.c.SetPolicy(h.ctx, actor, "a", Policy{Mode: ModeManual, Speed: speedTest}))
+	require.NoError(t, h.c.SetPolicy(h.ctx, actor, "a", Policy{Mode: ModeManual}))
 
 	// The tag has just moved but no poll has noticed. One sync is enough.
 	h.world.set(func(w *world) { w.registry[imgA] = d2 })
@@ -414,11 +412,11 @@ func TestSyncResolvesBeforeDeciding(t *testing.T) {
 	// A human rollout is superseded by a newer digest at sync time and the new
 	// one keeps the person's intent.
 	h.world.set(func(w *world) { w.registry[imgA] = d3 })
-	ids, err = h.c.Sync(h.ctx, SyncRequest{Actor: actor, Selector: mustSel("client=a"), Speed: speedAll})
+	ids, err = h.c.Sync(h.ctx, SyncRequest{Actor: actor, Selector: mustSel("client=a"), Strategy: speedAll})
 	require.NoError(t, err)
 	require.Len(t, ids, 1)
 	require.Equal(t, "3333333", h.rollout(ids[0]).Digest)
-	require.Equal(t, speedAll, h.rollout(ids[0]).Speed)
+	require.Equal(t, speedAll, h.rollout(ids[0]).Strategy)
 	require.True(t, h.rollout(ids[0]).Human)
 }
 
@@ -432,13 +430,6 @@ func TestOnNewBuildCountsObservedDigestsOnly(t *testing.T) {
 	r := h.active("a")
 	require.Equal(t, Halted, r.State)
 	require.Equal(t, 0, r.OnNewBuild, "a failed update never reached the digest")
-}
-
-func TestPresetHelpersFromConfig(t *testing.T) {
-	zero := 0
-	s := config.Soak{Grace: &zero, Passes: &zero}
-	require.Equal(t, 0, s.GraceN())
-	require.Equal(t, 0, s.PassesN())
 }
 
 func count(list []string, want string) int {
@@ -485,7 +476,7 @@ func TestTargetRemovedDuringSoakIsLeftOut(t *testing.T) {
 
 	rules := h.set.Rules()
 	without, err := parseTargets(replaceLine(testTargets,
-		"- {id: a-2/cl, node: a-2, weight: 0,   image: org/a:t, labels: {client: a, owner: a, role: cl, wave: \"0\"}, probes: {soak: soak-a}}", ""), &rules)
+		"- {id: a-2/cl, node: a-2, weight: 0,   image: org/a:t, labels: {client: a, owner: a, role: cl, wave: \"0\"}, hooks: {soak: soak-a}}", ""), &rules)
 	require.NoError(t, err)
 
 	h.set = without

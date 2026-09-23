@@ -28,7 +28,7 @@
 <dl class="facts">
   <div><dt>Selector</dt><dd><code>{{.GroupLabel}}={{.Group.Name}}</code></dd></div>
   <div><dt>Targets</dt><dd>{{.Group.Targets}}, on {{.Group.Nodes}} nodes</dd></div>
-  <div><dt>Policy</dt><dd>{{.Group.Policy.Mode}}, {{.Group.Policy.Speed}} speed{{if .Group.Policy.Pins}}, pinned{{end}}</dd></div>
+  <div><dt>Policy</dt><dd>{{.Group.Policy.Mode}}, {{if .Group.Policy.Strategy}}{{.Group.Policy.Strategy}}{{else}}default{{end}} strategy{{if .Group.Policy.Pins}}, pinned{{end}}</dd></div>
   <div><dt>Owner</dt><dd>{{.Group.Owner}}</dd></div>
 </dl>
 

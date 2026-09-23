@@ -56,7 +56,7 @@ func TestNewValidatesOptionsAndRestores(t *testing.T) {
 	h.release(imgA, d2)
 	_, err = h.c.Suspend(h.ctx, SuspendRequest{Actor: actor, Selector: mustSel("node=b-1"), Reason: "r"})
 	require.NoError(t, err)
-	require.NoError(t, h.c.SetPolicy(h.ctx, actor, "b", Policy{Mode: ModeManual, Speed: speedTest}))
+	require.NoError(t, h.c.SetPolicy(h.ctx, actor, "b", Policy{Mode: ModeManual}))
 	h.tick()
 
 	restarted := h.newController()

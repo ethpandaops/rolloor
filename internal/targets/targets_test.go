@@ -28,7 +28,7 @@ const good = `
   weight: 100
   image: org/a:unstable
   labels: {client: a, owner: a, role: cl, wave: "1"}
-  probes: {ready: r, soak: s}
+  hooks: {ready: r, soak: s}
 - id: a-1/el
   node: a-1
   address: a-1.example
@@ -72,8 +72,8 @@ func TestValidation(t *testing.T) {
 		"no tag":            "- {id: q, node: n, weight: 1, image: org/a, labels: {client: a, owner: a}}\n",
 		"missing group":     "- {id: q, node: n, weight: 1, image: a:b, labels: {owner: a}}\n",
 		"bad wave":          "- {id: q, node: n, weight: 1, image: a:b, labels: {client: a, owner: a, wave: x}}\n",
-		"unknown probe":     "- {id: q, node: n, weight: 1, image: a:b, labels: {client: a, owner: a}, probes: {discover: d}}\n",
-		"probe with path":   "- {id: q, node: n, weight: 1, image: a:b, labels: {client: a, owner: a}, probes: {ready: ../x}}\n",
+		"unknown probe":     "- {id: q, node: n, weight: 1, image: a:b, labels: {client: a, owner: a}, hooks: {discover: d}}\n",
+		"probe with path":   "- {id: q, node: n, weight: 1, image: a:b, labels: {client: a, owner: a}, hooks: {ready: ../x}}\n",
 		"unknown field":     "- {id: q, node: n, weight: 1, image: a:b, labels: {client: a, owner: a}, bogus: 1}\n",
 	}
 

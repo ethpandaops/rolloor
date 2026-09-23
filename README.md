@@ -2,7 +2,7 @@
 
 Staged, health-gated rollouts for a fleet of containers. One instance per environment.
 
-rolloor watches the image tags a set of containers run. When a tag moves, it converges those containers toward the new digest a batch at a time, keeping the weight mid-update under a budget, and after each batch compares the updated containers against the ones it hasn't reached yet. When a batch does worse, it halts and leaves that batch on the new build for debugging.
+rolloor watches the image tags a set of containers run. When a tag moves, it converges those containers toward the new digest a batch at a time, keeping the weight mid-update under a disruption budget (`maxUnavailable`), and after each batch compares the updated containers against the ones it hasn't reached yet. When a batch does worse, it halts and leaves that batch on the new build for debugging.
 
 It knows nothing about what the containers are. A deployment supplies:
 
@@ -16,12 +16,12 @@ The spec is `tasks/prd.md`.
 
 1. The registry is polled; a tag now points at a new digest.
 2. `inspect` reports what each container runs. Those behind form a rollout per group (the value of a configured label).
-3. Targets are sorted (already degraded first, then by `wave` label, node, id) and cut into batches whose nodes fit the budget.
+3. Targets are sorted (already degraded first, then by `wave` label, node, id) and cut into batches (the `strategy`: `firstBatch`, `batchSize`) whose nodes fit the disruption budget.
 4. `update` starts each update; `inspect` waits for the digest to show; `ready` waits for the container to do its job.
-5. `soak` compares the batch against the containers not yet reached, several times over a set duration. Passing moves on; failing too often halts and quarantines the batch.
+5. `soak` compares the batch against the containers not yet reached, every `interval` for `duration`. Passing moves on; more than `failureLimit` failed checks halts and quarantines the batch.
 6. A newer digest supersedes a halted or running rollout; the quarantined targets go first in the next one.
 
-People can sync, pause, promote, abort, retry, suspend targets with an expiry, and set a group's policy (automated or manual, speed preset, pinned digests).
+People can sync, pause, promote, abort, retry, suspend targets with an expiry, and set a group's policy (automated or manual, a named strategy, pinned digests).
 
 ## Hooks
 
@@ -35,7 +35,7 @@ Programs in `hooks.dir`, run with a JSON document on stdin. Exit 0 means yes; th
 | `soak` | `{updated, remaining, rollout}` | the updated targets are no worse than the remaining ones |
 | `environment` | `{environment}` | automated rollouts may start another batch (optional) |
 
-Each target may name its own programs under `probes`; the rest use `hooks.defaults`. `rolloor hook <name> --target <id>` runs one by hand with the same document. Programs must be idempotent: an update interrupted by a restart runs again.
+Each target may name its own programs under `hooks`; the rest use `hooks.defaults`. `rolloor hook <name> --target <id>` runs one by hand with the same document. Programs must be idempotent: an update interrupted by a restart runs again.
 
 ## Run
 

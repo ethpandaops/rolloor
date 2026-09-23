@@ -12,8 +12,8 @@ type selectorBody struct {
 	Selector string `json:"selector"`
 	Confirm  bool   `json:"confirm"`
 	// Sync only.
-	Force bool   `json:"force"`
-	Speed string `json:"speed"`
+	Force    bool   `json:"force"`
+	Strategy string `json:"strategy"`
 	// Suspend only. ExpiresIn is a duration; ExpiresAt an RFC 3339 time.
 	Reason    string `json:"reason"`
 	ExpiresIn string `json:"expiresIn"`
@@ -52,7 +52,7 @@ func (s *Server) actionSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	started, err := s.c.Sync(r.Context(), reconcile.SyncRequest{Actor: id.Name, Selector: sel, Force: body.Force, Speed: body.Speed})
+	started, err := s.c.Sync(r.Context(), reconcile.SyncRequest{Actor: id.Name, Selector: sel, Force: body.Force, Strategy: body.Strategy})
 	if err != nil {
 		writeActionError(w, err)
 

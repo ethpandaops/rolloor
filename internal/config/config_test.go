@@ -12,12 +12,16 @@ func TestParseMinimal(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, ":8080", cfg.Listen)
 	require.Equal(t, 60*time.Second, cfg.Registry.Poll)
-	require.Equal(t, "10%", cfg.Budget.String())
-	require.Equal(t, "normal", cfg.DefaultPolicy.Speed)
-	require.Len(t, cfg.Presets, 4)
+	require.Equal(t, "10%", cfg.DisruptionBudget.MaxUnavailable.String())
+	require.Equal(t, "10%", cfg.Strategy.BatchSize.String())
+	require.Equal(t, 10*time.Minute, cfg.Strategy.Soak.Duration)
+	require.Equal(t, time.Minute, cfg.Strategy.Soak.Interval)
+	require.Equal(t, 1, cfg.Strategy.Soak.FailureLimit)
+	require.Equal(t, 3, cfg.Inspect.FailureThreshold)
+	require.Empty(t, cfg.Strategies)
 	require.Equal(t, "inspect", cfg.Hooks.Defaults[HookInspect])
-	require.False(t, cfg.Presets["all"].UsesWaves())
-	require.True(t, cfg.Presets["normal"].UsesWaves())
+	require.True(t, cfg.Strategy.UsesWaves())
+	require.Equal(t, 3, cfg.Strategy.BatchFor(1, 30), "without firstBatch, batch 1 is batchSize")
 }
 
 func TestParseRejectsUnknownField(t *testing.T) {
@@ -25,46 +29,73 @@ func TestParseRejectsUnknownField(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestParseCustomPresetsReplaceBuiltins(t *testing.T) {
+func TestNamedStrategiesStartFromTheDefault(t *testing.T) {
 	cfg, err := Parse([]byte(`
 environment: x
-defaultPolicy: {speed: slow}
-presets:
-  slow: {batch: [1], soak: {duration: 5m}}
+strategy:
+  firstBatch: 1
+  batchSize: 20%
+  pauseAfterFirstBatch: true
+  waves: false
+  soak:
+    duration: 5m
+    interval: 30s
+    failureLimit: 0
+strategies:
+  fast:
+    batchSize: 50%
+    waves: true
+    soak:
+      duration: 0s
+defaultPolicy:
+  strategy: fast
 `))
 	require.NoError(t, err)
-	require.Len(t, cfg.Presets, 1)
-	require.Equal(t, 60*time.Second, cfg.Presets["slow"].Soak.Interval)
-	require.Equal(t, 2, cfg.Presets["slow"].Soak.PassesN())
-	require.Equal(t, 1, cfg.Presets["slow"].Soak.GraceN())
 
-	// Explicit zeros are kept: halt on the first failure, no weighted updates.
-	strict, err := Parse([]byte(`
-environment: x
-budget: 0
-defaultPolicy: {speed: strict}
-presets:
-  strict: {batch: [1], soak: {duration: 5m, grace: 0, passes: 1}}
-`))
+	base := cfg.Strategy
+	require.Equal(t, 1, base.BatchFor(1, 30))
+	require.Equal(t, 6, base.BatchFor(2, 30))
+	require.False(t, base.UsesWaves())
+	require.Equal(t, 0, base.Soak.FailureLimit, "an explicit zero is kept")
+
+	fast, ok := cfg.StrategyNamed("fast")
+	require.True(t, ok)
+	require.Equal(t, 15, fast.BatchFor(2, 30))
+	require.Equal(t, 1, fast.BatchFor(1, 30), "firstBatch comes from the default")
+	require.True(t, fast.PauseAfterFirstBatch)
+	require.True(t, fast.UsesWaves())
+	require.False(t, cfg.Strategy.UsesWaves(), "overriding waves leaves the default alone")
+	require.Equal(t, time.Duration(0), fast.Soak.Duration)
+	require.Equal(t, 30*time.Second, fast.Soak.Interval)
+	require.Equal(t, []string{"fast"}, cfg.StrategyNames())
+
+	_, ok = cfg.StrategyNamed("warp")
+	require.False(t, ok)
+
+	def, ok := cfg.StrategyNamed("")
+	require.True(t, ok)
+	require.Equal(t, base.BatchSize, def.BatchSize)
+
+	zero, err := Parse([]byte("environment: x\ndisruptionBudget:\n  maxUnavailable: 0\n"))
 	require.NoError(t, err)
-	require.Equal(t, 0, strict.Presets["strict"].Soak.GraceN())
-	require.Equal(t, 1, strict.Presets["strict"].Soak.PassesN())
-	require.Equal(t, "0", strict.Budget.String())
-	require.InDelta(t, 0, strict.Budget.OfWeight(1000), 0.001)
-
-	_, err = Parse([]byte("environment: x\npresets: {p: {batch: [1], soak: {duration: 1m, grace: -1}}}\ndefaultPolicy: {speed: p}\n"))
-	require.Error(t, err)
+	require.InDelta(t, 0, zero.DisruptionBudget.MaxUnavailable.OfWeight(1000), 0.001)
 }
 
 func TestValidateErrors(t *testing.T) {
 	cases := map[string]string{
-		"missing environment":   "listen: ':1'\n",
-		"bad default speed":     "environment: x\ndefaultPolicy: {speed: warp}\n",
-		"bad mode":              "environment: x\ndefaultPolicy: {mode: sometimes}\n",
-		"oidc without issuer":   "environment: x\nauth: {mode: oidc}\n",
-		"unknown hook default":  "environment: x\nhooks: {defaults: {discover: d}}\n",
-		"empty batch":           "environment: x\npresets: {p: {batch: []}}\ndefaultPolicy: {speed: p}\n",
-		"soak interval too big": "environment: x\npresets: {p: {batch: [1], soak: {duration: 1m, interval: 2m}}}\ndefaultPolicy: {speed: p}\n",
+		"missing environment":    "listen: ':1'\n",
+		"bad default strategy":   "environment: x\ndefaultPolicy: {strategy: warp}\n",
+		"bad mode":               "environment: x\ndefaultPolicy: {mode: sometimes}\n",
+		"oidc without issuer":    "environment: x\nauth: {mode: oidc}\n",
+		"unknown hook default":   "environment: x\nhooks: {defaults: {discover: d}}\n",
+		"batch selects nothing":  "environment: x\nstrategy: {batchSize: 0}\n",
+		"first batch nothing":    "environment: x\nstrategy: {firstBatch: 0%}\n",
+		"soak interval too big":  "environment: x\nstrategy: {soak: {duration: 1m, interval: 2m}}\n",
+		"negative failure limit": "environment: x\nstrategy: {soak: {failureLimit: -1}}\n",
+		"bad named strategy":     "environment: x\nstrategies: {fast: {batchSize: 0}}\n",
+		"unknown strategy field": "environment: x\nstrategies: {fast: {speed: 1}}\n",
+		"unnamed strategy":       "environment: x\nstrategies: {\"\": {batchSize: 1}}\n",
+		"strategy not a mapping": "environment: x\nstrategies: {fast: [1]}\n",
 	}
 
 	for name, raw := range cases {

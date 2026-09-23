@@ -119,7 +119,7 @@ func (c *Controller) openRollouts(ctx context.Context, now time.Time) {
 		c.rollouts[r.ID] = r
 		_ = c.saveRollout(ctx, r)
 		c.event(ctx, now, &Event{Actor: ControllerActor, Action: "rollout.created", Group: group, Rollout: r.ID,
-			Reason: fmt.Sprintf("%d targets to %s (%s)", len(eligible), r.DigestShort(), policy.Speed)})
+			Reason: fmt.Sprintf("%d targets to %s (%s)", len(eligible), r.DigestShort(), strategyLabel(policy.Strategy))})
 	}
 }
 
@@ -197,7 +197,7 @@ func (c *Controller) newRollout(now time.Time, group string, policy Policy, elig
 	r := &Rollout{
 		ID:        c.newID(),
 		Group:     group,
-		Speed:     policy.Speed,
+		Strategy:  policy.Strategy,
 		Desired:   desired,
 		Revisions: map[string]string{},
 		From:      from,
@@ -213,11 +213,11 @@ func (c *Controller) newRollout(now time.Time, group string, policy Policy, elig
 		}
 	}
 
-	preset := c.preset(policy.Speed)
+	st := c.strategy(policy.Strategy)
 
 	for _, t := range eligible {
 		wave := set.Wave(t)
-		if !preset.UsesWaves() {
+		if !st.UsesWaves() {
 			wave = 0
 		}
 
@@ -327,7 +327,7 @@ func (c *Controller) startBatch(ctx context.Context, now time.Time, r *Rollout, 
 		return
 	}
 
-	preset := c.preset(r.Speed)
+	st := c.strategy(r.Strategy)
 	wave := remaining[0].Wave
 
 	// A wave is a contiguous run of the sorted order; degraded targets sort
@@ -336,16 +336,15 @@ func (c *Controller) startBatch(ctx context.Context, now time.Time, r *Rollout, 
 	var candidates []*RolloutTarget
 
 	for _, rt := range remaining {
-		if rt.Wave != wave && preset.UsesWaves() {
+		if rt.Wave != wave && st.UsesWaves() {
 			break
 		}
 
 		candidates = append(candidates, rt)
 	}
 
-	idx := min(len(r.Batches), len(preset.Batch)-1)
-	size := preset.Batch[idx].Of(len(r.Targets))
-	budget := c.cfg.Budget.OfWeight(set.TotalWeight())
+	size := st.BatchFor(len(r.Batches)+1, len(r.Targets))
+	budget := c.cfg.DisruptionBudget.MaxUnavailable.OfWeight(set.TotalWeight())
 	busy := c.inFlightNodes(set, now)
 	inflight := c.inFlightWeight(set)
 
@@ -379,8 +378,8 @@ func (c *Controller) startBatch(ctx context.Context, now time.Time, r *Rollout, 
 
 	if len(picked) == 0 {
 		need := set.NodeWeight(candidates[0].Node)
-		c.setState(ctx, now, r, WaitingForBudget, fmt.Sprintf("Waiting for budget: %s of %s in use; next batch needs %s.",
-			pct(inflight, set.TotalWeight()), c.cfg.Budget.String(), pct(need, set.TotalWeight())))
+		c.setState(ctx, now, r, WaitingForBudget, fmt.Sprintf("Waiting for the disruption budget: %s of %s unavailable; the next batch needs %s.",
+			pct(inflight, set.TotalWeight()), c.cfg.DisruptionBudget.MaxUnavailable.String(), pct(need, set.TotalWeight())))
 
 		return
 	}
@@ -392,7 +391,7 @@ func (c *Controller) startBatch(ctx context.Context, now time.Time, r *Rollout, 
 	}
 
 	r.Batches = append(r.Batches, b)
-	c.setState(ctx, now, r, Running, fmt.Sprintf("Wave %d, batch %d of about %d: updating %d targets.", wave, b.Number, c.estimateBatches(r, &preset), len(picked)))
+	c.setState(ctx, now, r, Running, fmt.Sprintf("Wave %d, batch %d of about %d: updating %d targets.", wave, b.Number, c.estimateBatches(r, &st), len(picked)))
 	c.event(ctx, now, &Event{Actor: ControllerActor, Action: "batch.started", Group: r.Group, Rollout: r.ID,
 		Reason: fmt.Sprintf("batch %d: %d targets in wave %d", b.Number, len(picked), wave)})
 }
@@ -436,15 +435,15 @@ func (c *Controller) remaining(r *Rollout, set *targets.Set, now time.Time) []*R
 // estimateBatches guesses how many batches the rollout will have in total:
 // the ones already cut, plus what is left in each wave at the last batch
 // fraction, assuming the budget never bites.
-func (c *Controller) estimateBatches(r *Rollout, preset *config.Preset) int {
-	last := max(preset.Batch[len(preset.Batch)-1].Of(len(r.Targets)), 1)
+func (c *Controller) estimateBatches(r *Rollout, st *config.Strategy) int {
+	last := max(st.BatchSize.Of(len(r.Targets)), 1)
 	left := map[int]int{}
 
 	for i := range r.Targets {
 		rt := &r.Targets[i]
 		if rt.Batch == 0 && rt.Phase == PhasePending {
 			wave := rt.Wave
-			if !preset.UsesWaves() {
+			if !st.UsesWaves() {
 				wave = 0
 			}
 
@@ -471,6 +470,15 @@ func (c *Controller) setState(ctx context.Context, now time.Time, r *Rollout, st
 	if changed && state != Running {
 		c.event(ctx, now, &Event{Actor: ControllerActor, Action: "rollout." + lower(state), Group: r.Group, Rollout: r.ID, Reason: reason})
 	}
+}
+
+// strategyLabel names a strategy for people; the default has no name.
+func strategyLabel(name string) string {
+	if name == "" {
+		return "default strategy"
+	}
+
+	return name + " strategy"
 }
 
 func lower(s RolloutState) string {
