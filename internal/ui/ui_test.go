@@ -614,3 +614,25 @@ func TestGroupAndNodeFormsCarryTheConfirmBox(t *testing.T) {
 	require.Equal(t, http.StatusOK, code)
 	require.Contains(t, body, `disabled title="you&#39;re not listed under a" title="Lifts node=a-2"`)
 }
+
+func TestPublicReadsShowPagesButNotControls(t *testing.T) {
+	login := func(next string) string { return "/auth/login?next=" + url.QueryEscape(next) }
+	f := newFixture(t, login)
+	f.release()
+	f.cfg.Auth.PublicReads = true
+	f.auth.set(api.Identity{}, errFake)
+
+	for _, path := range []string{"/", "/groups/client/a", "/rollouts", "/nodes/a-1", "/history"} {
+		code, body := f.get(path, false)
+		require.Equal(t, http.StatusOK, code, path)
+		require.Contains(t, body, "Sign in", path)
+	}
+
+	_, body := f.get("/groups/client/a", false)
+	require.Contains(t, body, "Sign in to act.")
+
+	// Acting still sends the browser to sign in.
+	code, loc := f.post("refresh", url.Values{})
+	require.Equal(t, http.StatusFound, code)
+	require.Contains(t, loc, "/auth/login")
+}

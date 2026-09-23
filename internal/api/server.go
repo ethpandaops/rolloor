@@ -57,17 +57,15 @@ func (s *Server) Routes() http.Handler {
 
 	mux.HandleFunc("GET /healthz", s.healthz)
 	mux.HandleFunc("GET /api/v1/me", s.me)
-	mux.HandleFunc("GET /api/v1/fleet", s.fleet)
-	mux.HandleFunc("GET /api/v1/groups/{label}/{value}", s.group)
-	mux.HandleFunc("GET /api/v1/nodes/{node}", s.node)
-	mux.HandleFunc("GET /api/v1/targets", s.targetsList)
-	mux.HandleFunc("GET /api/v1/rollouts", s.rollouts)
-	mux.HandleFunc("GET /api/v1/rollouts/{id}", s.rollout)
-	mux.HandleFunc("GET /api/v1/history", s.history)
-	mux.HandleFunc("GET /api/v1/policies/{group}", s.policyGet)
 	mux.HandleFunc("PUT /api/v1/policies/{group}", s.policyPut)
-	mux.HandleFunc("GET /api/v1/suspensions", s.suspensions)
-	mux.HandleFunc("GET /api/v1/events", s.stream)
+
+	for path, h := range map[string]http.HandlerFunc{
+		"/fleet": s.fleet, "/groups/{label}/{value}": s.group, "/nodes/{node}": s.node, "/targets": s.targetsList,
+		"/rollouts": s.rollouts, "/rollouts/{id}": s.rollout, "/history": s.history, "/policies/{group}": s.policyGet,
+		"/suspensions": s.suspensions, "/events": s.stream,
+	} {
+		mux.HandleFunc("GET /api/v1"+path, s.readable(h))
+	}
 
 	for verb, h := range map[string]http.HandlerFunc{
 		"sync": s.actionSync, "refresh": s.actionRefresh, "suspend": s.actionSuspend, "resume": s.actionResume,
@@ -77,6 +75,20 @@ func (s *Server) Routes() http.Handler {
 	}
 
 	return mux
+}
+
+// readable lets a read through when reads are public or the caller has an
+// identity.
+func (s *Server) readable(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.cfg.Auth.PublicReads {
+			if _, ok := s.identity(w, r); !ok {
+				return
+			}
+		}
+
+		h(w, r)
+	}
 }
 
 func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
@@ -186,7 +198,8 @@ func (s *Server) history(w http.ResponseWriter, r *http.Request) {
 		about = s.targets().Select(sel)
 	}
 
-	query := reconcile.EventQuery{Group: q.Get("group"), Rollout: q.Get("rollout"), Target: q.Get("target"), Limit: limit}
+	after, _ := strconv.ParseInt(q.Get("after"), 10, 64)
+	query := reconcile.EventQuery{Group: q.Get("group"), Rollout: q.Get("rollout"), Target: q.Get("target"), Limit: limit, After: max(after, 0)}
 
 	var (
 		events []reconcile.Event

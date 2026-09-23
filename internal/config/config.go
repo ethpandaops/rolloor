@@ -151,15 +151,31 @@ type Policy struct {
 
 // Auth configures sign-in.
 type Auth struct {
-	Mode            string `yaml:"mode" default:"none"`
-	Issuer          string `yaml:"issuer"`
-	ClientID        string `yaml:"clientId"`
+	Mode     string `yaml:"mode" default:"none"`
+	Issuer   string `yaml:"issuer"`
+	ClientID string `yaml:"clientId"`
+	// ClientSecretEnv names the env var holding the client secret. Empty
+	// makes rolloor a public client; every login uses PKCE either way.
 	ClientSecretEnv string `yaml:"clientSecretEnv" default:"ROLLOOR_OIDC_CLIENT_SECRET"`
 	RedirectURL     string `yaml:"redirectUrl"`
 	IdentityClaim   string `yaml:"identityClaim" default:"preferred_username"`
 	AdminOwner      string `yaml:"adminOwner" default:"operators"`
 	// SessionSecretEnv names the env var holding the cookie signing key.
 	SessionSecretEnv string `yaml:"sessionSecretEnv" default:"ROLLOOR_SESSION_SECRET"`
+	// PublicReads lets anyone read the pages and API without signing in;
+	// acting always needs an identity.
+	PublicReads bool `yaml:"publicReads"`
+	// TrustedTokens are other issuers whose bearer tokens the API accepts,
+	// such as a CLI's own client.
+	TrustedTokens []TrustedToken `yaml:"trustedTokens"`
+}
+
+// TrustedToken is an issuer and audience whose ID or access tokens are
+// accepted as bearer tokens, and the claim that names the person.
+type TrustedToken struct {
+	Issuer        string `yaml:"issuer"`
+	Audience      string `yaml:"audience"`
+	IdentityClaim string `yaml:"identityClaim"`
 }
 
 // Log configures the root logger.
@@ -322,6 +338,12 @@ func (c *Config) Validate() error {
 	case "oidc":
 		if c.Auth.Issuer == "" || c.Auth.ClientID == "" || c.Auth.RedirectURL == "" {
 			return fmt.Errorf("config: auth.issuer, clientId and redirectUrl are required for oidc")
+		}
+
+		for i, t := range c.Auth.TrustedTokens {
+			if t.Issuer == "" || t.Audience == "" {
+				return fmt.Errorf("config: auth.trustedTokens[%d] needs an issuer and an audience", i)
+			}
 		}
 	default:
 		return fmt.Errorf("config: auth.mode must be none or oidc")

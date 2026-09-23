@@ -110,6 +110,21 @@ func (s *Server) viewer(w http.ResponseWriter, r *http.Request) (api.Identity, b
 	return api.Identity{}, false
 }
 
+// reader resolves the identity for a page that only shows things. With
+// public reads, a viewer who has not signed in sees the page with every
+// control disabled.
+func (s *Server) reader(w http.ResponseWriter, r *http.Request) (api.Identity, bool) {
+	if id, err := s.auth.Identity(r); err == nil {
+		return id, true
+	}
+
+	if s.cfg.Auth.PublicReads {
+		return api.Identity{}, true
+	}
+
+	return s.viewer(w, r)
+}
+
 // render writes a fragment for htmx polls and a full page otherwise.
 func (s *Server) render(w http.ResponseWriter, r *http.Request, id api.Identity, title, body string, data any) {
 	var buf bytes.Buffer
@@ -152,6 +167,10 @@ type can struct {
 }
 
 func (s *Server) canAct(id *api.Identity, owners []string) can {
+	if id.Name == "" {
+		return can{Why: "Sign in to act."}
+	}
+
 	ok, why := api.MayAct(id, owners)
 
 	return can{OK: ok, Why: why}
@@ -176,7 +195,7 @@ type fleetData struct {
 }
 
 func (s *Server) fleet(w http.ResponseWriter, r *http.Request) {
-	id, ok := s.viewer(w, r)
+	id, ok := s.reader(w, r)
 	if !ok {
 		return
 	}
@@ -222,7 +241,7 @@ type groupData struct {
 }
 
 func (s *Server) group(w http.ResponseWriter, r *http.Request) {
-	id, ok := s.viewer(w, r)
+	id, ok := s.reader(w, r)
 	if !ok {
 		return
 	}
@@ -270,7 +289,7 @@ type batchView struct {
 }
 
 func (s *Server) rollout(w http.ResponseWriter, r *http.Request) {
-	id, ok := s.viewer(w, r)
+	id, ok := s.reader(w, r)
 	if !ok {
 		return
 	}
@@ -345,7 +364,7 @@ func hasOpen(bs []batchView) bool {
 }
 
 func (s *Server) rollouts(w http.ResponseWriter, r *http.Request) {
-	id, ok := s.viewer(w, r)
+	id, ok := s.reader(w, r)
 	if !ok {
 		return
 	}
@@ -365,7 +384,7 @@ type nodeData struct {
 }
 
 func (s *Server) node(w http.ResponseWriter, r *http.Request) {
-	id, ok := s.viewer(w, r)
+	id, ok := s.reader(w, r)
 	if !ok {
 		return
 	}
@@ -403,7 +422,7 @@ type historyData struct {
 }
 
 func (s *Server) history(w http.ResponseWriter, r *http.Request) {
-	id, ok := s.viewer(w, r)
+	id, ok := s.reader(w, r)
 	if !ok {
 		return
 	}

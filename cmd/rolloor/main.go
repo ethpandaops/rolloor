@@ -414,9 +414,14 @@ func buildAuthorizer(ctx context.Context, cfg *config.Config, log observability.
 		teams = loaded
 	}
 
-	secret := os.Getenv(cfg.Auth.ClientSecretEnv)
-	if secret == "" {
-		return nil, nil, fmt.Errorf("auth: %s is not set", cfg.Auth.ClientSecretEnv)
+	// No secret env var configured means a public client.
+	var secret string
+
+	if cfg.Auth.ClientSecretEnv != "" {
+		secret = os.Getenv(cfg.Auth.ClientSecretEnv)
+		if secret == "" {
+			return nil, nil, fmt.Errorf("auth: %s is not set", cfg.Auth.ClientSecretEnv)
+		}
 	}
 
 	sessionKey := os.Getenv(cfg.Auth.SessionSecretEnv)

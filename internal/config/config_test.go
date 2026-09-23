@@ -83,19 +83,20 @@ defaultPolicy:
 
 func TestValidateErrors(t *testing.T) {
 	cases := map[string]string{
-		"missing environment":    "listen: ':1'\n",
-		"bad default strategy":   "environment: x\ndefaultPolicy: {strategy: warp}\n",
-		"bad mode":               "environment: x\ndefaultPolicy: {mode: sometimes}\n",
-		"oidc without issuer":    "environment: x\nauth: {mode: oidc}\n",
-		"unknown hook default":   "environment: x\nhooks: {defaults: {discover: d}}\n",
-		"batch selects nothing":  "environment: x\nstrategy: {batchSize: 0}\n",
-		"first batch nothing":    "environment: x\nstrategy: {firstBatch: 0%}\n",
-		"soak interval too big":  "environment: x\nstrategy: {soak: {duration: 1m, interval: 2m}}\n",
-		"negative failure limit": "environment: x\nstrategy: {soak: {failureLimit: -1}}\n",
-		"bad named strategy":     "environment: x\nstrategies: {fast: {batchSize: 0}}\n",
-		"unknown strategy field": "environment: x\nstrategies: {fast: {speed: 1}}\n",
-		"unnamed strategy":       "environment: x\nstrategies: {\"\": {batchSize: 1}}\n",
-		"strategy not a mapping": "environment: x\nstrategies: {fast: [1]}\n",
+		"missing environment":            "listen: ':1'\n",
+		"bad default strategy":           "environment: x\ndefaultPolicy: {strategy: warp}\n",
+		"bad mode":                       "environment: x\ndefaultPolicy: {mode: sometimes}\n",
+		"oidc without issuer":            "environment: x\nauth: {mode: oidc}\n",
+		"unknown hook default":           "environment: x\nhooks: {defaults: {discover: d}}\n",
+		"batch selects nothing":          "environment: x\nstrategy: {batchSize: 0}\n",
+		"first batch nothing":            "environment: x\nstrategy: {firstBatch: 0%}\n",
+		"soak interval too big":          "environment: x\nstrategy: {soak: {duration: 1m, interval: 2m}}\n",
+		"negative failure limit":         "environment: x\nstrategy: {soak: {failureLimit: -1}}\n",
+		"bad named strategy":             "environment: x\nstrategies: {fast: {batchSize: 0}}\n",
+		"unknown strategy field":         "environment: x\nstrategies: {fast: {speed: 1}}\n",
+		"unnamed strategy":               "environment: x\nstrategies: {\"\": {batchSize: 1}}\n",
+		"trusted token without audience": "environment: x\nauth: {mode: oidc, issuer: i, clientId: c, redirectUrl: r, trustedTokens: [{issuer: j}]}\n",
+		"strategy not a mapping":         "environment: x\nstrategies: {fast: [1]}\n",
 	}
 
 	for name, raw := range cases {

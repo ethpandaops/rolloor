@@ -89,6 +89,7 @@ const fleetYAML = `
 type fixture struct {
 	t     *testing.T
 	ctx   context.Context //nolint:containedctx // test fixture
+	cfg   *config.Config
 	c     *reconcile.Controller
 	store *reconcile.MemoryStore
 	world *fakeWorld
@@ -107,7 +108,7 @@ func newFixture(t *testing.T) *fixture {
 	set, err := targets.Parse([]byte(fleetYAML), &targets.Rules{GroupLabel: "client", OwnerLabel: "owner", WaveLabel: "wave", KnownHooks: config.TargetHooks})
 	require.NoError(t, err)
 
-	f := &fixture{t: t, ctx: context.Background(), store: reconcile.NewMemoryStore(), set: set,
+	f := &fixture{t: t, ctx: context.Background(), cfg: cfg, store: reconcile.NewMemoryStore(), set: set,
 		world: &fakeWorld{digest: d1, running: map[string]string{"a-1/cl": d1, "a-2/cl": d1, "b-1/el": d1, "c-1/x": d1, "c-2/x": d1}},
 		auth:  &fakeAuth{id: Identity{Name: admin, Admin: true}}, bc: NewBroadcaster()}
 
@@ -666,4 +667,55 @@ func mustSel(s string) targets.Selector {
 	}
 
 	return sel
+}
+
+func TestReadsNeedAnIdentityUnlessPublic(t *testing.T) {
+	f := newFixture(t)
+	f.auth.err = errors.New("not signed in")
+
+	code, _, _ := f.do(http.MethodGet, "/api/v1/fleet", "")
+	require.Equal(t, http.StatusUnauthorized, code)
+
+	code, _, _ = f.do(http.MethodGet, "/healthz", "")
+	require.Equal(t, http.StatusOK, code, "health is always open")
+
+	f.cfg.Auth.PublicReads = true
+
+	for _, path := range []string{"/api/v1/fleet", "/api/v1/rollouts", "/api/v1/history", "/api/v1/targets"} {
+		code, _, _ = f.do(http.MethodGet, path, "")
+		require.Equal(t, http.StatusOK, code, path)
+	}
+
+	code, _, _ = f.do(http.MethodPost, "/api/v1/actions/refresh", "{}")
+	require.Equal(t, http.StatusUnauthorized, code, "acting still needs an identity")
+}
+
+func TestHistoryAfterAnID(t *testing.T) {
+	f := newFixture(t)
+	f.release()
+
+	_, _, raw := f.do(http.MethodGet, "/api/v1/history?limit=500", "")
+
+	var all []reconcile.Event
+	require.NoError(t, json.Unmarshal([]byte(raw), &all))
+	require.Greater(t, len(all), 2)
+
+	// History is newest first; ask for everything after an id in the middle.
+	cut := all[len(all)/2].ID
+
+	want := 0
+
+	for _, e := range all {
+		if e.ID > cut {
+			want++
+		}
+	}
+
+	_, _, raw = f.do(http.MethodGet, "/api/v1/history?after="+strconv.FormatInt(cut, 10), "")
+
+	var later []reconcile.Event
+	require.NoError(t, json.Unmarshal([]byte(raw), &later))
+	require.Len(t, later, want)
+	require.Equal(t, cut+1, later[0].ID, "oldest first, starting right after the id")
+	require.Greater(t, later[len(later)-1].ID, later[0].ID)
 }

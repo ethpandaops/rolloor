@@ -20,15 +20,20 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 
+	"github.com/ethpandaops/rolloor/internal/api"
 	"github.com/ethpandaops/rolloor/internal/config"
 )
 
 const (
-	clientID   = "rolloor"
-	sessionKey = "0123456789abcdef0123456789abcdef"
-	sam        = "sam"
-	operators  = "operators"
-	alpha      = "alpha"
+	clientID      = "rolloor"
+	sessionKey    = "0123456789abcdef0123456789abcdef"
+	sam           = "sam"
+	operators     = "operators"
+	claimSub      = "sub"
+	modeOIDC      = "oidc"
+	claimUsername = "preferred_username"
+	callbackURL   = "http://app.example/auth/callback"
+	alpha         = "alpha"
 )
 
 // issuer is a fake OpenID provider: discovery, JWKS, and a token endpoint
@@ -42,6 +47,9 @@ type issuer struct {
 	claim  string
 	nonce  string
 	expiry time.Duration
+	aud    string
+	forms  []url.Values
+	basic  []string
 }
 
 func newIssuer(t *testing.T) *issuer {
@@ -50,7 +58,7 @@ func newIssuer(t *testing.T) *issuer {
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	require.NoError(t, err)
 
-	is := &issuer{key: key, name: sam, claim: "preferred_username", expiry: time.Hour}
+	is := &issuer{key: key, name: sam, claim: claimUsername, expiry: time.Hour}
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
@@ -65,6 +73,9 @@ func newIssuer(t *testing.T) *issuer {
 	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
 		require.NoError(t, r.ParseForm())
 		is.codes = append(is.codes, r.Form.Get("code"))
+		is.forms = append(is.forms, r.PostForm)
+		user, _, _ := r.BasicAuth()
+		is.basic = append(is.basic, user)
 
 		if is.fail {
 			w.WriteHeader(http.StatusBadRequest)
@@ -91,7 +102,7 @@ func (is *issuer) token(t *testing.T, name string) string {
 	require.NoError(t, err)
 
 	claims := map[string]any{
-		"iss": is.srv.URL, "aud": clientID, "sub": name, "exp": time.Now().Add(is.expiry).Unix(), "iat": time.Now().Unix(),
+		"iss": is.srv.URL, "aud": is.audience(), claimSub: name, "exp": time.Now().Add(is.expiry).Unix(), "iat": time.Now().Unix(),
 	}
 	if name != "" {
 		claims[is.claim] = name
@@ -107,10 +118,18 @@ func (is *issuer) token(t *testing.T, name string) string {
 	return raw
 }
 
+func (is *issuer) audience() string {
+	if is.aud != "" {
+		return is.aud
+	}
+
+	return clientID
+}
+
 func newOIDC(t *testing.T, is *issuer, teams *Teams) *OIDC {
 	t.Helper()
 
-	cfg := &config.Auth{Mode: "oidc", Issuer: is.srv.URL, ClientID: clientID, RedirectURL: "http://app.example/auth/callback", IdentityClaim: "preferred_username", AdminOwner: operators}
+	cfg := &config.Auth{Mode: modeOIDC, Issuer: is.srv.URL, ClientID: clientID, RedirectURL: callbackURL, IdentityClaim: claimUsername, AdminOwner: operators}
 
 	o, err := NewOIDC(context.Background(), cfg, "secret", sessionKey, teams, logrus.New())
 	require.NoError(t, err)
@@ -170,7 +189,7 @@ func TestBearerTokens(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer "+is.token(t, ""))
 	_, err = o.Identity(req)
 	require.ErrorIs(t, err, ErrNotSignedIn)
-	require.ErrorContains(t, err, "preferred_username")
+	require.ErrorContains(t, err, claimUsername)
 
 	req.Header.Set("Authorization", "Bearer not.a.token")
 	_, err = o.Identity(req)
@@ -553,4 +572,94 @@ func TestTeams(t *testing.T) {
 
 	cancel()
 	require.ErrorIs(t, <-done, context.Canceled)
+}
+
+func TestTrustedTokensFromAnotherIssuer(t *testing.T) {
+	is := newIssuer(t)
+	cli := newIssuer(t)
+	cli.aud, cli.claim = "panda-proxy", claimSub
+
+	cfg := &config.Auth{Mode: modeOIDC, Issuer: is.srv.URL, ClientID: clientID, RedirectURL: callbackURL,
+		IdentityClaim: claimUsername, AdminOwner: operators,
+		TrustedTokens: []config.TrustedToken{{Issuer: cli.srv.URL, Audience: "panda-proxy", IdentityClaim: claimSub}}}
+
+	o, err := NewOIDC(context.Background(), cfg, "secret", sessionKey, nil, logrus.New())
+	require.NoError(t, err)
+
+	bearer := func(tok string) (api.Identity, error) {
+		req := httptest.NewRequest(http.MethodGet, "/", http.NoBody)
+		req.Header.Set("Authorization", "Bearer "+tok)
+
+		return o.Identity(req)
+	}
+
+	// The CLI's token names the person in sub.
+	id, err := bearer(cli.token(t, sam))
+	require.NoError(t, err)
+	require.Equal(t, sam, id.Name)
+
+	// rolloor's own tokens still work, and a token for another audience does not.
+	id, err = bearer(is.token(t, sam))
+	require.NoError(t, err)
+	require.Equal(t, sam, id.Name)
+
+	cli.aud = "someone-else"
+	_, err = bearer(cli.token(t, sam))
+	require.ErrorIs(t, err, ErrNotSignedIn)
+
+	// The trusted entry falls back to the main identity claim.
+	cfg.TrustedTokens[0].IdentityClaim = ""
+	fallback, err := NewOIDC(context.Background(), cfg, "secret", sessionKey, nil, logrus.New())
+	require.NoError(t, err)
+	require.Equal(t, claimUsername, fallback.trusted[0].claim)
+
+	cfg.TrustedTokens[0].Issuer = "http://127.0.0.1:1"
+	_, err = NewOIDC(context.Background(), cfg, "secret", sessionKey, nil, logrus.New())
+	require.ErrorContains(t, err, "trusted issuer")
+}
+
+func TestLoginUsesPKCEAndPublicClientsSendNoSecret(t *testing.T) {
+	is := newIssuer(t)
+	cfg := &config.Auth{Mode: modeOIDC, Issuer: is.srv.URL, ClientID: clientID, RedirectURL: callbackURL, IdentityClaim: claimUsername, AdminOwner: operators}
+
+	o, err := NewOIDC(context.Background(), cfg, "", sessionKey, nil, logrus.New())
+	require.NoError(t, err)
+
+	app := httptest.NewServer(o.Middleware(http.NotFoundHandler()))
+	t.Cleanup(app.Close)
+
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+
+	resp, err := client.Get(app.URL + LoginPath)
+	require.NoError(t, err)
+	resp.Body.Close()
+
+	loc, err := url.Parse(resp.Header.Get("Location"))
+	require.NoError(t, err)
+	require.Equal(t, "S256", loc.Query().Get("code_challenge_method"))
+	require.NotEmpty(t, loc.Query().Get("code_challenge"))
+
+	var stateCk *http.Cookie
+
+	for _, c := range resp.Cookies() {
+		if c.Name == stateCookie {
+			stateCk = c
+		}
+	}
+
+	require.NotNil(t, stateCk)
+
+	is.nonce = loc.Query().Get("nonce")
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, app.URL+CallbackPath+"?state="+url.QueryEscape(stateCk.Value)+"&code=c", http.NoBody)
+	req.AddCookie(stateCk)
+	resp, err = client.Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusFound, resp.StatusCode)
+
+	require.Len(t, is.forms, 1)
+	require.NotEmpty(t, is.forms[0].Get("code_verifier"), "the token request proves the challenge")
+	require.Equal(t, clientID, is.forms[0].Get("client_id"), "a public client names itself in the form")
+	require.Empty(t, is.forms[0].Get("client_secret"))
+	require.Empty(t, is.basic[0])
 }

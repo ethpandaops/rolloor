@@ -48,7 +48,7 @@ The Docker image runs `serve` with `/etc/rolloor/config.yaml` and keeps its SQLi
 
 - **Web UI** at `/`: the fleet, groups, rollouts, nodes and history, with every control a viewer may not use disabled and the reason shown.
 - **API** under `/api/v1`: the same reads, `/actions/*` for every verb, `/events` as a server-sent event stream.
-- **Sign-in**: `auth.mode: oidc` against any OpenID Connect issuer, or `none`. A person may act on targets whose owner label is listed for them in the teams file; a selection spanning several owners needs confirming.
+- **Sign-in**: `auth.mode: oidc` against any OpenID Connect issuer (PKCE; a public client needs no secret), or `none`. `publicReads` opens the pages and reads to everyone; `trustedTokens` accepts bearer tokens minted for other clients, such as a CLI's. A person may act on targets whose owner label is listed for them in the teams file; a selection spanning several owners needs confirming.
 - **Metrics** at `/metrics` for Prometheus.
 
 ## Example

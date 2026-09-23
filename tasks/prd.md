@@ -119,11 +119,24 @@ auth:
   mode: oidc
   issuer: https://auth.example/application/o/rolloor/
   clientId: rolloor
+  # Env var holding the client secret; empty makes rolloor a public client.
+  # Every login uses PKCE.
   clientSecretEnv: ROLLOOR_OIDC_CLIENT_SECRET
+  # One client can serve many instances when the issuer allows a pattern
+  # of redirect URLs.
   redirectUrl: https://rolloor.prod-eu.example/auth/callback
   identityClaim: preferred_username
   # Members of this owner value may act on anything.
   adminOwner: operators
+  # Anyone may read pages and the API without signing in; acting always
+  # needs an identity.
+  publicReads: true
+  # Bearer tokens from other clients the API also accepts, such as a CLI's.
+  trustedTokens:
+    - issuer: https://auth.example/application/o/cli/
+      audience: cli
+      # The claim naming the person in those tokens.
+      identityClaim: sub
 ```
 
 Unknown fields are an error. `maxUnavailable` and batch sizes accept `N%` or an absolute number. The file is the only source of configuration; defaults fill what it leaves out. There are no flag or environment overrides.
@@ -254,7 +267,7 @@ The target document is the target's row from the file plus `desired` (the digest
 
 ## 7. API
 
-JSON under `/api/v1`. Reads are open to any signed-in identity. Writes check the owner rule for every target the selector matches; a selector spanning more than one owner value requires `confirm: true` in the body.
+JSON under `/api/v1`. Reads are open to any signed-in identity, or to anyone with `auth.publicReads`. Writes check the owner rule for every target the selector matches; a selector spanning more than one owner value requires `confirm: true` in the body.
 
 ```
 GET  /fleet                         groups with counts, sync/health roll-up, reason line, disruption budget, environment check
@@ -263,7 +276,7 @@ GET  /nodes/{node}                   the node: weight, labels, targets
 GET  /targets?selector=k=v,k=v       targets matching
 GET  /rollouts                       all rollouts, newest first
 GET  /rollouts/{id}                  the rollout: waves, batches, soak results, reason
-GET  /history?selector=&node=&limit= events, filtered to targets the selector or node matches
+GET  /history?selector=&node=&limit=&after= events, filtered to targets the selector or node matches; with after, only events with a greater id, oldest first
 GET  /policies/{group}               PUT replaces mode, strategy, pins (a PUT without pins unpins)
 GET  /events                         SSE: every event as it happens; a client that falls behind gets `event: gap` and reconnects with `Last-Event-ID` to have the rest replayed from the store
 POST /actions/sync                   {selector, force?, strategy?, confirm?}
@@ -279,7 +292,7 @@ GET  /me                             identity, owner values it may act on
 
 Errors: `403` with `{error, ownersRequired, ownersHeld}` so the UI can show why a control is disabled. `sync` authorizes over the whole groups the selector touches, since a rollout moves the group. Configuration comes from the file only; there are no environment or flag overrides.
 
-Auth: OIDC authorization-code flow at `/auth/login` → session cookie; the API also accepts `Authorization: Bearer <id or access token>` verified against the issuer's JWKS. `auth.mode: none` skips all of it.
+Auth: OIDC authorization-code flow with PKCE at `/auth/login` → session cookie; the API also accepts `Authorization: Bearer <id or access token>` verified against the issuer's JWKS, or against any `trustedTokens` issuer and audience. `auth.mode: none` skips all of it.
 
 ## 8. UI
 

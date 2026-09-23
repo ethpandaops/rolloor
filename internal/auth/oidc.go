@@ -36,7 +36,9 @@ const (
 // OIDC signs people in with an OpenID Connect issuer and turns the configured
 // claim into an identity with owner values.
 type OIDC struct {
-	verifier   *oidc.IDTokenVerifier
+	verifier *oidc.IDTokenVerifier
+	// trusted verify bearer tokens from other issuers or audiences.
+	trusted    []trustedVerifier
 	oauth      oauth2.Config
 	claim      string
 	adminOwner string
@@ -51,9 +53,15 @@ type OIDC struct {
 
 var _ api.Authorizer = (*OIDC)(nil)
 
-// NewOIDC discovers the issuer. teams may be nil, in which case a claim value
-// equal to an owner value grants that owner. secret is the client secret and
-// sessionKey signs cookies.
+type trustedVerifier struct {
+	verifier *oidc.IDTokenVerifier
+	claim    string
+}
+
+// NewOIDC discovers the issuer and every trusted token issuer. teams may be
+// nil, in which case a claim value equal to an owner value grants that owner.
+// secret is the client secret, empty for a public client, and sessionKey
+// signs cookies.
 func NewOIDC(ctx context.Context, cfg *config.Auth, secret, sessionKey string, teams *Teams, log observability.ContextualLogger) (*OIDC, error) {
 	if len(sessionKey) < 16 {
 		return nil, errors.New("auth: the session key must be at least 16 bytes")
@@ -66,11 +74,33 @@ func NewOIDC(ctx context.Context, cfg *config.Auth, secret, sessionKey string, t
 
 	sessions := codec{key: []byte(sessionKey)}
 
+	var trusted []trustedVerifier
+
+	for _, t := range cfg.TrustedTokens {
+		p, err := oidc.NewProvider(ctx, t.Issuer)
+		if err != nil {
+			return nil, fmt.Errorf("auth: discover trusted issuer %s: %w", t.Issuer, err)
+		}
+
+		claim := t.IdentityClaim
+		if claim == "" {
+			claim = cfg.IdentityClaim
+		}
+
+		trusted = append(trusted, trustedVerifier{verifier: p.Verifier(&oidc.Config{ClientID: t.Audience}), claim: claim})
+	}
+
+	endpoint := provider.Endpoint()
+	if secret == "" {
+		endpoint.AuthStyle = oauth2.AuthStyleInParams
+	}
+
 	return &OIDC{
 		verifier: provider.Verifier(&oidc.Config{ClientID: cfg.ClientID}),
+		trusted:  trusted,
 		oauth: oauth2.Config{
 			ClientID: cfg.ClientID, ClientSecret: secret, RedirectURL: cfg.RedirectURL,
-			Endpoint: provider.Endpoint(), Scopes: []string{oidc.ScopeOpenID, "profile", "email"},
+			Endpoint: endpoint, Scopes: []string{oidc.ScopeOpenID, "profile", "email"},
 		},
 		claim:      cfg.IdentityClaim,
 		adminOwner: cfg.AdminOwner,
@@ -118,16 +148,31 @@ func (o *OIDC) identityFor(name string) api.Identity {
 	return api.Identity{Name: name, Owners: owners, Admin: slices.Contains(owners, o.adminOwner)}
 }
 
-// nameFromToken verifies an ID token against the issuer and reads the claim.
+// nameFromToken verifies a bearer token against rolloor's own client, then
+// against each trusted issuer, and reads the identity claim.
 func (o *OIDC) nameFromToken(ctx context.Context, raw string) (string, error) {
 	name, _, err := o.verify(ctx, raw)
+	if err == nil {
+		return name, nil
+	}
 
-	return name, err
+	for _, t := range o.trusted {
+		if n, _, terr := verifyWith(ctx, t.verifier, t.claim, raw); terr == nil {
+			return n, nil
+		}
+	}
+
+	return "", err
 }
 
-// verify checks an ID token and returns the claim and the token's nonce.
+// verify checks an ID token from rolloor's own client and returns the claim
+// and the token's nonce.
 func (o *OIDC) verify(ctx context.Context, raw string) (name, nonce string, err error) {
-	tok, err := o.verifier.Verify(ctx, raw)
+	return verifyWith(ctx, o.verifier, o.claim, raw)
+}
+
+func verifyWith(ctx context.Context, v *oidc.IDTokenVerifier, claim, raw string) (name, nonce string, err error) {
+	tok, err := v.Verify(ctx, raw)
 	if err != nil {
 		return "", "", fmt.Errorf("%w: %w", ErrNotSignedIn, err)
 	}
@@ -137,9 +182,9 @@ func (o *OIDC) verify(ctx context.Context, raw string) (name, nonce string, err 
 	claims := map[string]any{}
 	_ = tok.Claims(&claims)
 
-	name, _ = claims[o.claim].(string)
+	name, _ = claims[claim].(string)
 	if name == "" {
-		return "", "", fmt.Errorf("%w: token has no %q claim", ErrNotSignedIn, o.claim)
+		return "", "", fmt.Errorf("%w: token has no %q claim", ErrNotSignedIn, claim)
 	}
 
 	return name, tok.Nonce, nil
@@ -171,7 +216,9 @@ func (o *OIDC) login(w http.ResponseWriter, r *http.Request) {
 		next = "/"
 	}
 
-	state, err := o.encode(map[string]any{"n": nonce, "next": next, "e": o.now().Add(stateTTL)})
+	verifier := oauth2.GenerateVerifier()
+
+	state, err := o.encode(map[string]any{"n": nonce, "v": verifier, "next": next, "e": o.now().Add(stateTTL)})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 
@@ -179,7 +226,7 @@ func (o *OIDC) login(w http.ResponseWriter, r *http.Request) {
 	}
 
 	setCookie(w, r, stateCookie, state, int(stateTTL.Seconds()))
-	http.Redirect(w, r, o.oauth.AuthCodeURL(state, oidc.Nonce(nonce)), http.StatusFound)
+	http.Redirect(w, r, o.oauth.AuthCodeURL(state, oidc.Nonce(nonce), oauth2.S256ChallengeOption(verifier)), http.StatusFound)
 }
 
 func (o *OIDC) callback(w http.ResponseWriter, r *http.Request) {
@@ -191,9 +238,10 @@ func (o *OIDC) callback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var st struct {
-		Nonce   string    `json:"n"`
-		Next    string    `json:"next"`
-		Expires time.Time `json:"e"`
+		Nonce    string    `json:"n"`
+		Verifier string    `json:"v"`
+		Next     string    `json:"next"`
+		Expires  time.Time `json:"e"`
 	}
 
 	if decodeErr := o.sessions.decode(c.Value, &st); decodeErr != nil || o.now().After(st.Expires) {
@@ -204,7 +252,7 @@ func (o *OIDC) callback(w http.ResponseWriter, r *http.Request) {
 
 	setCookie(w, r, stateCookie, "", -1)
 
-	tok, err := o.oauth.Exchange(r.Context(), r.URL.Query().Get("code"))
+	tok, err := o.oauth.Exchange(r.Context(), r.URL.Query().Get("code"), oauth2.VerifierOption(st.Verifier))
 	if err != nil {
 		o.log.WithContext(r.Context()).WithError(err).Warn("code exchange failed")
 		http.Error(w, "the issuer rejected the login", http.StatusBadGateway)
