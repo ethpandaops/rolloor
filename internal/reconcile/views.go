@@ -23,7 +23,7 @@ type TargetView struct {
 	Reason     string             `json:"reason"`
 	Rollout    string             `json:"rollout,omitempty"`
 	Suspension *Suspension        `json:"suspension,omitempty"`
-	Hooks      map[string]HookRun `json:"hooks,omitempty"`
+	Hooks      map[string]HookRun `json:"hookRuns,omitempty"`
 }
 
 // GroupView is the roll-up for one group.

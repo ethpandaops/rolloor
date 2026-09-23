@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Passes when the updated beacon nodes are no further behind the head than
+# the remaining ones (or 2 slots, whichever is more) and keep at least half
+# the remaining ones' median peer count. A remaining node that does not
+# answer is left out; an updated one that does not answer fails.
+set -euo pipefail
+
+doc=$(cat)
+
+# probe URL: prints "<slots behind> <peers>", or fails.
+probe() {
+  local s p
+  s=$(curl -fsS --max-time 10 "$1/eth/v1/node/syncing") || return 1
+  p=$(curl -fsS --max-time 10 "$1/eth/v1/node/peer_count") || return 1
+  [ "$(jq -r .data.el_offline <<<"$s")" = false ] || return 1
+  echo "$(jq -r .data.sync_distance <<<"$s") $(jq -r .data.connected <<<"$p")"
+}
+
+u_lag=0 u_peers=
+for url in $(jq -r '.updated[].extra.beacon' <<<"$doc"); do
+  read -r lag peers < <(probe "$url") || { echo "updated node $url does not answer"; exit 1; }
+  [ "$lag" -gt "$u_lag" ] && u_lag=$lag
+  if [ -z "$u_peers" ] || [ "$peers" -lt "$u_peers" ]; then u_peers=$peers; fi
+done
+
+r_lag=0 r_peers=()
+for url in $(jq -r '.remaining[].extra.beacon' <<<"$doc"); do
+  read -r lag peers < <(probe "$url") || continue
+  [ "$lag" -gt "$r_lag" ] && r_lag=$lag
+  r_peers+=("$peers")
+done
+
+numbers="updated=${u_lag} remaining=${r_lag} unit=slots"
+allowed=$(( r_lag > 2 ? r_lag : 2 ))
+
+if [ "$u_lag" -gt "$allowed" ]; then
+  printf 'updated nodes are %s slots behind; remaining at most %s\n%s\n' "$u_lag" "$r_lag" "$numbers"
+  exit 1
+fi
+
+if [ "${#r_peers[@]}" -eq 0 ]; then
+  [ "$u_peers" -gt 0 ] || { printf 'an updated node has no peers\n%s\n' "$numbers"; exit 1; }
+  printf 'updated at most %s slots behind with at least %s peers; nothing left to compare against\n%s\n' "$u_lag" "$u_peers" "$numbers"
+  exit 0
+fi
+
+median=$(printf '%s\n' "${r_peers[@]}" | sort -n | awk '{a[NR]=$1} END {print a[int(NR/2)+1]}')
+
+if [ $(( u_peers * 2 )) -lt "$median" ]; then
+  printf 'an updated node has %s peers; the remaining median is %s\n%s\n' "$u_peers" "$median" "$numbers"
+  exit 1
+fi
+
+printf 'updated at most %s slots behind with at least %s peers; remaining at most %s, median %s peers\n%s\n' "$u_lag" "$u_peers" "$r_lag" "$median" "$numbers"

@@ -205,7 +205,7 @@ func runHook(ctx context.Context, out interface{ Write([]byte) (int, error) }, c
 		in := reconcile.HookInput{Target: t}
 
 		if desired == "" && hook != config.HookSoak {
-			resolver, rerr := registry.NewResolver(registry.Options{AuthFile: cfg.Registry.AuthFile, PlainHTTP: cfg.Registry.PlainHTTP, Timeout: cfg.Registry.Timeout}, log)
+			resolver, rerr := registry.NewResolver(registryOptions(cfg), log)
 			if rerr != nil {
 				return rerr
 			}
@@ -293,7 +293,7 @@ func serve(ctx context.Context, configPath string) error {
 
 	runner.Hide(cfg.Auth.ClientSecretEnv, cfg.Auth.SessionSecretEnv)
 
-	resolver, err := registry.NewResolver(registry.Options{AuthFile: cfg.Registry.AuthFile, PlainHTTP: cfg.Registry.PlainHTTP, Timeout: cfg.Registry.Timeout}, log)
+	resolver, err := registry.NewResolver(registryOptions(cfg), log)
 	if err != nil {
 		return err
 	}
@@ -430,6 +430,10 @@ func buildAuthorizer(ctx context.Context, cfg *config.Config, log observability.
 	}
 
 	return oidcAuth, teams, nil
+}
+
+func registryOptions(cfg *config.Config) *registry.Options {
+	return &registry.Options{AuthFile: cfg.Registry.AuthFile, PlainHTTP: cfg.Registry.PlainHTTP, CAFile: cfg.Registry.CAFile, Timeout: cfg.Registry.Timeout}
 }
 
 // forgetRemoved drops live state for targets that were in the old set and

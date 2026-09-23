@@ -75,6 +75,8 @@ type Registry struct {
 	AuthFile string        `yaml:"authFile"`
 	// PlainHTTP lists registry hosts spoken to without TLS, for local registries.
 	PlainHTTP []string `yaml:"plainHttp"`
+	// CAFile is a PEM bundle trusted in addition to the system roots.
+	CAFile string `yaml:"caFile"`
 	// Timeout bounds one request to a registry.
 	Timeout time.Duration `yaml:"timeout" default:"30s"`
 }
@@ -104,9 +106,11 @@ type Inspect struct {
 
 // Strategy is how a rollout cuts batches and watches them.
 type Strategy struct {
-	// FirstBatch is the size of batch 1; omitted means BatchSize.
+	// FirstBatch is how many nodes batch 1 takes; omitted means BatchSize.
 	FirstBatch Fraction `yaml:"firstBatch"`
-	// BatchSize is the size of every later batch, of the rollout's targets.
+	// BatchSize is how many nodes every later batch takes, as a count or a
+	// share of the rollout's nodes. A batch takes every target the group has
+	// on each node it picks.
 	BatchSize Fraction `yaml:"batchSize"`
 	// PauseAfterFirstBatch waits for a promote once batch 1 has passed.
 	PauseAfterFirstBatch bool `yaml:"pauseAfterFirstBatch"`
@@ -115,7 +119,7 @@ type Strategy struct {
 	Soak  Soak  `yaml:"soak"`
 }
 
-// BatchFor returns how many of total targets batch n (from 1) takes.
+// BatchFor returns how many of total nodes batch n (from 1) takes.
 func (s *Strategy) BatchFor(n, total int) int {
 	if n == 1 && s.FirstBatch.set {
 		return s.FirstBatch.Of(total)

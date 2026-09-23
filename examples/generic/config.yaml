@@ -55,7 +55,7 @@ inspect:
   failureThreshold: 2
 
 strategy:
-  # Size of every batch, as a share of the rollout's targets or a count.
+  # Nodes per batch, as a share of the rollout's nodes or a count.
   batchSize: 50%
   soak:
     # How long each batch is watched before the next one starts.

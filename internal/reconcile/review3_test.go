@@ -1,6 +1,7 @@
 package reconcile
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -104,4 +105,47 @@ func TestEventsAboutPagesBackPastOnePage(t *testing.T) {
 	got, err = h.c.EventsAbout(h.ctx, about, EventQuery{})
 	require.NoError(t, err)
 	require.Empty(t, got)
+}
+
+func TestTargetViewKeepsItsHooksBesideTheirRuns(t *testing.T) {
+	h := newHarness(t, testConfig, testTargets)
+	h.prime()
+
+	raw, err := json.Marshal(h.view(tA1))
+	require.NoError(t, err)
+	require.Contains(t, string(raw), `"hooks":{"soak":"soak-a"}`)
+	require.Contains(t, string(raw), `"hookRuns":{"inspect":`)
+}
+
+func TestCompleteReasonCountsOnlyTargetsMoved(t *testing.T) {
+	r := &Rollout{Desired: map[string]string{imgA: d2}, Targets: []RolloutTarget{
+		{ID: tA1, Phase: PhasePassed}, {ID: tA2, Phase: PhasePassed},
+	}}
+	require.Equal(t, "All 2 targets on 2222222.", completeReason(r))
+
+	r.Targets = append(r.Targets, RolloutTarget{ID: tA3, Phase: PhaseSkipped})
+	require.Equal(t, "2 of 3 targets on 2222222; 1 skipped and left for the next rollout.", completeReason(r))
+}
+
+func TestSoakProgressStaysOutOfHistory(t *testing.T) {
+	h := newHarness(t, testConfig, testTargets)
+	h.prime()
+	h.release(imgA, d2)
+	h.ticks(5, 0)
+	h.ticks(4, 20*time.Second)
+
+	require.Equal(t, 1, count(h.notes.actions(), "rollout.soaking"), "one line when the soak starts, none for its checks")
+
+	events, err := h.c.Events(h.ctx, EventQuery{})
+	require.NoError(t, err)
+
+	var started string
+
+	for i := range events {
+		if events[i].Action == "batch.started" {
+			started = events[i].Reason
+		}
+	}
+
+	require.Equal(t, "batch 1: 2 targets on 2 nodes in wave 0", started)
 }

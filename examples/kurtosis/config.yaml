@@ -1,0 +1,80 @@
+# rolloor for the Kurtosis devnet example, laid out the way one devnet's
+# instance would be. run.sh runs the rolloor image with this file at
+# /etc/rolloor/config.yaml and mounts the hooks, targets and registry
+# certificate beside it.
+
+# Shown in the page header.
+environment: kurtosis-example
+
+# Where the web UI, API and metrics listen.
+listen: "127.0.0.1:8090"
+
+# The SQLite database lives here.
+dataDir: /var/lib/rolloor
+
+# run.sh writes targets.yaml here from the running enclave. On a real
+# devnet, ansible writes it from the inventory.
+targetsDir: /etc/rolloor/targets.d
+
+labels:
+  # One rollout per client: lighthouse targets move together, geth apart.
+  group: client
+  # Who may act on a target. With auth off, everyone may.
+  owner: owner
+  # Fleet page headings: el, cl, vc.
+  section: role
+
+registry:
+  # How often every tag is resolved. A devnet would use a minute or more.
+  poll: 10s
+  # The example registry signs its certificate itself.
+  caFile: /etc/rolloor/registry.crt
+
+disruptionBudget:
+  # Four nodes of 32 validators each: at most two nodes' validators may be
+  # restarting at once.
+  maxUnavailable: 50%
+
+hooks:
+  # The example's shell hooks (examples/kurtosis/hooks).
+  dir: /etc/rolloor/hooks
+  # Each hook run is killed after this long; an update must show its digest,
+  # and then pass ready, within five times this.
+  timeout: 30s
+  # Used by any target that does not name its own under `hooks`.
+  defaults:
+    inspect: inspect
+    update: update
+    ready: ready-running
+
+inspect:
+  # How often each container's running digest is read from its node.
+  interval: 10s
+  concurrency: 8
+  # Failed inspections in a row before a target reads Unknown.
+  failureThreshold: 3
+
+strategy:
+  # One node first, to catch a bad build before it spreads.
+  firstBatch: 1
+  # Then half the nodes per batch.
+  batchSize: 50%
+  soak:
+    # Watch each batch for a minute against the nodes not yet updated.
+    duration: 60s
+    # Compare every 15 seconds.
+    interval: 15s
+    # A restarted node can briefly have fewer peers; tolerate two bad checks.
+    failureLimit: 2
+
+defaultPolicy:
+  # Rollouts start as soon as a new build is seen.
+  mode: automated
+
+auth:
+  # No sign-in in CI; history records the remote address.
+  mode: none
+
+log:
+  level: info
+  format: text

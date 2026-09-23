@@ -1,0 +1,33 @@
+# ethereum-package arguments for the example devnet: four nodes, each a geth
+# execution client, a lighthouse beacon node and a separate lighthouse
+# validator client. Lighthouse comes from the example's own registry so the
+# example can publish new builds of it.
+participants:
+  - el_type: geth
+    # A fixed release, so no geth rollout starts during the example.
+    el_image: ethereum/client-go:v1.17.6
+    cl_type: lighthouse
+    # The tag rolloor follows. run.sh pushes builds A, B, C and D to it.
+    cl_image: localhost:5055/lighthouse:example
+    # The validator client runs the same image, so it moves with the beacon.
+    vc_image: localhost:5055/lighthouse:example
+    # Four identical nodes.
+    count: 4
+    # Validators per node; this is each node's weight in the targets file.
+    validator_count: 32
+    # Every node custodies all data columns; with this few nodes the network
+    # needs it to start at the current fork.
+    supernode: true
+
+network_params:
+  # Short slots and epochs so the example runs in minutes.
+  preset: minimal
+  seconds_per_slot: 6
+
+# Keep each client's data in a volume. rolloor's updater recreates
+# containers; without this, a recreated node loses its database and identity.
+# Real devnets keep data on the host, so they need nothing like it.
+persistent: true
+
+# Nothing beyond the nodes themselves.
+additional_services: []

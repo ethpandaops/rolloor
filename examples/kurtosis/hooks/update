@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Asks the node's updater to move the container to the tag's head, but only
+# when that head is the digest rolloor asked for: the updater can deploy
+# nothing else. If the tag has moved on, it leaves the container alone and
+# rolloor replaces the rollout on its next registry poll.
+set -euo pipefail
+source "$(dirname "$0")/lib.sh"
+
+target=$(cat)
+name=$(jq -r .extra.container <<<"$target")
+desired=$(jq -r .desired <<<"$target")
+
+current=$(container_field "$(updater_get "/v1/containers?name=${name}")" digest)
+if [ "$current" = "$desired" ]; then
+  echo "already running $(short "$desired")"
+  exit 0
+fi
+
+check=$(updater_post "/v1/check?container=${name}")
+if err=$(container_field "$check" error) && [ -n "$err" ] && [ "$err" != null ]; then
+  echo "updater could not read the registry: $err"
+  exit 1
+fi
+
+head=$(container_field "$check" latest_digest)
+if [ "$head" != "$desired" ]; then
+  echo "tag head is $(short "$head"), not $(short "$desired"); left as is"
+  exit 0
+fi
+
+# Async: the updater takes it and restarts the container in the background;
+# rolloor then watches inspect for the digest.
+updater_post "/v1/update?container=${name}&async=true" >/dev/null
+echo "update to $(short "$desired") started"

@@ -3,6 +3,8 @@ package registry
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -40,7 +42,10 @@ type Options struct {
 	AuthFile string
 	// PlainHTTP hosts are spoken to over http.
 	PlainHTTP []string
-	Timeout   time.Duration
+	// CAFile is a PEM bundle trusted in addition to the system roots, for
+	// registries behind a private certificate authority.
+	CAFile  string
+	Timeout time.Duration
 	// Platform selects the manifest whose config carries the revision label
 	// when a tag is a multi-platform index. "os/arch".
 	Platform string
@@ -60,7 +65,7 @@ type Resolver struct {
 }
 
 // NewResolver builds a resolver. It reads the auth file once.
-func NewResolver(opts Options, log observability.ContextualLogger) (*Resolver, error) {
+func NewResolver(opts *Options, log observability.ContextualLogger) (*Resolver, error) {
 	r := &Resolver{
 		client:    &http.Client{Timeout: opts.Timeout},
 		auths:     map[string]string{},
@@ -85,7 +90,40 @@ func NewResolver(opts Options, log observability.ContextualLogger) (*Resolver, e
 		}
 	}
 
+	if opts.CAFile != "" {
+		if err := r.trust(opts.CAFile); err != nil {
+			return nil, err
+		}
+	}
+
 	return r, nil
+}
+
+// systemRoots is x509.SystemCertPool, replaceable so its failure is testable.
+var systemRoots = x509.SystemCertPool
+
+// trust adds the certificates in a PEM file to the roots the client accepts.
+func (r *Resolver) trust(path string) error {
+	pem, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("registry: read CA file: %w", err)
+	}
+
+	pool, err := systemRoots()
+	if err != nil {
+		pool = x509.NewCertPool()
+	}
+
+	if !pool.AppendCertsFromPEM(pem) {
+		return fmt.Errorf("registry: %s holds no PEM certificates", path)
+	}
+
+	transport, _ := http.DefaultTransport.(*http.Transport)
+	transport = transport.Clone()
+	transport.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+	r.client.Transport = transport
+
+	return nil
 }
 
 func (r *Resolver) loadAuth(path string) error {

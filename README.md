@@ -16,7 +16,7 @@ The spec is `tasks/prd.md`.
 
 1. The registry is polled; a tag now points at a new digest.
 2. `inspect` reports what each container runs. Those behind form a rollout per group (the value of a configured label).
-3. Targets are sorted (already degraded first, then by `wave` label, node, id) and cut into batches (the `strategy`: `firstBatch`, `batchSize`) whose nodes fit the disruption budget.
+3. Targets are sorted (already degraded first, then by `wave` label, node, id) and cut into batches of nodes (the `strategy`: `firstBatch`, `batchSize`) that fit the disruption budget; a batch takes all of a node's targets in the group.
 4. `update` starts each update; `inspect` waits for the digest to show; `ready` waits for the container to do its job.
 5. `soak` compares the batch against the containers not yet reached, every `interval` for `duration`. Passing moves on; more than `failureLimit` failed checks halts and quarantines the batch.
 6. A newer digest supersedes a halted or running rollout; the quarantined targets go first in the next one.

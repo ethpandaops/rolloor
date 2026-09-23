@@ -2,7 +2,10 @@ package registry
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -61,7 +64,7 @@ func awkwardRegistry(t *testing.T) (*httptest.Server, string) {
 func TestRevisionFailuresLeaveDigestUsable(t *testing.T) {
 	_, host := awkwardRegistry(t)
 
-	r, err := NewResolver(Options{PlainHTTP: []string{host}}, logrus.New())
+	r, err := NewResolver(&Options{PlainHTTP: []string{host}}, logrus.New())
 	require.NoError(t, err)
 
 	for _, tag := range []string{tagJunk, "badindex", "junkchild", "badblob", "junkblob"} {
@@ -78,7 +81,7 @@ func TestRevisionFailuresLeaveDigestUsable(t *testing.T) {
 }
 
 func TestRequestBuildErrors(t *testing.T) {
-	r, err := NewResolver(Options{}, logrus.New())
+	r, err := NewResolver(&Options{}, logrus.New())
 	require.NoError(t, err)
 
 	// A host with a space cannot become a URL.
@@ -101,7 +104,7 @@ func TestRequestBuildErrors(t *testing.T) {
 }
 
 func TestCredsByAPIHost(t *testing.T) {
-	r, err := NewResolver(Options{}, logrus.New())
+	r, err := NewResolver(&Options{}, logrus.New())
 	require.NoError(t, err)
 
 	r.auths[dockerHubAPIHost] = "u:p"
@@ -118,7 +121,7 @@ func TestAuthFileHubAliases(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "config.json")
 		require.NoError(t, os.WriteFile(path, []byte(`{"auths":{"`+alias+`":{"username":"hub","password":"pw"}}}`), 0o600))
 
-		r, err := NewResolver(Options{AuthFile: path}, logrus.New())
+		r, err := NewResolver(&Options{AuthFile: path}, logrus.New())
 		require.NoError(t, err)
 		require.Equal(t, "hub:pw", r.auths[dockerHubHost], alias)
 		require.Equal(t, "hub:pw", r.creds(Reference{Host: dockerHubHost}), alias)
@@ -129,7 +132,7 @@ func TestAuthFileSkipsEmptyEntries(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	require.NoError(t, os.WriteFile(path, []byte(`{"auths":{"h":{}}}`), 0o600))
 
-	r, err := NewResolver(Options{AuthFile: path}, logrus.New())
+	r, err := NewResolver(&Options{AuthFile: path}, logrus.New())
 	require.NoError(t, err)
 	require.Empty(t, r.auths)
 }
@@ -162,9 +165,55 @@ func TestConnectionDroppedAfterToken(t *testing.T) {
 
 	host := strings.TrimPrefix(srv.URL, "http://")
 
-	r, err := NewResolver(Options{PlainHTTP: []string{host}}, logrus.New())
+	r, err := NewResolver(&Options{PlainHTTP: []string{host}}, logrus.New())
 	require.NoError(t, err)
 
 	_, err = r.Resolve(context.Background(), host+"/org/app:x")
 	require.Error(t, err)
+}
+
+func TestCAFileTrustsAPrivateRegistry(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Docker-Content-Digest", manifestDigest)
+
+		if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/manifests/") {
+			_, _ = w.Write([]byte(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"` + configDigest + `"}}`))
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	ref := strings.TrimPrefix(srv.URL, "https://") + "/app:t"
+
+	// Without the CA the certificate is refused.
+	plain, err := NewResolver(&Options{}, logrus.New())
+	require.NoError(t, err)
+	_, err = plain.Resolve(t.Context(), ref)
+	require.ErrorContains(t, err, "certificate")
+
+	dir := t.TempDir()
+	ca := filepath.Join(dir, "ca.pem")
+	require.NoError(t, os.WriteFile(ca, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw}), 0o644))
+
+	trusted, err := NewResolver(&Options{CAFile: ca}, logrus.New())
+	require.NoError(t, err)
+	got, err := trusted.Resolve(t.Context(), ref)
+	require.NoError(t, err)
+	require.Equal(t, manifestDigest, got.Digest)
+
+	// A missing file, a file with no certificates, and no system roots.
+	_, err = NewResolver(&Options{CAFile: filepath.Join(dir, "missing.pem")}, logrus.New())
+	require.ErrorContains(t, err, "read CA file")
+
+	junk := filepath.Join(dir, "junk.pem")
+	require.NoError(t, os.WriteFile(junk, []byte("not a certificate"), 0o644))
+	_, err = NewResolver(&Options{CAFile: junk}, logrus.New())
+	require.ErrorContains(t, err, "no PEM certificates")
+
+	orig := systemRoots
+	systemRoots = func() (*x509.CertPool, error) { return nil, errors.New("no roots") }
+
+	t.Cleanup(func() { systemRoots = orig })
+
+	_, err = NewResolver(&Options{CAFile: ca}, logrus.New())
+	require.NoError(t, err, "the CA file alone is enough")
 }

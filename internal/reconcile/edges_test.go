@@ -47,14 +47,16 @@ func TestTwoTargetsOnOneNodeSortByID(t *testing.T) {
 	require.Equal(t, tA3, r.Targets[2].ID)
 	require.Equal(t, "a-3/vc", r.Targets[3].ID)
 
-	// Both land in the same batch and the node costs its weight once.
+	// Batch sizes count nodes: two nodes take a-3's two targets and a-4's,
+	// and a-3 costs its weight once.
 	h.ticks(1, 0)
 	h.ticks(4, 0)
 	h.ticks(4, 20*time.Second)
 	h.tick()
 	r = h.active("a")
-	require.Equal(t, []string{tA3, "a-3/vc"}, r.Batches[1].Targets)
-	require.Equal(t, "20.0% of 50%", r.Unavailable)
+	require.Equal(t, []string{tA3, "a-3/vc", tA4}, r.Batches[1].Targets)
+	require.Equal(t, "40.0% of 50%", r.Unavailable)
+	require.Contains(t, r.Reason, "updating 3 targets on 2 nodes")
 }
 
 func TestMixedSoakProgramsInOneBatch(t *testing.T) {

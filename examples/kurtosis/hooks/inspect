@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Prints the registry digest the target's container runs, as the node's
+# updater reports it, or "none" when the node has no such container.
+set -euo pipefail
+source "$(dirname "$0")/lib.sh"
+
+target=$(cat)
+name=$(jq -r .extra.container <<<"$target")
+
+list=$(updater_get "/v1/containers?name=${name}") || { echo "updater unreachable"; exit 1; }
+digest=$(container_field "$list" digest)
+
+echo "${digest:-none}"

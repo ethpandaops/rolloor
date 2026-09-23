@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Ready when the beacon node is synced and its execution client is online.
+set -euo pipefail
+
+target=$(cat)
+beacon=$(jq -r .extra.beacon <<<"$target")
+
+s=$(curl -fsS --max-time 10 "$beacon/eth/v1/node/syncing") || { echo "beacon API unreachable"; exit 1; }
+
+if [ "$(jq -r .data.is_syncing <<<"$s")" = true ]; then
+  echo "syncing, $(jq -r .data.sync_distance <<<"$s") slots behind"
+  exit 1
+fi
+
+if [ "$(jq -r .data.el_offline <<<"$s")" = true ]; then
+  echo "execution client offline"
+  exit 1
+fi
+
+echo "synced at slot $(jq -r .data.head_slot <<<"$s")"

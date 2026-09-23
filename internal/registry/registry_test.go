@@ -144,7 +144,7 @@ func (f *fakeRegistry) host() string { return strings.TrimPrefix(f.srv.URL, "htt
 func newResolver(t *testing.T, f *fakeRegistry, authFile string) *Resolver {
 	t.Helper()
 
-	r, err := NewResolver(Options{PlainHTTP: []string{f.host()}, AuthFile: authFile, Timeout: 5 * time.Second}, logrus.New())
+	r, err := NewResolver(&Options{PlainHTTP: []string{f.host()}, AuthFile: authFile, Timeout: 5 * time.Second}, logrus.New())
 	require.NoError(t, err)
 
 	return r
@@ -236,14 +236,14 @@ func TestAuthFileErrors(t *testing.T) {
 	bad := filepath.Join(dir, "bad.json")
 	require.NoError(t, os.WriteFile(bad, []byte(`{"auths":{"h":{"auth":"%%%"}}}`), 0o600))
 
-	_, err := NewResolver(Options{AuthFile: bad}, logrus.New())
+	_, err := NewResolver(&Options{AuthFile: bad}, logrus.New())
 	require.Error(t, err)
 
 	require.NoError(t, os.WriteFile(bad, []byte(`not json`), 0o600))
-	_, err = NewResolver(Options{AuthFile: bad}, logrus.New())
+	_, err = NewResolver(&Options{AuthFile: bad}, logrus.New())
 	require.Error(t, err)
 
-	_, err = NewResolver(Options{AuthFile: filepath.Join(dir, "missing.json")}, logrus.New())
+	_, err = NewResolver(&Options{AuthFile: filepath.Join(dir, "missing.json")}, logrus.New())
 	require.Error(t, err)
 }
 
@@ -255,7 +255,7 @@ func TestChallengeWithoutRealm(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	host := strings.TrimPrefix(srv.URL, "http://")
-	r, err := NewResolver(Options{PlainHTTP: []string{host}}, logrus.New())
+	r, err := NewResolver(&Options{PlainHTTP: []string{host}}, logrus.New())
 	require.NoError(t, err)
 
 	_, err = r.Resolve(context.Background(), host+"/org/app:x")
@@ -302,7 +302,7 @@ func TestTokenEndpointFailures(t *testing.T) {
 	for _, m := range []string{"500", "empty", tagJunk} {
 		mode = m
 
-		r, err := NewResolver(Options{PlainHTTP: []string{host}}, logrus.New())
+		r, err := NewResolver(&Options{PlainHTTP: []string{host}}, logrus.New())
 		require.NoError(t, err)
 
 		_, err = r.Resolve(context.Background(), host+"/org/app:x")
@@ -311,7 +311,7 @@ func TestTokenEndpointFailures(t *testing.T) {
 
 	mode = "access"
 
-	r, err := NewResolver(Options{PlainHTTP: []string{host}}, logrus.New())
+	r, err := NewResolver(&Options{PlainHTTP: []string{host}}, logrus.New())
 	require.NoError(t, err)
 
 	res, err := r.Resolve(context.Background(), host+"/org/app:x")

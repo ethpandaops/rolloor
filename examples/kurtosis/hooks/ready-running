@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Ready when the container is running the desired digest. For containers with
+# no API of their own, such as validator clients.
+set -euo pipefail
+source "$(dirname "$0")/lib.sh"
+
+target=$(cat)
+name=$(jq -r .extra.container <<<"$target")
+desired=$(jq -r .desired <<<"$target")
+
+details=$(updater_get "/v1/containers/details?name=${name}") || { echo "updater unreachable"; exit 1; }
+running=$(container_field "$details" running)
+digest=$(container_field "$details" digest)
+
+[ "$running" = true ] || { echo "$name is not running"; exit 1; }
+[ "$digest" = "$desired" ] || { echo "$name runs $(short "$digest"), not $(short "$desired")"; exit 1; }
+
+echo "$name running $(short "$digest")"

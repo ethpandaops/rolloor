@@ -304,8 +304,8 @@ func TestNodeDegradedCostsNothingForAllItsTargets(t *testing.T) {
 	h.release(imgA, d3)
 
 	r := h.active("a")
-	require.Equal(t, []string{tA3, "a-3/vc"}, r.Batches[0].Targets)
-	require.Equal(t, "0.0% of 50%", r.Unavailable)
+	require.Equal(t, []string{tA3, "a-3/vc", tA4}, r.Batches[0].Targets)
+	require.Equal(t, "0.0% of 50%", r.Unavailable, "both nodes were quarantined in the halted batch, so both are free")
 }
 
 func TestRestartRerunsInterruptedUpdates(t *testing.T) {

@@ -316,7 +316,7 @@ func (c *Controller) inFlightWeight(set *targets.Set) float64 {
 func (c *Controller) startBatch(ctx context.Context, now time.Time, r *Rollout, set *targets.Set) {
 	remaining := c.remaining(r, set, now)
 	if len(remaining) == 0 {
-		c.finish(ctx, now, r, Complete, fmt.Sprintf("All %d targets on %s.", len(r.Targets), r.DigestShort()))
+		c.finish(ctx, now, r, Complete, completeReason(r))
 
 		return
 	}
@@ -343,7 +343,9 @@ func (c *Controller) startBatch(ctx context.Context, now time.Time, r *Rollout, 
 		candidates = append(candidates, rt)
 	}
 
-	size := st.BatchFor(len(r.Batches)+1, len(r.Targets))
+	// Batch sizes count nodes: a batch takes every target the group has on
+	// each node it picks.
+	size := st.BatchFor(len(r.Batches)+1, len(rolloutNodes(r)))
 	budget := c.cfg.DisruptionBudget.MaxUnavailable.OfWeight(set.TotalWeight())
 	busy := c.inFlightNodes(set, now)
 	inflight := c.inFlightWeight(set)
@@ -355,20 +357,20 @@ func (c *Controller) startBatch(ctx context.Context, now time.Time, r *Rollout, 
 	)
 
 	for _, rt := range candidates {
-		if len(picked) >= size {
-			break
-		}
-
-		w := set.NodeWeight(rt.Node)
-		if _, already := busy[rt.Node]; already || c.nodeDegraded(set, r, rt.Node) {
-			w = 0
-		}
-
-		if _, seen := nodes[rt.Node]; !seen && inflight+cost+w > budget && w > 0 {
-			continue
-		}
-
 		if _, seen := nodes[rt.Node]; !seen {
+			if len(nodes) >= size {
+				continue
+			}
+
+			w := set.NodeWeight(rt.Node)
+			if _, already := busy[rt.Node]; already || c.nodeDegraded(set, r, rt.Node) {
+				w = 0
+			}
+
+			if inflight+cost+w > budget && w > 0 {
+				continue
+			}
+
 			nodes[rt.Node] = struct{}{}
 			cost += w
 		}
@@ -391,9 +393,9 @@ func (c *Controller) startBatch(ctx context.Context, now time.Time, r *Rollout, 
 	}
 
 	r.Batches = append(r.Batches, b)
-	c.setState(ctx, now, r, Running, fmt.Sprintf("Wave %d, batch %d of about %d: updating %d targets.", wave, b.Number, c.estimateBatches(r, &st), len(picked)))
+	c.setState(ctx, now, r, Running, fmt.Sprintf("Wave %d, batch %d of about %d: updating %d targets on %d nodes.", wave, b.Number, c.estimateBatches(r, &st), len(picked), len(nodes)))
 	c.event(ctx, now, &Event{Actor: ControllerActor, Action: "batch.started", Group: r.Group, Rollout: r.ID,
-		Reason: fmt.Sprintf("batch %d: %d targets in wave %d", b.Number, len(picked), wave)})
+		Reason: fmt.Sprintf("batch %d: %d targets on %d nodes in wave %d", b.Number, len(picked), len(nodes), wave)})
 }
 
 // remaining lists targets not yet batched, skipping ones that have since been
@@ -436,8 +438,8 @@ func (c *Controller) remaining(r *Rollout, set *targets.Set, now time.Time) []*R
 // the ones already cut, plus what is left in each wave at the last batch
 // fraction, assuming the budget never bites.
 func (c *Controller) estimateBatches(r *Rollout, st *config.Strategy) int {
-	last := max(st.BatchSize.Of(len(r.Targets)), 1)
-	left := map[int]int{}
+	last := max(st.BatchSize.Of(len(rolloutNodes(r))), 1)
+	left := map[int]map[string]struct{}{}
 
 	for i := range r.Targets {
 		rt := &r.Targets[i]
@@ -447,19 +449,55 @@ func (c *Controller) estimateBatches(r *Rollout, st *config.Strategy) int {
 				wave = 0
 			}
 
-			left[wave]++
+			if left[wave] == nil {
+				left[wave] = map[string]struct{}{}
+			}
+
+			left[wave][rt.Node] = struct{}{}
 		}
 	}
 
 	total := len(r.Batches)
-	for _, n := range left {
-		total += (n + last - 1) / last
+	for _, nodes := range left {
+		total += (len(nodes) + last - 1) / last
 	}
 
 	return total
 }
 
+// rolloutNodes is the set of nodes a rollout's targets are on.
+func rolloutNodes(r *Rollout) map[string]struct{} {
+	nodes := map[string]struct{}{}
+	for i := range r.Targets {
+		nodes[r.Targets[i].Node] = struct{}{}
+	}
+
+	return nodes
+}
+
+// completeReason says how a rollout ended, counting only targets it moved.
+func completeReason(r *Rollout) string {
+	moved, skipped := 0, 0
+
+	for i := range r.Targets {
+		switch r.Targets[i].Phase {
+		case PhasePassed:
+			moved++
+		case PhaseSkipped:
+			skipped++
+		case PhasePending, PhaseUpdating, PhaseReady, PhaseFailed:
+		}
+	}
+
+	if skipped == 0 {
+		return fmt.Sprintf("All %d targets on %s.", moved, r.DigestShort())
+	}
+
+	return fmt.Sprintf("%d of %d targets on %s; %d skipped and left for the next rollout.", moved, len(r.Targets), r.DigestShort(), skipped)
+}
+
 func (c *Controller) setState(ctx context.Context, now time.Time, r *Rollout, state RolloutState, reason string) {
+	prev := r.State
 	changed := r.State != state || r.Reason != reason
 	r.State = state
 	r.Reason = reason
@@ -467,7 +505,10 @@ func (c *Controller) setState(ctx context.Context, now time.Time, r *Rollout, st
 
 	_ = c.saveRollout(ctx, r)
 
-	if changed && state != Running {
+	// History records moves between states; a soak's running progress is
+	// only shown on the rollout itself.
+	progress := state == Soaking && prev == Soaking
+	if changed && state != Running && !progress {
 		c.event(ctx, now, &Event{Actor: ControllerActor, Action: "rollout." + lower(state), Group: r.Group, Rollout: r.ID, Reason: reason})
 	}
 }

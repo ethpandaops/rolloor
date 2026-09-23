@@ -82,9 +82,10 @@ inspect:
   failureThreshold: 3
 
 strategy:
-  # Size of batch 1; omitted means batchSize.
+  # Nodes in batch 1; omitted means batchSize.
   firstBatch: 1
-  # Size of every later batch, of the rollout's targets ("10%") or a count.
+  # Nodes in every later batch, as a share of the rollout's nodes ("10%") or
+  # a count. A batch takes every target the group has on each node it picks.
   batchSize: 10%
   # Wait for a promote once batch 1 has passed.
   pauseAfterFirstBatch: true
@@ -199,11 +200,11 @@ The loop ticks every few seconds (a fixed cadence in `main`), and at once on `sy
 
 ### 4.1 Sort and batch
 
-Rollout targets are the group's OutOfSync targets at creation, minus Suspended and Unknown. Order: `Degraded` first, then by `wave` ascending, then by node name, then by `id`. Targets on the same node are adjacent so they land in the same batch when the fraction allows.
+Rollout targets are the group's OutOfSync targets at creation, minus Suspended and Unknown. Order: `Degraded` first, then by `wave` ascending, then by node name, then by `id`. Targets on the same node are adjacent and always land in the same batch.
 
 A wave is the run of targets sharing a `wave` value. Batches are cut inside a wave. If the strategy has `waves: false`, the whole rollout is one wave.
 
-Batch size: `firstBatch` for batch 1 (if set), `batchSize` for every batch after, as a share of the rollout's target count or a count. The batch is then trimmed to the disruption budget: walk the sorted list, adding a target if its node is already in the batch or if adding the node's weight keeps unavailable weight ≤ `maxUnavailable`. A batch is never empty when the budget allows any node; if nothing fits, the rollout waits in `WaitingForBudget` with the numbers.
+Batch size: `firstBatch` nodes for batch 1 (if set), `batchSize` nodes for every batch after, as a count or a share of the rollout's nodes; a batch takes every rollout target on each node it picks. The batch is then trimmed to the disruption budget: walk the sorted list, adding a target if its node is already in the batch or if adding the node's weight keeps unavailable weight ≤ `maxUnavailable`. A batch is never empty when the budget allows any node; if nothing fits, the rollout waits in `WaitingForBudget` with the numbers.
 
 Unavailable weight = sum over nodes with any target `Progressing`, across all rollouts in the environment, excluding nodes that were `Degraded` before their update began. Weight-zero nodes never use the budget. Total weight = sum of all nodes' weights, including Suspended and Unknown.
 

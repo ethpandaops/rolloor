@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Ready when the execution client has finished syncing.
+set -euo pipefail
+
+target=$(cat)
+rpc=$(jq -r .extra.rpc <<<"$target")
+
+r=$(curl -fsS --max-time 10 -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"eth_syncing","params":[]}' "$rpc") || { echo "execution API unreachable"; exit 1; }
+
+[ "$(jq -c .result <<<"$r")" = false ] || { echo "syncing"; exit 1; }
+
+echo "synced"
