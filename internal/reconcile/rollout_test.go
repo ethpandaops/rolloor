@@ -310,6 +310,85 @@ func TestWaitingForBudgetSaysHowMuch(t *testing.T) {
 	require.Equal(t, Complete, h.drive(rb.ID, 200, 20*time.Second).State)
 }
 
+// budgetConfig allows 120 of the 400 weight in the budget fleets below: one
+// weighted node at a time, never two.
+var budgetConfig = replaceLine(testConfig, "maxUnavailable: 50%", "maxUnavailable: 30%")
+
+// quarantine halts group b's rollout of d2 on n1/b, leaving it Degraded.
+func (h *harness) quarantine() {
+	h.t.Helper()
+	h.world.set(func(w *world) { w.updateFail["n1/b"] = "boom" })
+	h.release(imgB, d2)
+
+	for i := 0; i < 4 && h.active("b").State != Halted; i++ {
+		h.tick()
+	}
+
+	require.Equal(h.t, Halted, h.active("b").State)
+	h.world.set(func(w *world) { delete(w.updateFail, "n1/b") })
+}
+
+func TestRetryStaysWithinBudget(t *testing.T) {
+	h := newHarness(t, budgetConfig, `
+- {id: n1/b, node: n1, weight: 100, image: org/b:t, labels: {client: b, owner: b, wave: "1"}}
+- {id: n2/a, node: n2, weight: 100, image: org/a:t, labels: {client: a, owner: a, wave: "1"}}
+- {id: n3/s, node: n3, weight: 200, image: org/s:t, labels: {client: side, owner: operators}}
+`)
+	h.prime()
+	h.quarantine()
+
+	// While n1 is quarantined it costs nothing, so a may use the budget.
+	h.world.set(func(w *world) { w.notReady["n2/a"] = true })
+	h.release(imgA, d2)
+
+	start, _ := h.unavailable()
+	require.InDelta(t, 100, start, 0)
+
+	// Retrying the halted batch puts n1 back under the budget.
+	require.NoError(t, h.c.Retry(h.ctx, actor, h.active("b").ID, "fixed the host"))
+
+	for i := range 4 {
+		h.tick()
+
+		used, allowed := h.unavailable()
+		require.LessOrEqual(t, used, allowed, "tick %d after the retry", i)
+	}
+}
+
+func TestQuarantineClearedOnSharedNodeStaysWithinBudget(t *testing.T) {
+	h := newHarness(t, budgetConfig, `
+- {id: n1/a, node: n1, weight: 100, image: org/a:t, labels: {client: a, owner: a, wave: "1"}}
+- {id: n1/b, node: n1, weight: 100, image: org/b:t, labels: {client: b, owner: b, wave: "1"}}
+- {id: n2/a, node: n2, weight: 100, image: org/a:t, labels: {client: a, owner: a, wave: "1"}}
+- {id: n3/s, node: n3, weight: 200, image: org/s:t, labels: {client: side, owner: operators}}
+`)
+	h.prime()
+	h.quarantine()
+
+	// New builds for both groups: b moves n1/b again, and a takes n1/a for
+	// free beside it plus n2/a at full weight. a's targets stay in flight.
+	h.world.set(func(w *world) {
+		w.notReady["n1/a"], w.notReady["n2/a"] = true, true
+		w.registry[imgA], w.registry[imgB] = d2, d3
+	})
+	h.clock.Advance(h.cfg.Registry.Poll)
+	h.tick()
+
+	rb := h.active("b").ID
+	start, _ := h.unavailable()
+	require.InDelta(t, 100, start, 0)
+
+	// b's batch finishing lifts n1/b's quarantine while a is still moving n1.
+	// Whether b may finish then, or must wait for the budget, is the fix's to
+	// decide; the count must hold either way.
+	for i := 0; i < 8 && h.rollout(rb).State.Active(); i++ {
+		h.tick()
+
+		used, allowed := h.unavailable()
+		require.LessOrEqual(t, used, allowed, "tick %d", i)
+	}
+}
+
 func TestEnvironmentCheckPausesAutomatedOnly(t *testing.T) {
 	cfg := testConfig + "\n"
 	cfg = replaceLine(cfg, "  defaults: {soak: \"\"}", "  defaults: {soak: \"\"}\n  environment: {program: env, interval: 30s}")
