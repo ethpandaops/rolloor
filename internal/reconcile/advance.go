@@ -107,7 +107,8 @@ func (c *Controller) planRollout(ctx context.Context, now time.Time, r *Rollout,
 // retryBatch reopens a halted batch. A failed target already running the
 // digest goes back to waiting for inspect to confirm it, so nothing is claimed
 // that was not observed; one that is not gets its update run again. The
-// batch's earlier soak attempts stay on the record.
+// batch's earlier soak attempts stay on the record. A retried target's update
+// begins while it is quarantined, so like any degraded node's it is free.
 func (c *Controller) retryBatch(ctx context.Context, now time.Time, r *Rollout) {
 	r.RetryPending = false
 	r.Soak = SoakProgress{}
@@ -130,6 +131,7 @@ func (c *Controller) retryBatch(ctx context.Context, now time.Time, r *Rollout) 
 				rt.Phase, rt.Reason, rt.UpdateDone = PhasePending, "retrying: running the update again", false
 			}
 
+			_, rt.Free = c.degraded[id]
 			delete(c.degraded, id)
 			_ = c.persist(ctx, c.store.ClearDegraded(ctx, id))
 		}

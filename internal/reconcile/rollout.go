@@ -249,16 +249,17 @@ func (c *Controller) newRollout(now time.Time, group string, policy Policy, elig
 }
 
 // inFlightNodes lists every node with a target mid-update across all
-// rollouts, plus nodes a finished rollout may still be changing, excluding
-// nodes that are already degraded.
-func (c *Controller) inFlightNodes(set *targets.Set, now time.Time) map[string]struct{} {
+// rollouts, plus nodes a finished rollout may still be changing. A target
+// admitted while its node was already degraded does not count, even once
+// that node's quarantine is lifted: the budget was never charged for it.
+func (c *Controller) inFlightNodes(now time.Time) map[string]struct{} {
 	nodes := map[string]struct{}{}
 
 	for _, r := range c.rollouts {
 		if !r.State.Active() {
 			for i := range r.Targets {
 				rt := &r.Targets[i]
-				if now.Before(rt.HoldUntil) && !c.nodeDegraded(set, r, rt.Node) {
+				if now.Before(rt.HoldUntil) && !rt.Free {
 					nodes[rt.Node] = struct{}{}
 				}
 			}
@@ -273,7 +274,7 @@ func (c *Controller) inFlightNodes(set *targets.Set, now time.Time) map[string]s
 
 		for _, id := range b.Targets {
 			rt := r.target(id)
-			if rt != nil && rt.Phase != PhaseSkipped && !c.nodeDegraded(set, r, rt.Node) {
+			if rt != nil && rt.Phase != PhaseSkipped && !rt.Free {
 				nodes[rt.Node] = struct{}{}
 			}
 		}
@@ -304,7 +305,7 @@ func (c *Controller) nodeDegraded(set *targets.Set, r *Rollout, node string) boo
 // inFlightWeight is the weight of the in-flight nodes.
 func (c *Controller) inFlightWeight(set *targets.Set) float64 {
 	var w float64
-	for n := range c.inFlightNodes(set, c.clock.Now()) {
+	for n := range c.inFlightNodes(c.clock.Now()) {
 		w += set.NodeWeight(n)
 	}
 
@@ -347,12 +348,14 @@ func (c *Controller) startBatch(ctx context.Context, now time.Time, r *Rollout, 
 	// each node it picks.
 	size := st.BatchFor(len(r.Batches)+1, len(rolloutNodes(r)))
 	budget := c.cfg.DisruptionBudget.MaxUnavailable.OfWeight(set.TotalWeight())
-	busy := c.inFlightNodes(set, now)
+	busy := c.inFlightNodes(now)
 	inflight := c.inFlightWeight(set)
 
+	// nodes maps each picked node to whether it was already degraded, which
+	// makes it free for as long as this batch's updates are in flight.
 	var (
 		picked []*RolloutTarget
-		nodes  = map[string]struct{}{}
+		nodes  = map[string]bool{}
 		cost   float64
 	)
 
@@ -362,8 +365,10 @@ func (c *Controller) startBatch(ctx context.Context, now time.Time, r *Rollout, 
 				continue
 			}
 
+			free := c.nodeDegraded(set, r, rt.Node)
+
 			w := set.NodeWeight(rt.Node)
-			if _, already := busy[rt.Node]; already || c.nodeDegraded(set, r, rt.Node) {
+			if _, already := busy[rt.Node]; already || free {
 				w = 0
 			}
 
@@ -371,7 +376,7 @@ func (c *Controller) startBatch(ctx context.Context, now time.Time, r *Rollout, 
 				continue
 			}
 
-			nodes[rt.Node] = struct{}{}
+			nodes[rt.Node] = free
 			cost += w
 		}
 
@@ -388,7 +393,7 @@ func (c *Controller) startBatch(ctx context.Context, now time.Time, r *Rollout, 
 
 	b := Batch{Number: len(r.Batches) + 1, Wave: wave, StartedAt: now}
 	for _, rt := range picked {
-		rt.Batch = b.Number
+		rt.Batch, rt.Free = b.Number, nodes[rt.Node]
 		b.Targets = append(b.Targets, rt.ID)
 	}
 

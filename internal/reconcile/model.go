@@ -133,6 +133,10 @@ type RolloutTarget struct {
 	// DegradedBefore marks a target that was already Degraded when the
 	// rollout began, so its node costs nothing against the budget.
 	DegradedBefore bool `json:"degradedBefore,omitempty"`
+	// Free marks a target whose node was already degraded when its update
+	// was admitted: the node costs nothing against the budget while that
+	// update is in flight, even if the quarantine is lifted meanwhile.
+	Free bool `json:"free,omitempty"`
 	// HoldUntil keeps the node counted against the budget after the rollout
 	// ended while this target's update may still be landing.
 	HoldUntil time.Time `json:"holdUntil,omitzero"`
