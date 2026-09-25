@@ -120,7 +120,7 @@ func TestBudgetStaysHeldWhileAnEndedRolloutMayStillBeLanding(t *testing.T) {
 	h.clock.Advance(h.cfg.Hooks.Timeout*5 + time.Second)
 
 	h.c.mu.Lock()
-	busy := h.c.inFlightNodes(h.set, h.clock.Now())
+	busy := h.c.inFlightNodes(h.clock.Now())
 	h.c.mu.Unlock()
 	require.NotContains(t, busy, tA4[:3], "a-4 is no longer held")
 	require.Contains(t, busy, "a-3", "still in group b's open batch")

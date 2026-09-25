@@ -457,6 +457,17 @@ func (h *harness) phases(r RolloutView) map[string]TargetPhase {
 	return out
 }
 
+// unavailable is the weight the controller counts as mid-update, and the
+// weight the disruption budget allows.
+func (h *harness) unavailable() (used, allowed float64) {
+	set := h.current()
+
+	h.c.mu.RLock()
+	defer h.c.mu.RUnlock()
+
+	return h.c.inFlightWeight(set), h.cfg.DisruptionBudget.MaxUnavailable.OfWeight(set.TotalWeight())
+}
+
 func (h *harness) view(id string) TargetView {
 	h.t.Helper()
 
