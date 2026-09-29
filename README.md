@@ -62,13 +62,11 @@ Needs docker, curl and jq. Six nginx containers on a local registry: rolloor mov
 ## Develop
 
 ```sh
-make test      # go test -race
-make cover     # coverage floors per package (100% where decisions are made)
-make lint      # golangci-lint and the word lint
-make simulate  # the controller simulation at 10,000 seeds
-make fuzz      # every fuzz target for FUZZTIME (1m)
+make test     # go test -race
+make cover    # coverage floors per package (100% where decisions are made)
+make lint     # golangci-lint and the word lint
 ```
 
-The simulation (`internal/reconcile/property_test.go`) drives random fleets through builds, failing programs, verbs, targets-file edits, restarts, crashes mid-tick and store outages, and checks after every step that the disruption budget holds, no update runs before its batch is stored, suspended and held rollouts stay untouched, and batches keep their size and wave order. At the end every failure is healed and every target must reach its desired build. `make test` runs 100 seeds, CI 10,000 and a nightly run far more. A failing seed reproduces with `ROLLOOR_SIM_SEED=<n> go test -run TestPropertyControllerInvariants ./internal/reconcile`; a failing fuzz input is saved under the package's `testdata/fuzz`, and committing it keeps it in every run.
+`internal/reconcile/property_test.go` runs the controller through random fleets, failures, verbs, restarts, crashes and store outages, checking the budget and the other rules after every step and that everything converges once the failures stop. A failing seed reproduces with `ROLLOOR_SIM_SEED=<n>`.
 
 Go 1.25. Nothing in this repository is specific to a workload; deployments bring their own hooks and targets. `scripts/lint-words.sh` fails the build if the first workload's words appear in any tracked file.

@@ -2,6 +2,7 @@ package reconcile
 
 import (
 	"fmt"
+	"math/rand/v2"
 	"slices"
 	"strings"
 )
@@ -26,7 +27,7 @@ type propFleet struct {
 	weights map[string]int
 }
 
-func newPropFleet(rng chooser) *propFleet {
+func newPropFleet(rng *rand.Rand) *propFleet {
 	f := &propFleet{weights: map[string]int{}}
 
 	soaks := map[string]bool{}
@@ -107,7 +108,7 @@ func (f *propFleet) nodes() []string {
 // edit changes the file the way a re-rendered inventory would: a target
 // leaves or comes back, a node's weight changes, or a target moves to
 // another node or group. It returns what it did, or "" for nothing.
-func (f *propFleet) edit(rng chooser) string {
+func (f *propFleet) edit(rng *rand.Rand) string {
 	switch rng.IntN(5) {
 	case 0:
 		if len(f.targets) < 2 {
@@ -151,7 +152,7 @@ func (f *propFleet) edit(rng chooser) string {
 	}
 }
 
-func propConfig(rng chooser) string {
+func propConfig(rng *rand.Rand) string {
 	budget := []string{"10%", "25%", "40%", "60%", "100"}[rng.IntN(5)]
 	batch := []string{"1", "2", "3", "50%", "100%"}[rng.IntN(5)]
 	soak := []string{"0s", "40s"}[rng.IntN(2)]

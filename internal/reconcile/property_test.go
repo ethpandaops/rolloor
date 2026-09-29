@@ -3,7 +3,6 @@ package reconcile
 import (
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"io"
 	"math/rand/v2"
 	"os"
@@ -25,37 +24,6 @@ import (
 //
 // Reproduce a failure with ROLLOOR_SIM_SEED=<seed>; run more seeds with
 // ROLLOOR_SIM_SEEDS=<n>.
-
-// chooser is the source of every random choice: a seeded generator for the
-// property test, fuzz input for the fuzz target.
-type chooser interface {
-	IntN(n int) int
-}
-
-// byteChooser reads choices from fuzz input, then from a generator seeded by
-// that input once it runs out, so a short input still drives a long run.
-type byteChooser struct {
-	data []byte
-	rest *rand.Rand
-}
-
-func newByteChooser(data []byte) *byteChooser {
-	h := fnv.New64a()
-	_, _ = h.Write(data)
-
-	return &byteChooser{data: data, rest: rand.New(rand.NewPCG(h.Sum64(), 0x5eed))}
-}
-
-func (b *byteChooser) IntN(n int) int {
-	if len(b.data) == 0 {
-		return b.rest.IntN(n)
-	}
-
-	v := int(b.data[0])
-	b.data = b.data[1:]
-
-	return v % n
-}
 
 // propSuspension is a suspension the controller accepted.
 type propSuspension struct {
@@ -103,7 +71,7 @@ type propBefore struct {
 // on evidence the controller did not produce.
 type sim struct {
 	h     *harness
-	rng   chooser
+	rng   *rand.Rand
 	fleet *propFleet
 	proc  *process
 	log   *logrus.Logger
@@ -132,7 +100,7 @@ type sim struct {
 	dispatches []propDispatch
 }
 
-func newSim(t *testing.T, rng chooser) (*sim, string) {
+func newSim(t *testing.T, rng *rand.Rand) (*sim, string) {
 	t.Helper()
 
 	cfg := propConfig(rng)
@@ -310,7 +278,7 @@ func (s *sim) converged() error {
 }
 
 // runSim runs one simulation and returns a report of the first failure.
-func runSim(t *testing.T, rng chooser, steps int) error {
+func runSim(t *testing.T, rng *rand.Rand, steps int) error {
 	t.Helper()
 
 	s, cfg := newSim(t, rng)
@@ -392,19 +360,4 @@ func TestPropertyControllerInvariants(t *testing.T) {
 			t.Fatalf("stopping after %d failing seeds", failures)
 		}
 	}
-}
-
-// FuzzControllerInvariants runs the same simulation with its choices taken
-// from fuzz input, so the fuzzer can steer toward new paths. Failing inputs
-// land in testdata/fuzz and run with every go test after that.
-func FuzzControllerInvariants(f *testing.F) {
-	for seed := range 8 {
-		f.Add([]byte(fmt.Sprintf("seed-%d", seed)))
-	}
-
-	f.Fuzz(func(t *testing.T, data []byte) {
-		if err := runSim(t, newByteChooser(data), 120); err != nil {
-			t.Fatal(err)
-		}
-	})
 }

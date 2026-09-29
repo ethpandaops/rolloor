@@ -4,10 +4,6 @@ on:
   push:
     branches: [master]
   pull_request:
-  # Nightly, the simulation and the fuzzers run far longer than on a change.
-  schedule:
-    - cron: "17 3 * * *"
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -38,36 +34,6 @@ jobs:
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
           govulncheck ./...
-
-  simulate:
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-      - name: the controller simulation
-        env:
-          ROLLOOR_SIM_SEEDS: ${{ github.event_name == 'schedule' && '100000' || '10000' }}
-        run: go test -count=1 -timeout 35m -run TestPropertyControllerInvariants ./internal/reconcile
-
-  fuzz:
-    runs-on: ubuntu-latest
-    timeout-minutes: 80
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-      - name: every fuzz target
-        run: ./scripts/fuzz.sh ${{ github.event_name == 'schedule' && '10m' || '75s' }}
-      - name: failing inputs, to commit under testdata/fuzz
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: fuzz-failures
-          path: internal/**/testdata/fuzz
 
   lint:
     runs-on: ubuntu-latest

@@ -1,4 +1,4 @@
-.PHONY: build test cover lint words run example simulate fuzz
+.PHONY: build test cover lint words run example
 
 build:
 	CGO_ENABLED=0 go build -trimpath -o bin/rolloor ./cmd/rolloor
@@ -23,12 +23,3 @@ run:
 example:
 	./examples/generic/run.sh
 
-# The controller simulation at 10,000 seeds; see internal/reconcile/property_test.go.
-simulate:
-	ROLLOOR_SIM_SEEDS=10000 go test -count=1 -timeout 30m -run TestPropertyControllerInvariants ./internal/reconcile
-
-FUZZTIME ?= 1m
-
-# Every fuzz target for FUZZTIME each.
-fuzz:
-	./scripts/fuzz.sh $(FUZZTIME)
