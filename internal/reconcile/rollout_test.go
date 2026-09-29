@@ -1,6 +1,7 @@
 package reconcile
 
 import (
+	"slices"
 	"testing"
 	"time"
 
@@ -317,7 +318,7 @@ var budgetConfig = replaceLine(testConfig, "maxUnavailable: 50%", "maxUnavailabl
 // quarantine halts group b's rollout of d2 on n1/b, leaving it Degraded.
 func (h *harness) quarantine() {
 	h.t.Helper()
-	h.world.set(func(w *world) { w.updateFail["n1/b"] = "boom" })
+	h.world.set(func(w *world) { w.updateFail["n1/b"] = boom })
 	h.release(imgB, d2)
 
 	for i := 0; i < 4 && h.active("b").State != Halted; i++ {
@@ -581,7 +582,7 @@ func TestPauseAndPromote(t *testing.T) {
 func TestCarefulPresetPausesAfterFirstTarget(t *testing.T) {
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
-	require.NoError(t, h.c.SetPolicy(h.ctx, actor, "a", Policy{Mode: ModeAutomated, Strategy: "careful"}))
+	require.NoError(t, h.c.SetPolicy(h.ctx, actor, "a", Policy{Mode: ModeAutomated, Strategy: careful}))
 	h.release(imgA, d2)
 
 	r := h.active("a")
@@ -871,4 +872,142 @@ func TestSupersededMidBatchSkipsInFlightTargets(t *testing.T) {
 	require.Equal(t, PhaseSkipped, h.phases(old)[tA1])
 	require.Equal(t, "Superseded", old.Targets[0].Reason)
 	require.Equal(t, "3333333", h.active("a").Digest)
+}
+
+func TestSyncLiftsAQuarantineOnTheDesiredBuild(t *testing.T) {
+	h := newHarness(t, testConfig, testTargets)
+	h.prime()
+
+	// a-1 takes d2 but never reports ready; the rollout halts and is
+	// aborted, leaving a-1 quarantined while it runs the desired digest.
+	h.world.set(func(w *world) { w.notReady[tA1] = true })
+	h.release(imgA, d2)
+	h.ticks(3, 0)
+	h.ticks(4, 20*time.Second)
+	halted := h.active("a")
+	require.Equal(t, Halted, halted.State)
+	require.NoError(t, h.c.Abort(h.ctx, actor, halted.ID))
+	require.Equal(t, Degraded, h.view(tA1).Health)
+	require.Equal(t, Synced, h.view(tA1).Sync)
+
+	// The node recovers. A sync verifies a-1 in a batch of its own kind and
+	// lifts the quarantine.
+	h.world.set(func(w *world) { w.notReady[tA1] = false })
+	_, err := h.c.Sync(h.ctx, SyncRequest{Actor: actor, Selector: mustSel("client=a")})
+	require.NoError(t, err)
+
+	r := h.active("a")
+	require.True(t, r.Targets[0].DegradedBefore)
+	require.Equal(t, Complete, h.drive(r.ID, 100, 20*time.Second).State)
+	require.Equal(t, Healthy, h.view(tA1).Health)
+}
+
+// oneNodeConfig allows 100 weight, one weighted node of these fleets at a time.
+var oneNodeConfig = replaceLine(testConfig, "maxUnavailable: 50%", "maxUnavailable: 100")
+
+func TestANodeHeavierThanTheBudgetGoesAlone(t *testing.T) {
+	h := newHarness(t, replaceLine(testConfig, "maxUnavailable: 50%", "maxUnavailable: 10%"), `
+- {id: n1/a, node: n1, weight: 300, image: org/a:t, labels: {client: a, owner: a}}
+- {id: n2/a, node: n2, weight: 100, image: org/a:t, labels: {client: a, owner: a}}
+- {id: n3/b, node: n3, weight: 100, image: org/b:t, labels: {client: b, owner: b}}
+`)
+	h.prime()
+
+	// Every node outweighs the 50 the budget allows. Each still goes, one at
+	// a time, as maxUnavailable rounds up to one pod on a DaemonSet.
+	h.world.set(func(w *world) { w.registry[imgB] = d2 })
+	h.release(imgA, d2)
+
+	ra, rb := h.active("a"), h.active("b")
+	require.Equal(t, []string{"n1/a"}, ra.Batches[0].Targets, "batchSize 2, but only one node fits")
+	require.Equal(t, WaitingForBudget, rb.State)
+
+	used, allowed := h.unavailable()
+	require.InDelta(t, 300, used, 0)
+	require.InDelta(t, 50, allowed, 0)
+
+	require.Equal(t, Complete, h.drive(ra.ID, 100, 20*time.Second).State)
+	require.Equal(t, Complete, h.drive(rb.ID, 100, 20*time.Second).State)
+	require.Len(t, h.rollout(ra.ID).Batches, 2)
+}
+
+func TestALiftedQuarantineCostsItsNodeAgain(t *testing.T) {
+	h := newHarness(t, oneNodeConfig, `
+- {id: n1/x, node: n1, weight: 100, image: org/a:t, labels: {client: a, owner: a, wave: "1"}}
+- {id: n1/y, node: n1, weight: 100, image: org/a:t, labels: {client: a, owner: a, wave: "0"}}
+- {id: n2/z, node: n2, weight: 100, image: org/a:t, labels: {client: a, owner: a, wave: "2"}}
+`)
+	h.prime()
+
+	// x fails its update and is quarantined; d3 supersedes, and the new
+	// rollout starts with x alone, free, since its node is already degraded.
+	h.world.set(func(w *world) { w.updateFail["n1/x"] = boom })
+	h.release(imgA, d2)
+	h.drive(h.active("a").ID, 20, 20*time.Second)
+	require.Equal(t, Halted, h.active("a").State)
+	h.world.set(func(w *world) { delete(w.updateFail, "n1/x") })
+	h.release(imgA, d3)
+
+	r := h.active("a")
+	require.Equal(t, []string{"n1/x"}, r.Batches[0].Targets)
+	require.True(t, r.Targets[0].Free)
+
+	// x passes and its quarantine is lifted. y shares its node but comes in
+	// a later wave: n1 is healthy again, so y costs its full weight.
+	for i := 0; i < 20 && len(h.active("a").Batches) < 2; i++ {
+		h.ticks(1, 20*time.Second)
+	}
+
+	r = h.active("a")
+	require.Equal(t, []string{"n1/y"}, r.Batches[1].Targets)
+	require.False(t, r.Targets[1].Free)
+
+	used, _ := h.unavailable()
+	require.InDelta(t, 100, used, 0)
+}
+
+func TestRetryWaitsForTheBudgetWhenItsQuarantineWasLifted(t *testing.T) {
+	h := newHarness(t, oneNodeConfig, `
+- {id: n1/a, node: n1, weight: 100, image: org/a:t, labels: {client: a, owner: a}}
+- {id: n2/b, node: n2, weight: 100, image: org/b:t, labels: {client: b, owner: b}}
+`)
+	h.prime()
+	full := h.current()
+
+	h.world.set(func(w *world) { w.updateFail["n1/a"] = boom })
+	h.release(imgA, d2)
+	ra := h.active("a")
+	require.Equal(t, Halted, ra.State)
+
+	// n1/a leaves the targets file and comes back, which drops its
+	// quarantine, and group b takes the whole budget meanwhile.
+	rules := full.Rules()
+	without, err := parseTargets("- {id: n2/b, node: n2, weight: 100, image: org/b:t, labels: {client: b, owner: b}}\n", &rules)
+	require.NoError(t, err)
+	h.swap(without)
+	h.c.Forget(h.ctx, []string{"n1/a"})
+	h.swap(full)
+
+	h.world.set(func(w *world) {
+		delete(w.updateFail, "n1/a")
+		w.notReady["n2/b"] = true
+	})
+	h.release(imgB, d2)
+	rb := h.active("b")
+	require.Len(t, rb.Batches, 1)
+
+	// Reopening n1/a now would put both nodes down.
+	require.NoError(t, h.c.Retry(h.ctx, actor, ra.ID, "fixed"))
+
+	halts := len(slices.DeleteFunc(h.notes.actions(), func(a string) bool { return a != "rollout.halted" }))
+
+	h.ticks(2, 0)
+	require.Equal(t, Halted, h.rollout(ra.ID).State)
+	require.Contains(t, h.rollout(ra.ID).Reason, "Retry waiting for the disruption budget")
+	require.Len(t, slices.DeleteFunc(h.notes.actions(), func(a string) bool { return a != "rollout.halted" }), halts,
+		"waiting is not announced as another halt")
+
+	h.world.set(func(w *world) { w.notReady["n2/b"] = false })
+	require.Equal(t, Complete, h.drive(rb.ID, 100, 20*time.Second).State)
+	require.Equal(t, Complete, h.drive(ra.ID, 100, 20*time.Second).State)
 }

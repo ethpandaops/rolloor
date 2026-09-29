@@ -22,3 +22,4 @@ run:
 
 example:
 	./examples/generic/run.sh
+

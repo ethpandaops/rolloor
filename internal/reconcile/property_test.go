@@ -1,262 +1,359 @@
 package reconcile
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"math/rand/v2"
+	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/sirupsen/logrus"
 
 	"github.com/ethpandaops/rolloor/internal/targets"
 )
 
-// propGroups are the groups a random fleet draws from; each has one image.
-var propGroups = []string{"a", "b", "c"}
+// The property test drives random fleets through random builds, program
+// failures, verbs, targets-file edits, restarts, crashes and store outages,
+// and checks after every step what must always hold. Once the steps run out
+// every failure is healed, and every target must end on its desired build.
+//
+// Reproduce a failure with ROLLOOR_SIM_SEED=<seed>; run more seeds with
+// ROLLOOR_SIM_SEEDS=<n>.
 
-func propImage(group string) string { return "org/" + group + ":t" }
-
-// propFleet builds a random targets file: nodes of integer weight (so the
-// budget comparison is exact), each hosting one to three groups' targets.
-func propFleet(rng *rand.Rand) (yaml string, ids []string) {
-	var b strings.Builder
-
-	soaks := map[string]bool{}
-	for _, g := range propGroups {
-		soaks[g] = rng.IntN(2) == 0
-	}
-
-	nodes := 2 + rng.IntN(6)
-	for n := range nodes {
-		weight := 0
-		if rng.IntN(4) != 0 {
-			weight = 1 + rng.IntN(100)
-		}
-
-		var groups []string
-
-		for _, g := range propGroups {
-			if rng.IntN(2) == 0 {
-				groups = append(groups, g)
-			}
-		}
-
-		if len(groups) == 0 {
-			groups = append(groups, propGroups[rng.IntN(len(propGroups))])
-		}
-
-		for _, g := range groups {
-			id := fmt.Sprintf("n%d/%s", n, g)
-
-			hooks := ""
-			if soaks[g] {
-				hooks = ", hooks: {soak: soak-" + g + "}"
-			}
-
-			fmt.Fprintf(&b, "- {id: %s, node: n%d, weight: %d, image: %s, labels: {client: %s, owner: %s, wave: \"%d\"}%s}\n",
-				id, n, weight, propImage(g), g, g, rng.IntN(3), hooks)
-
-			ids = append(ids, id)
-		}
-	}
-
-	return b.String(), ids
+// propSuspension is a suspension the controller accepted.
+type propSuspension struct {
+	sel     targets.Selector
+	expires time.Time
 }
 
-func propConfig(rng *rand.Rand) string {
-	budget := []string{"10%", "25%", "40%", "60%", "100"}[rng.IntN(5)]
-	batch := []string{"1", "2", "3", "50%", "100%"}[rng.IntN(5)]
-	soak := []string{"0s", "40s"}[rng.IntN(2)]
-
-	return fmt.Sprintf(`
-environment: test
-disruptionBudget: {maxUnavailable: %s}
-registry: {poll: 60s}
-hooks: {dir: /tmp, timeout: 10s, defaults: {soak: ""}}
-inspect: {interval: 30s, concurrency: 4, failureThreshold: 2}
-labels: {group: client, owner: owner}
-strategy: {batchSize: %s, soak: {duration: %s, interval: 20s, failureLimit: %d}}
-`, budget, batch, soak, rng.IntN(2))
-}
-
-// propCheck asserts what must hold after every step on a fleet whose targets
-// file does not change: the controller's own count of unavailable weight
-// stays within the budget, a group has at most one active rollout, and a
-// finished rollout stays finished.
-func propCheck(h *harness, terminal map[string]RolloutState) error {
-	if used, allowed := h.unavailable(); used > allowed {
-		return fmt.Errorf("unavailable weight %v exceeds the %v the budget allows", used, allowed)
+func (s *propSuspension) matches(t *propTarget) bool {
+	for k, v := range s.sel {
+		switch k {
+		case targets.KeyID:
+			if t.id != v {
+				return false
+			}
+		case groupLabel:
+			if t.group != v {
+				return false
+			}
+		default:
+			return false
+		}
 	}
 
-	active := map[string]string{}
+	return true
+}
+
+// propBefore is what the checks compare a step against.
+type propBefore struct {
+	used float64
+	// active is each group's active rollout.
+	active map[string]*RolloutView
+	// degraded is every node with a quarantined target, and every
+	// quarantined target.
+	degraded map[string]bool
+	// free is every rollout target already admitted without cost.
+	free map[string]bool
+	// inflight is every node counted against the budget; open is every
+	// rollout target in an open batch.
+	inflight map[string]bool
+	open     map[string]bool
+}
+
+// sim is one simulated environment. Besides the harness it keeps its own
+// record of what it did to the controller and the world, so the checks rest
+// on evidence the controller did not produce.
+type sim struct {
+	h     *harness
+	rng   *rand.Rand
+	fleet *propFleet
+	proc  *process
+	log   *logrus.Logger
+
+	// down is set while no process runs because the store refused to load;
+	// started when a new process began during the step.
+	down    bool
+	started bool
+	outage  bool
+	edited  bool
+
+	digests int
+	builds  map[string][]string
+	modes   map[string]string
+	pins    map[string]map[string]string
+
+	suspended []propSuspension
+	terminal  map[string]RolloutState
+	manual    map[string]bool
+	strategy  map[string]string
+	before    propBefore
+	trail     []string
+
+	mu         sync.Mutex
+	violations []string
+	dispatches []propDispatch
+}
+
+func newSim(t *testing.T, rng *rand.Rand) (*sim, string) {
+	t.Helper()
+
+	cfg := propConfig(rng)
+	fleet := newPropFleet(rng)
+
+	log := logrus.New()
+	log.SetOutput(io.Discard)
+
+	s := &sim{
+		h: newHarness(t, cfg, fleet.yaml()), rng: rng, fleet: fleet, log: log,
+		builds: map[string][]string{}, modes: map[string]string{}, pins: map[string]map[string]string{},
+		terminal: map[string]RolloutState{}, manual: map[string]bool{}, strategy: map[string]string{},
+	}
+
+	s.h.world.set(func(w *world) { w.registry[propImage("c")] = d1 })
+	s.start()
+	s.h.prime()
+
+	return s, cfg
+}
+
+// start runs a new process on whatever the store holds.
+func (s *sim) start() {
+	h := s.h
+	s.proc = &process{MemoryStore: h.store, sim: s, writes: -1}
+
+	c, err := New(h.ctx, &Options{
+		Config: h.cfg, Targets: h.current, Resolver: h.world, Runner: s.proc, Store: s.proc,
+		Notifier: h.notes, Clock: h.clock, Log: s.log, NewID: h.nextID,
+	})
+	if err != nil {
+		s.down = true
+
+		return
+	}
+
+	h.c, s.down, s.started = c, false, true
+}
+
+func (s *sim) violation(format string, args ...any) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.violations = append(s.violations, fmt.Sprintf(format, args...))
+}
+
+// want is the digest a target should end on.
+func (s *sim) want(t *targets.Target) string {
+	if pin, ok := s.pins[s.h.current().Group(t)][t.Image]; ok {
+		return pin
+	}
+
+	s.h.world.mu.Lock()
+	defer s.h.world.mu.Unlock()
+
+	return s.h.world.registry[t.Image]
+}
+
+// converge heals every failure, acts as a patient operator (resume, retry,
+// promote, sync), and requires every target to end on its desired build.
+func (s *sim) converge() error {
+	h := s.h
+
+	h.world.set(func(w *world) {
+		clear(w.updateFail)
+		clear(w.updateStuck)
+		clear(w.notReady)
+		clear(w.soakFail)
+		clear(w.inspectFail)
+		clear(w.runErr)
+		clear(w.registryErr)
+	})
+
+	s.outage = false
+	s.setOutage(false)
+
+	if s.down {
+		s.start()
+
+		if s.down {
+			return errors.New("no process starts on a healthy store")
+		}
+	}
+
+	var err error
+
+	for range 60 {
+		s.operate()
+
+		for range 5 {
+			h.c.InspectAll(h.ctx)
+			h.clock.Advance(20 * time.Second)
+			h.tick()
+		}
+
+		if err = s.converged(); err == nil {
+			return nil
+		}
+	}
+
+	return err
+}
+
+func (s *sim) operate() {
+	h := s.h
+
+	for len(s.suspended) > 0 {
+		before := len(s.suspended)
+		s.lift(s.suspended[0].sel)
+
+		if len(s.suspended) == before {
+			s.suspended = s.suspended[1:]
+		}
+	}
+
+	busy := map[string]bool{}
 
 	for _, r := range h.c.Rollouts() {
-		if was, ok := terminal[r.ID]; ok && r.State != was {
-			return fmt.Errorf("rollout %s left terminal state %s for %s", r.ID, was, r.State)
-		}
-
 		if !r.State.Active() {
-			terminal[r.ID] = r.State
-
 			continue
 		}
 
-		if other, ok := active[r.Group]; ok {
-			return fmt.Errorf("group %s has two active rollouts: %s and %s", r.Group, other, r.ID)
+		busy[r.Group] = true
+
+		switch r.State {
+		case Halted:
+			_ = h.c.Retry(h.ctx, actor, r.ID, "healed")
+		case Paused:
+			_ = h.c.Promote(h.ctx, actor, r.ID)
+		case WaitingForSync:
+			_, _ = h.c.Sync(h.ctx, SyncRequest{Actor: actor, Selector: targets.Selector{groupLabel: r.Group}})
+		case Running, Soaking, WaitingForBudget, WaitingForEnvironment, Aborted, Superseded, Complete:
+		}
+	}
+
+	// A group whose abort still holds sits out of sync with no rollout.
+	for _, g := range h.current().Groups() {
+		if !busy[g] {
+			_, _ = h.c.Sync(h.ctx, SyncRequest{Actor: actor, Selector: targets.Selector{groupLabel: g}})
+		}
+	}
+}
+
+// converged reports the first target not on its desired build, or an
+// active rollout left over.
+func (s *sim) converged() error {
+	h := s.h
+	set := h.current()
+
+	for i := range set.Targets {
+		t := &set.Targets[i]
+		want := s.want(t)
+
+		h.world.mu.Lock()
+		running := h.world.running[t.ID]
+		h.world.mu.Unlock()
+
+		v := h.view(t.ID)
+		if running != want {
+			return fmt.Errorf("%s runs %s, want %s: %s", t.ID, shortDigest(running), shortDigest(want), v.Reason)
 		}
 
-		active[r.Group] = r.ID
+		if v.Sync != Synced || v.Health != Healthy {
+			return fmt.Errorf("%s runs its desired build but reads %s and %s: %s", t.ID, v.Sync, v.Health, v.Reason)
+		}
+	}
+
+	for _, r := range h.c.Rollouts() {
+		if r.State.Active() {
+			return fmt.Errorf("rollout %s is still %s: %s", r.ID, r.State, r.Reason)
+		}
 	}
 
 	return nil
 }
 
-// propStep applies one random action: time passing, a new build, a failing or
-// recovering program, or a person's verb. It returns a description.
-func propStep(h *harness, rng *rand.Rand, ids []string, builds *int) string {
-	ctx := h.ctx
-	id := ids[rng.IntN(len(ids))]
-	g := propGroups[rng.IntN(len(propGroups))]
+// runSim runs one simulation and returns a report of the first failure.
+func runSim(t *testing.T, rng *rand.Rand, steps int) error {
+	t.Helper()
 
-	var rollouts []RolloutView
+	s, cfg := newSim(t, rng)
 
-	for _, r := range h.c.Rollouts() {
-		if r.State.Active() {
-			rollouts = append(rollouts, r)
+	fail := func(err error) error {
+		const shown = 40
+
+		return fmt.Errorf("%w\nconfig:%s\ntargets:\n%s\nlast steps:\n  %s",
+			err, cfg, s.fleet.yaml(), strings.Join(s.trail[max(0, len(s.trail)-shown):], "\n  "))
+	}
+
+	for step := range steps {
+		s.snapshot()
+		s.trail = append(s.trail, s.act())
+
+		if err := s.check(); err != nil {
+			return fail(fmt.Errorf("step %d: %w", step, err))
 		}
 	}
 
-	pick := func() (RolloutView, bool) {
-		if len(rollouts) == 0 {
-			return RolloutView{}, false
+	if err := s.converge(); err != nil {
+		var rollouts []string
+		for _, r := range s.h.c.Rollouts() {
+			rollouts = append(rollouts, fmt.Sprintf("%s %s %s: %s", r.ID, r.Group, r.State, r.Reason))
 		}
 
-		return rollouts[rng.IntN(len(rollouts))], true
+		return fail(fmt.Errorf("after healing every failure: %w\nrollouts:\n  %s", err, strings.Join(rollouts, "\n  ")))
 	}
 
-	switch n := rng.IntN(100); {
-	case n < 45:
-		d := []time.Duration{0, 5 * time.Second, 20 * time.Second, 60 * time.Second}[rng.IntN(4)]
-		h.clock.Advance(d)
-		h.tick()
-
-		return fmt.Sprintf("tick +%s", d)
-	case n < 53:
-		*builds++
-		digest := fmt.Sprintf("sha256:%064x", *builds+1)
-
-		h.world.set(func(w *world) { w.registry[propImage(g)] = digest })
-
-		return "release " + g + " …" + digest[len(digest)-4:]
-	case n < 60:
-		fail := rng.IntN(2) == 0
-
-		h.world.set(func(w *world) {
-			if fail {
-				w.updateFail[id] = "boom"
-			} else {
-				delete(w.updateFail, id)
-			}
-		})
-
-		return fmt.Sprintf("updateFail %s=%v", id, fail)
-	case n < 65:
-		v := rng.IntN(2) == 0
-
-		h.world.set(func(w *world) { w.notReady[id] = v })
-
-		return fmt.Sprintf("notReady %s=%v", id, v)
-	case n < 70:
-		v := rng.IntN(2) == 0
-
-		h.world.set(func(w *world) { w.soakFail["soak-"+g] = v })
-
-		return fmt.Sprintf("soakFail soak-%s=%v", g, v)
-	case n < 80:
-		r, ok := pick()
-		if !ok || r.State != Halted {
-			return "retry: nothing halted"
-		}
-
-		err := h.c.Retry(ctx, actor, r.ID, "try again")
-
-		return fmt.Sprintf("retry %s (%s): %v", r.ID, r.Group, err)
-	case n < 83:
-		r, ok := pick()
-		if !ok {
-			return "abort: nothing active"
-		}
-
-		return fmt.Sprintf("abort %s: %v", r.ID, h.c.Abort(ctx, actor, r.ID))
-	case n < 87:
-		r, ok := pick()
-		if !ok {
-			return "pause: nothing active"
-		}
-
-		return fmt.Sprintf("pause %s: %v", r.ID, h.c.Pause(ctx, actor, r.ID))
-	case n < 91:
-		r, ok := pick()
-		if !ok {
-			return "promote: nothing active"
-		}
-
-		return fmt.Sprintf("promote %s: %v", r.ID, h.c.Promote(ctx, actor, r.ID))
-	case n < 95:
-		force := rng.IntN(3) == 0
-		_, err := h.c.Sync(ctx, SyncRequest{Actor: actor, Selector: targets.Selector{"client": g}, Force: force})
-
-		return fmt.Sprintf("sync %s force=%v: %v", g, force, err)
-	case n < 98:
-		_, err := h.c.Suspend(ctx, SuspendRequest{Actor: actor, Selector: targets.Selector{"id": id}, Reason: "hold", Expires: time.Hour})
-
-		return fmt.Sprintf("suspend %s: %v", id, err)
-	default:
-		_, err := h.c.Resume(ctx, actor, targets.Selector{"id": id})
-
-		return fmt.Sprintf("resume %s: %v", id, err)
-	}
+	return nil
 }
 
-// TestPropertyControllerInvariants drives random fleets through random
-// sequences of builds, failures and verbs, checking the invariants after
-// every step. A failure names the seed, the fleet and the last steps; the
-// seed alone reproduces it.
-func TestPropertyControllerInvariants(t *testing.T) {
-	const steps, shown, maxFailures = 200, 40, 3
+// propSeeds is which seeds to run: one from ROLLOOR_SIM_SEED, a count from
+// ROLLOOR_SIM_SEEDS, else 1000, or 100 in short mode.
+func propSeeds(t *testing.T) (first, n uint64) {
+	t.Helper()
 
-	seeds := 1000
-	if testing.Short() {
-		seeds = 100
+	if v := os.Getenv("ROLLOOR_SIM_SEED"); v != "" {
+		seed, err := strconv.ParseUint(v, 10, 64)
+		if err != nil {
+			t.Fatalf("ROLLOOR_SIM_SEED: %v", err)
+		}
+
+		return seed, 1
 	}
 
+	if v := os.Getenv("ROLLOOR_SIM_SEEDS"); v != "" {
+		count, err := strconv.ParseUint(v, 10, 64)
+		if err != nil {
+			t.Fatalf("ROLLOOR_SIM_SEEDS: %v", err)
+		}
+
+		return 0, count
+	}
+
+	if testing.Short() {
+		return 0, 100
+	}
+
+	return 0, 1000
+}
+
+// TestPropertyControllerInvariants runs the simulation for many seeds. A
+// failure names the seed, the config, the fleet and the last steps.
+func TestPropertyControllerInvariants(t *testing.T) {
+	const steps, maxFailures = 200, 3
+
+	first, n := propSeeds(t)
 	failures := 0
 
-	for seed := range uint64(seeds) {
-		rng := rand.New(rand.NewPCG(seed, 0x5eed))
-		fleet, ids := propFleet(rng)
-		cfg := propConfig(rng)
-		h := newHarness(t, cfg, fleet)
-		h.prime()
-
-		terminal := map[string]RolloutState{}
-		builds := 0
-
-		var trail []string
-
-		for step := range steps {
-			trail = append(trail, propStep(h, rng, ids, &builds))
-
-			err := propCheck(h, terminal)
-			if err == nil {
-				continue
-			}
-
-			t.Errorf("seed %d, step %d: %v\nconfig:%s\ntargets:\n%s\nlast steps:\n  %s",
-				seed, step, err, cfg, fleet, strings.Join(trail[max(0, len(trail)-shown):], "\n  "))
+	for seed := first; seed < first+n; seed++ {
+		if err := runSim(t, rand.New(rand.NewPCG(seed, 0x5eed)), steps); err != nil {
+			t.Errorf("seed %d: %v", seed, err)
 
 			failures++
-
-			break
 		}
 
 		if failures == maxFailures {

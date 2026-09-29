@@ -42,6 +42,10 @@ const (
 	d3    = "sha256:3333333333333333333333333333333333333333333333333333333333333333"
 	soakA = "soak-a"
 	soakB = "soak-b"
+
+	groupLabel = "client"
+	careful    = "careful"
+	boom       = "boom"
 )
 
 const testConfig = `
@@ -75,7 +79,7 @@ const testTargets = `
 - {id: a-3/side, node: a-3, weight: 100, image: org/s:t, labels: {client: side, owner: operators, role: sidecar}}
 `
 
-var testRules = targets.Rules{GroupLabel: "client", OwnerLabel: "owner", WaveLabel: labelWave, KnownHooks: config.TargetHooks}
+var testRules = targets.Rules{GroupLabel: groupLabel, OwnerLabel: "owner", WaveLabel: labelWave, KnownHooks: config.TargetHooks}
 
 // world is the fake registry, fleet and hook behaviour behind a test.
 type world struct {
@@ -373,15 +377,19 @@ func (h *harness) newController() *Controller {
 	c, err := New(h.ctx, &Options{
 		Config: h.cfg, Targets: h.current, Resolver: h.world, Runner: h.world,
 		Store: h.store, Notifier: h.notes, Clock: h.clock, Log: logrus.New(),
-		NewID: func() string {
-			h.ids++
-
-			return fmt.Sprintf("id-%d", h.ids)
-		},
+		NewID: h.nextID,
 	})
 	require.NoError(h.t, err)
 
 	return c
+}
+
+// nextID hands out rollout and suspension ids that stay unique across
+// controllers built on the same harness.
+func (h *harness) nextID() string {
+	h.ids++
+
+	return fmt.Sprintf("id-%d", h.ids)
 }
 
 // prime inspects everything and resolves once, so every target is Synced.

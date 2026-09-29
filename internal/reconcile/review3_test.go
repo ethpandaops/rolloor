@@ -2,6 +2,8 @@ package reconcile
 
 import (
 	"encoding/json"
+	"maps"
+	"slices"
 	"testing"
 	"time"
 
@@ -65,11 +67,16 @@ func TestFlushAlsoWritesDeletions(t *testing.T) {
 	_, err = h.c.Suspend(h.ctx, SuspendRequest{Actor: actor, Selector: mustSel("node=a-6"), Reason: "r", Expires: time.Hour})
 	require.NoError(t, err)
 
-	// The retry lifts the quarantine and the suspension expires while the
-	// store is refusing writes; both deletions must reach it afterwards.
-	h.world.set(func(w *world) { w.soakFail[soakA] = false })
-	require.NoError(t, h.c.Retry(h.ctx, actor, r.ID, "probe fixed"))
+	// a-1 leaves the targets file, dropping its quarantine, and a suspension
+	// expires while the store is refusing writes; both deletions must reach
+	// it afterwards.
+	rules := h.set.Rules()
+	smaller, err := parseTargets(replaceLine(testTargets, "- {id: a-1/cl, node: a-1, weight: 0,   image: org/a:t, labels: {client: a, owner: a, role: cl, wave: \"0\"}, hooks: {soak: soak-a}}", ""), &rules)
+	require.NoError(t, err)
+
 	h.store.Fail = errFake
+	h.swap(smaller)
+	h.c.Forget(h.ctx, []string{tA1})
 	h.clock.Advance(2 * time.Minute)
 	h.tick()
 	h.store.Fail = nil
@@ -77,7 +84,7 @@ func TestFlushAlsoWritesDeletions(t *testing.T) {
 
 	snap, err := h.store.Load(h.ctx)
 	require.NoError(t, err)
-	require.Empty(t, snap.Degraded)
+	require.Equal(t, []string{tA2}, slices.Collect(maps.Keys(snap.Degraded)))
 	require.Len(t, snap.Suspensions, 1)
 	require.Equal(t, "node=a-6", snap.Suspensions[0].Selector.String())
 }
