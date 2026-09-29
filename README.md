@@ -16,10 +16,10 @@ The spec is `tasks/prd.md`.
 
 1. The registry is polled; a tag now points at a new digest.
 2. `inspect` reports what each container runs. Those behind form a rollout per group (the value of a configured label).
-3. Targets are sorted (already degraded first, then by `wave` label, node, id) and cut into batches of nodes (the `strategy`: `firstBatch`, `batchSize`) that fit the disruption budget; a batch takes all of a node's targets in the group.
+3. Targets are sorted (already degraded first, then by `wave` label, node, id) and cut into batches of nodes (the `strategy`: `firstBatch`, `batchSize`) that fit the disruption budget; a batch takes all of a node's targets in the group. When nothing else is unavailable, one node may go however heavy it is, as `maxUnavailable` rounds up to one pod on a Kubernetes DaemonSet; `maxUnavailable: 0` moves only weightless nodes.
 4. `update` starts each update; `inspect` waits for the digest to show; `ready` waits for the container to do its job.
 5. `soak` compares the batch against the containers not yet reached, every `interval` for `duration`. Passing moves on; more than `failureLimit` failed checks halts and quarantines the batch.
-6. A newer digest supersedes a halted or running rollout; the quarantined targets go first in the next one.
+6. A newer digest supersedes a halted or running rollout; the quarantined targets go first in the next one. A quarantined target counts as out of sync until a batch has verified it, even on the desired digest, so a sync re-checks it.
 
 People can sync, pause, promote, abort, retry, suspend targets with an expiry, and set a group's policy (automated or manual, a named strategy, pinned digests).
 
@@ -57,14 +57,18 @@ The Docker image runs `serve` with `/etc/rolloor/config.yaml` and keeps its SQLi
 ./examples/generic/run.sh
 ```
 
-Needs docker, curl and jq. Six nginx containers on a local registry: rolloor moves them between builds in waves and batches, halts on a broken build, and converges past it. CI runs it on every change.
+Needs docker, curl and jq. Six nginx containers on a local registry: rolloor moves them between builds in waves and batches, is killed mid-batch and restarted, halts on a broken build, and converges past it. CI runs it on every change.
 
 ## Develop
 
 ```sh
-make test     # go test -race
-make cover    # coverage floors per package (100% where decisions are made)
-make lint     # golangci-lint and the word lint
+make test      # go test -race
+make cover     # coverage floors per package (100% where decisions are made)
+make lint      # golangci-lint and the word lint
+make simulate  # the controller simulation at 10,000 seeds
+make fuzz      # every fuzz target for FUZZTIME (1m)
 ```
+
+The simulation (`internal/reconcile/property_test.go`) drives random fleets through builds, failing programs, verbs, targets-file edits, restarts, crashes mid-tick and store outages, and checks after every step that the disruption budget holds, no update runs before its batch is stored, suspended and held rollouts stay untouched, and batches keep their size and wave order. At the end every failure is healed and every target must reach its desired build. `make test` runs 100 seeds, CI 10,000 and a nightly run far more. A failing seed reproduces with `ROLLOOR_SIM_SEED=<n> go test -run TestPropertyControllerInvariants ./internal/reconcile`; a failing fuzz input is saved under the package's `testdata/fuzz`, and committing it keeps it in every run.
 
 Go 1.25. Nothing in this repository is specific to a workload; deployments bring their own hooks and targets. `scripts/lint-words.sh` fails the build if the first workload's words appear in any tracked file.

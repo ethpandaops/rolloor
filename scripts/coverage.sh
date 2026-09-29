@@ -26,7 +26,7 @@ profile=$(mktemp)
 output=$(mktemp)
 trap 'rm -f "$profile" "$output"' EXIT
 
-if ! go test -race -timeout 5m -coverprofile="$profile" -covermode=atomic ./... >"$output" 2>&1; then
+if ! go test -race -short -timeout 5m -coverprofile="$profile" -covermode=atomic ./... >"$output" 2>&1; then
   grep -vE '^ok|no test files' "$output" >&2
   exit 1
 fi
