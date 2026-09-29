@@ -270,6 +270,13 @@ func (c *Controller) Tick(ctx context.Context) error {
 		c.supersedeChangedRollouts(ctx, now)
 		c.openRollouts(ctx, now)
 		jobs = c.planRollouts(ctx, now)
+
+		// A batch whose save failed must not move anything: after a restart
+		// nobody would know its nodes are changing.
+		if c.dirty {
+			c.withdraw(jobs)
+			jobs = nil
+		}
 	}
 
 	c.mu.Unlock()
@@ -493,6 +500,36 @@ func (c *Controller) flush(ctx context.Context) bool {
 
 	c.dirty = false
 
+	_ = c.persist(ctx, c.store.ReplaceDecisions(ctx, c.decisions()))
+
+	if c.dirty {
+		c.log.WithContext(ctx).Warn("store still failing; no programs run this tick")
+	}
+
+	return !c.dirty
+}
+
+// writeOwed writes the decisions the store refused earlier before a person's
+// action adds new ones, so disk never holds a new decision without the older
+// ones it rests on (a new rollout beside the unsaved end of the last one).
+func (c *Controller) writeOwed(ctx context.Context) error {
+	if !c.dirty {
+		return nil
+	}
+
+	c.dirty = false
+
+	if err := c.persist(ctx, c.store.ReplaceDecisions(ctx, c.decisions())); err != nil {
+		return fmt.Errorf("earlier decisions are still not stored, so nothing was changed: %w", err)
+	}
+
+	return nil
+}
+
+// decisions is everything flush writes. Deletions are decisions too: a lifted
+// quarantine or abort marker must not come back after a restart, so the
+// tables are replaced whole.
+func (c *Controller) decisions() *Snapshot {
 	snap := &Snapshot{Degraded: c.degraded, Aborted: c.aborted, Desired: c.desired}
 
 	for _, r := range c.rollouts {
@@ -503,15 +540,7 @@ func (c *Controller) flush(ctx context.Context) bool {
 		snap.Suspensions = append(snap.Suspensions, sp)
 	}
 
-	// Deletions are decisions too: a lifted quarantine or abort marker must
-	// not come back after a restart, so the tables are replaced whole.
-	_ = c.persist(ctx, c.store.ReplaceDecisions(ctx, snap))
-
-	if c.dirty {
-		c.log.WithContext(ctx).Warn("store still failing; no programs run this tick")
-	}
-
-	return !c.dirty
+	return snap
 }
 
 // commit applies change to r and saves it. When the store refuses, the

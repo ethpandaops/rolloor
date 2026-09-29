@@ -82,7 +82,7 @@ func TestMixedSoakProgramsInOneBatch(t *testing.T) {
 func TestCarefulWithNothingLeftDoesNotPause(t *testing.T) {
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
-	require.NoError(t, h.c.SetPolicy(h.ctx, actor, "side", Policy{Mode: ModeAutomated, Strategy: "careful"}))
+	require.NoError(t, h.c.SetPolicy(h.ctx, actor, "side", Policy{Mode: ModeAutomated, Strategy: careful}))
 	h.release(imgS, d2)
 
 	r := h.active("side")
@@ -263,7 +263,8 @@ func TestRemovingEveryTargetOfAnImageMidRollout(t *testing.T) {
 	h.set = smaller
 
 	final := h.drive(r.ID, 10, 0)
-	require.Equal(t, Complete, final.State)
+	require.Equal(t, Superseded, final.State)
+	require.Equal(t, "no targets left in group b", final.Reason)
 	require.Equal(t, PhaseSkipped, h.phases(final)["b-1/el"])
 }
 

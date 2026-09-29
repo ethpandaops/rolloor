@@ -11,12 +11,19 @@ import (
 )
 
 // supersedeChangedRollouts closes any active rollout whose desired digests
-// have moved on; openRollouts will start a fresh one in the same tick.
+// have moved on, or whose group has no targets left; openRollouts will start
+// a fresh one in the same tick where there is anything to move.
 func (c *Controller) supersedeChangedRollouts(ctx context.Context, now time.Time) {
 	set := c.targets()
 
 	for _, r := range c.rollouts {
 		if !r.State.Active() {
+			continue
+		}
+
+		if len(set.InGroup(r.Group)) == 0 {
+			c.finish(ctx, now, r, Superseded, "no targets left in group "+r.Group)
+
 			continue
 		}
 
@@ -143,7 +150,9 @@ func (c *Controller) groupDesiredKey(group string, set *targets.Set) string {
 }
 
 // outOfSync lists the group's targets that should move: desired and live both
-// known, different, and not suspended.
+// known and not suspended, and either different or the target quarantined. A
+// quarantined target is not in sync until a batch has verified it, even when
+// it already runs the desired digest.
 func (c *Controller) outOfSync(group string, set *targets.Set) (eligible []*targets.Target, desired, from map[string]string) {
 	desired = map[string]string{}
 	fromCount := map[string]map[string]int{}
@@ -160,7 +169,9 @@ func (c *Controller) outOfSync(group string, set *targets.Set) (eligible []*targ
 		}
 
 		live, known := c.liveKnown(t.ID)
-		if !known || live == d.Digest || c.suspensionFor(t) != nil {
+		_, quarantined := c.degraded[t.ID]
+
+		if !known || (live == d.Digest && !quarantined) || c.suspensionFor(t) != nil {
 			continue
 		}
 
@@ -283,16 +294,10 @@ func (c *Controller) inFlightNodes(now time.Time) map[string]struct{} {
 	return nodes
 }
 
-// nodeDegraded reports whether a node is already disrupted: any target on it
-// is quarantined, or was degraded when the rollout began. Such a node costs
-// nothing against the budget, whichever group is moving it.
-func (c *Controller) nodeDegraded(set *targets.Set, r *Rollout, node string) bool {
-	for i := range r.Targets {
-		if r.Targets[i].Node == node && r.Targets[i].DegradedBefore {
-			return true
-		}
-	}
-
+// nodeDegraded reports whether a node is already disrupted: a target on it
+// is quarantined. Such a node costs nothing against the budget, whichever
+// group is moving it.
+func (c *Controller) nodeDegraded(set *targets.Set, node string) bool {
 	for _, t := range set.Node(node) {
 		if _, degraded := c.degraded[t.ID]; degraded {
 			return true
@@ -365,14 +370,18 @@ func (c *Controller) startBatch(ctx context.Context, now time.Time, r *Rollout, 
 				continue
 			}
 
-			free := c.nodeDegraded(set, r, rt.Node)
+			free := c.nodeDegraded(set, rt.Node)
 
 			w := set.NodeWeight(rt.Node)
 			if _, already := busy[rt.Node]; already || free {
 				w = 0
 			}
 
-			if inflight+cost+w > budget && w > 0 {
+			// As maxUnavailable rounds up to one pod on a DaemonSet, a budget
+			// above zero lets one node go when nothing else is unavailable,
+			// however heavy; otherwise such a node could never be updated.
+			alone := budget > 0 && inflight+cost == 0
+			if inflight+cost+w > budget && w > 0 && !alone {
 				continue
 			}
 
@@ -404,7 +413,8 @@ func (c *Controller) startBatch(ctx context.Context, now time.Time, r *Rollout, 
 }
 
 // remaining lists targets not yet batched, skipping ones that have since been
-// suspended or lost, in update order.
+// suspended or lost, in update order. A target already on the new build
+// passes without a batch unless it is quarantined.
 func (c *Controller) remaining(r *Rollout, set *targets.Set, now time.Time) []*RolloutTarget {
 	var out []*RolloutTarget
 
@@ -427,7 +437,8 @@ func (c *Controller) remaining(r *Rollout, set *targets.Set, now time.Time) []*R
 			continue
 		}
 
-		if live, _ := c.liveKnown(rt.ID); live == r.Desired[t.Image] {
+		_, quarantined := c.degraded[rt.ID]
+		if live, _ := c.liveKnown(rt.ID); live == r.Desired[t.Image] && !quarantined {
 			rt.Phase, rt.Reason, rt.UpdatedAt = PhasePassed, "already on the new build", now
 
 			continue
