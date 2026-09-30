@@ -6,7 +6,7 @@ rolloor rolls container builds across a fleet in health-gated batches under a di
 
 1. Poll image tags and inspect running digests.
 2. Create one rollout per group with targets behind.
-3. Admit node batches under the disruption budget.
+3. Admit node batches under the disruption budget, which counts every node not ready (probed continuously, rollout or not) as unavailable.
 4. Update, then wait for the new digest and observed readiness.
 5. Compare each batch against unreached targets during soak; a worse batch halts.
 6. Any group image changing supersedes its rollout.
@@ -58,6 +58,15 @@ labels:
   group: app
   # Ownership label.
   owner: owner
+# Runs every target's ready program, rollout or not; a node with a target
+# not ready counts against the budget.
+readinessProbe:
+  # How often each target is probed.
+  period: 30s
+  # Consecutive failures before a target reads not ready.
+  failureThreshold: 3
+  # Consecutive successes before it reads ready again.
+  successThreshold: 1
 # Shared by every rollout.
 disruptionBudget:
   # Unavailable weight, absolute or percentage.
