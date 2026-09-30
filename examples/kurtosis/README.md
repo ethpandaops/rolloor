@@ -16,7 +16,7 @@ Needs docker, kurtosis, curl, jq and openssl. It takes about half an hour.
 4. `run.sh` writes the targets file from the running enclave, then starts rolloor from this repository's image.
 5. Build B is pushed. rolloor updates one node (beacon and validator), soaks it against the three it hasn't reached, then updates the rest two nodes at a time, never more than `maxUnavailable` allows.
 6. Build C, whose lighthouse exits at once, is pushed. The first node fails to become ready and the rollout halts with that node quarantined; the other three stay on B.
-7. Build D is pushed. The halted rollout is superseded and D converges, the quarantined node first.
+7. Build D is pushed. The halted rollout is superseded and D converges, the not-ready node first.
 
 ## How it maps to a real devnet
 
@@ -46,7 +46,7 @@ Each hook reads one target (or, for `soak-beacon`, the soak document) as JSON on
 | `update` | every target | watchtower has taken an update to the desired digest, or the container already runs it; it refuses any other digest, since watchtower can only deploy the tag's head |
 | `ready-beacon` | beacon nodes | synced, execution client online |
 | `ready-execution` | execution clients | finished syncing |
-| `ready-running` | validator clients | the container is running the desired digest |
+| `ready-running` | validator clients | the container is running, irrespective of its desired digest |
 | `soak-beacon` | beacon nodes | the updated nodes are no further behind than the rest (or 2 slots) and keep at least half their median peer count |
 
 This directory is the one place in the repository allowed workload words; `scripts/lint-words.sh` skips it.

@@ -3,7 +3,6 @@ package reconcile
 import (
 	"context"
 	"fmt"
-	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -100,7 +99,7 @@ func (c *Controller) planRollout(ctx context.Context, now time.Time, r *Rollout,
 		return c.planBatch(ctx, now, r, set)
 	case Soaking:
 		return c.planSoak(ctx, now, r, set)
-	case Running, WaitingForBudget, WaitingForEnvironment:
+	case Running, WaitingForBudget:
 		if r.CurrentBatch() == nil {
 			c.startBatch(ctx, now, r, set)
 
@@ -115,13 +114,10 @@ func (c *Controller) planRollout(ctx context.Context, now time.Time, r *Rollout,
 	}
 }
 
-// retryFits reports whether reopening the halted batch keeps the budget, and
-// if not, why the retry waits. A quarantined target costs nothing, but one
-// whose quarantine was lifted since (it left the targets file and came back)
-// costs its node again, under the same rule as a new batch.
+// retryFits checks the same observed-unavailability budget as a new admission.
 func (c *Controller) retryFits(set *targets.Set, r *Rollout, now time.Time) (string, bool) {
 	b := &r.Batches[len(r.Batches)-1]
-	busy := c.inFlightNodes(now)
+	busy := c.unavailableNodes(now)
 	nodes := map[string]struct{}{}
 
 	var cost float64
@@ -137,11 +133,10 @@ func (c *Controller) retryFits(set *targets.Set, r *Rollout, now time.Time) (str
 			continue
 		}
 
-		_, quarantined := c.degraded[id]
 		_, counted := busy[rt.Node]
 		_, seen := nodes[rt.Node]
 
-		if quarantined || counted || seen || set.NodeWeight(rt.Node) == 0 {
+		if counted || seen || set.NodeWeight(rt.Node) == 0 {
 			continue
 		}
 
@@ -150,8 +145,8 @@ func (c *Controller) retryFits(set *targets.Set, r *Rollout, now time.Time) (str
 	}
 
 	budget := c.cfg.DisruptionBudget.MaxUnavailable.OfWeight(set.TotalWeight())
-	inflight := c.inFlightWeight(set)
-	alone := budget > 0 && inflight == 0 && len(nodes) == 1
+	inflight := c.unavailableWeight(set)
+	alone := budget > 0 && len(busy) == 0 && len(nodes) == 1
 
 	if cost == 0 || inflight+cost <= budget || alone {
 		return "", true
@@ -161,12 +156,11 @@ func (c *Controller) retryFits(set *targets.Set, r *Rollout, now time.Time) (str
 		pct(inflight, set.TotalWeight()), c.cfg.DisruptionBudget.MaxUnavailable.String(), b.Number, pct(cost, set.TotalWeight())), false
 }
 
-// retryBatch reopens a halted batch. A failed target already running the
-// digest goes back to waiting for inspect to confirm it, so nothing is claimed
-// that was not observed; one that is not gets its update run again. The
-// batch's earlier soak attempts stay on the record. A retried target stays
-// quarantined until it passes, so like any degraded node's it is free.
+// retryBatch reopens failed targets using the current observations and preserves
+// earlier soak attempts.
 func (c *Controller) retryBatch(ctx context.Context, now time.Time, r *Rollout) {
+	busy := c.unavailableNodes(now)
+	set := c.targets()
 	r.RetryPending = false
 	r.Soak = SoakProgress{}
 
@@ -181,29 +175,41 @@ func (c *Controller) retryBatch(ctx context.Context, now time.Time, r *Rollout) 
 	for _, id := range b.Targets {
 		rt := r.target(id)
 		if rt.Phase == PhaseFailed {
+			t, present := set.Get(id)
+			if reason, skip := c.skipReason(r, set, &t, present); skip {
+				rt.Phase, rt.Reason = PhaseSkipped, reason
+
+				continue
+			}
+
+			if c.heldReady(r, rt) {
+				rt.HoldUntil = time.Time{}
+			}
+
 			rt.Phase, rt.Reason, rt.UpdatedAt = PhaseUpdating, "retrying: waiting for the digest", now
+			rt.DigestSeenAt = time.Time{}
 			rt.UpdateDone, rt.Updated = true, false
 
-			if live, known := c.liveKnown(id); !known || !slices.Contains(sortedValues(r.Desired), live) {
+			if live, known := c.liveKnown(id); !known || live != r.Desired[t.Image] {
 				rt.Phase, rt.Reason, rt.UpdateDone = PhasePending, "retrying: running the update again", false
 			}
 
-			_, rt.Free = c.degraded[id]
+			_, rt.Free = busy[rt.Node]
 		}
 	}
 
 	c.setState(ctx, now, r, Running, fmt.Sprintf("Retrying batch %d.", b.Number))
 }
 
-// planBatch moves each target in the open batch one step: dispatch the
-// update, wait for the digest to land, then ready. A target that has since
-// been suspended, removed or moved to another group is skipped where it is.
+// planBatch dispatches updates and reads the independent observations.
+// Ineligible targets are skipped where they are.
 func (c *Controller) planBatch(ctx context.Context, now time.Time, r *Rollout, set *targets.Set) []job {
 	b := r.CurrentBatch()
 
 	var jobs []job
 
 	allReady, skipped := true, false
+	changed := false
 
 	for _, id := range b.Targets {
 		rt := r.target(id)
@@ -219,12 +225,11 @@ func (c *Controller) planBatch(ctx context.Context, now time.Time, r *Rollout, s
 		switch rt.Phase {
 		case PhasePending:
 			allReady = false
+			changed = true
 			rt.Phase, rt.Reason, rt.UpdatedAt = PhaseUpdating, "update running", now
 
-			// Already seen on the digest (an update that landed as the last
-			// process stopped, or a quarantined target being verified): no
-			// update, only the checks. Running it again could collide with
-			// one still finishing.
+			// An already-observed digest needs verification, not another update
+			// that could collide with one still finishing.
 			if live, known := c.liveKnown(id); known && live == r.Desired[t.Image] {
 				rt.UpdateDone, rt.Reason = true, "already on the new build, waiting for inspect to confirm"
 
@@ -233,10 +238,24 @@ func (c *Controller) planBatch(ctx context.Context, now time.Time, r *Rollout, s
 
 			jobs = append(jobs, job{rollout: r.ID, target: id, hook: config.HookUpdate, program: c.programFor(&t, config.HookUpdate), input: c.hookInput(set, &t)})
 		case PhaseUpdating:
-			if rt.Updated && r.Force {
-				rt.Phase, rt.Reason = PhaseReady, "ready (forced)"
+			live, known := c.liveKnown(id)
+			if known && live == r.Desired[t.Image] && rt.UpdateDone {
+				if !rt.Updated {
+					changed = true
+					rt.Updated, rt.DigestSeenAt = true, c.live[id].DigestSince
+					rt.Reason = "on the new build, waiting for readiness"
+				}
 
-				continue
+				if r.Force || c.readyOnBuild(rt) {
+					changed = true
+					rt.Phase, rt.Reason = PhaseReady, "ready"
+
+					continue
+				}
+			} else if rt.Updated {
+				changed = true
+				rt.Updated = false
+				rt.DigestSeenAt = time.Time{}
 			}
 
 			allReady = false
@@ -252,20 +271,20 @@ func (c *Controller) planBatch(ctx context.Context, now time.Time, r *Rollout, s
 				return nil
 			}
 
-			// The update result lands in the tick that dispatched it, so an
-			// Updating target here is past its update: it is inspected until the
-			// digest shows, then asked for readiness.
-			hook := config.HookReady
-			if !rt.Updated {
-				hook = config.HookInspect
+			reason := "waiting for the digest"
+			if rt.Updated {
+				reason = "not ready: " + c.live[id].Readiness.Reason
 			}
 
-			jobs = append(jobs, job{rollout: r.ID, target: id, hook: hook, program: c.programFor(&t, hook), input: c.hookInput(set, &t)})
+			if rt.Reason != reason {
+				changed = true
+				rt.Reason = reason
+			}
 		case PhaseReady, PhasePassed, PhaseSkipped, PhaseFailed:
 		}
 	}
 
-	c.saveSkips(ctx, r, skipped)
+	c.saveSkips(ctx, r, skipped || changed)
 
 	if allReady && len(jobs) == 0 {
 		c.batchReady(ctx, now, r, set)
@@ -527,6 +546,10 @@ func (c *Controller) halt(ctx context.Context, now time.Time, r *Rollout, culpri
 		}
 
 		rt.Phase, rt.Reason = PhaseFailed, reason
+		if !c.readyOnBuild(rt) {
+			rt.HoldUntil = now.Add(c.updateDeadline())
+		}
+
 		c.degraded[id] = reason
 		_ = c.persist(ctx, c.store.SaveDegraded(ctx, id, reason))
 	}
@@ -642,33 +665,13 @@ func (c *Controller) applyTargetResult(ctx context.Context, now time.Time, r *Ro
 		return
 	}
 
-	switch o.hook {
-	case config.HookUpdate:
-		if !o.res.OK {
-			c.halt(ctx, now, r, o.target, "update failed: "+o.res.Reason)
+	if !o.res.OK {
+		c.halt(ctx, now, r, o.target, "update failed: "+o.res.Reason)
 
-			return
-		}
-
-		rt.UpdateDone, rt.Reason = true, "update started, waiting for the digest"
-	case config.HookInspect:
-		digest := strings.TrimSpace(o.res.Reason)
-		accepted := c.setLiveLocked(ctx, now, o.started, o.target, digest, o.res.OK, o.res.Reason)
-
-		if accepted && o.res.OK && digest == r.Desired[t.Image] {
-			rt.Updated, rt.Reason = true, "on the new build, checking readiness"
-
-			if r.Force {
-				rt.Phase, rt.Reason = PhaseReady, "ready (forced)"
-			}
-		}
-	case config.HookReady:
-		if o.res.OK {
-			rt.Phase, rt.Reason = PhaseReady, "ready"
-		} else {
-			rt.Reason = "not ready: " + o.res.Reason
-		}
+		return
 	}
+
+	rt.UpdateDone, rt.Reason = true, "update started, waiting for the digest"
 }
 
 // applySoak folds one check's program results into the soak progress.

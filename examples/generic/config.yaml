@@ -29,9 +29,9 @@ registry:
     - localhost:5050
 
 disruptionBudget:
-  # Share of total weight allowed to be mid-update at once, across every
-  # rollout. The three weighted nodes carry 10 each (30 in all); 40% is 12,
-  # so one weighted node moves at a time.
+  # Share of weight allowed to be unavailable, including unrelated outages.
+  # The weighted nodes carry 30 in all; 40% is 12, so one healthy weighted
+  # node can update at a time.
   maxUnavailable: 40%
 
 hooks:
@@ -53,6 +53,12 @@ inspect:
   concurrency: 4
   # Inspections in a row that may fail before a target reads Unknown.
   failureThreshold: 2
+
+readinessProbe:
+  # Poll availability independently of rollout progress.
+  period: 5s
+  failureThreshold: 3
+  successThreshold: 1
 
 strategy:
   # Nodes per batch, as a share of the rollout's nodes or a count.

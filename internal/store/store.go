@@ -422,7 +422,7 @@ func (s *SQLite) ReplaceDecisions(ctx context.Context, snap *reconcile.Snapshot)
 	}
 	defer tx.Rollback() //nolint:errcheck // a no-op after commit
 
-	for _, q := range []string{`DELETE FROM degraded`, `DELETE FROM aborted`, `DELETE FROM suspensions`} {
+	for _, q := range []string{`DELETE FROM degraded`, `DELETE FROM aborted`, `DELETE FROM suspensions`, `DELETE FROM live`, `DELETE FROM hook_runs`} {
 		if _, err := tx.ExecContext(ctx, q); err != nil {
 			return fmt.Errorf("store: replace: %w", err)
 		}
@@ -457,6 +457,21 @@ func (s *SQLite) ReplaceDecisions(ctx context.Context, snap *reconcile.Snapshot)
 	for img, d := range snap.Desired {
 		if err := w.SaveDesired(ctx, img, d); err != nil {
 			return err
+		}
+	}
+
+	for id := range snap.Live {
+		live := snap.Live[id]
+		if err := w.SaveLive(ctx, id, &live); err != nil {
+			return err
+		}
+	}
+
+	for id, runs := range snap.HookRuns {
+		for _, run := range runs {
+			if err := w.SaveHookRun(ctx, id, &run); err != nil {
+				return err
+			}
 		}
 	}
 

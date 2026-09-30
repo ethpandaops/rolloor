@@ -55,15 +55,7 @@ type propBefore struct {
 	used float64
 	// active is each group's active rollout.
 	active map[string]*RolloutView
-	// degraded is every node with a quarantined target, and every
-	// quarantined target.
-	degraded map[string]bool
-	// free is every rollout target already admitted without cost.
-	free map[string]bool
-	// inflight is every node counted against the budget; open is every
-	// rollout target in an open batch.
-	inflight map[string]bool
-	open     map[string]bool
+	open   map[string]bool
 }
 
 // sim is one simulated environment. Besides the harness it keeps its own
@@ -88,12 +80,14 @@ type sim struct {
 	modes   map[string]string
 	pins    map[string]map[string]string
 
-	suspended []propSuspension
-	terminal  map[string]RolloutState
-	manual    map[string]bool
-	strategy  map[string]string
-	before    propBefore
-	trail     []string
+	suspended     []propSuspension
+	terminal      map[string]RolloutState
+	manual        map[string]bool
+	strategy      map[string]string
+	before        propBefore
+	admission     map[string]bool
+	admissionUsed float64
+	trail         []string
 
 	mu         sync.Mutex
 	violations []string
@@ -113,6 +107,10 @@ func newSim(t *testing.T, rng *rand.Rand) (*sim, string) {
 		h: newHarness(t, cfg, fleet.yaml()), rng: rng, fleet: fleet, log: log,
 		builds: map[string][]string{}, modes: map[string]string{}, pins: map[string]map[string]string{},
 		terminal: map[string]RolloutState{}, manual: map[string]bool{}, strategy: map[string]string{},
+	}
+	s.h.beforeTick = func() {
+		s.admission = s.h.oracleUnavailable()
+		s.admissionUsed, _ = s.h.unavailable()
 	}
 
 	s.h.world.set(func(w *world) { w.registry[propImage("c")] = d1 })
@@ -227,12 +225,16 @@ func (s *sim) operate() {
 
 		switch r.State {
 		case Halted:
-			_ = h.c.Retry(h.ctx, actor, r.ID, "healed")
+			if r.RetryPending {
+				_ = h.c.Abort(h.ctx, actor, r.ID)
+			} else {
+				_ = h.c.Retry(h.ctx, actor, r.ID, "healed")
+			}
 		case Paused:
 			_ = h.c.Promote(h.ctx, actor, r.ID)
 		case WaitingForSync:
 			_, _ = h.c.Sync(h.ctx, SyncRequest{Actor: actor, Selector: targets.Selector{groupLabel: r.Group}})
-		case Running, Soaking, WaitingForBudget, WaitingForEnvironment, Aborted, Superseded, Complete:
+		case Running, Soaking, WaitingForBudget, Aborted, Superseded, Complete:
 		}
 	}
 

@@ -92,10 +92,8 @@ func (s *Server) readable(h http.HandlerFunc) http.HandlerFunc {
 }
 
 func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
-	ok, reason, at := s.c.EnvironmentStatus()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "version": s.version, "environment": s.cfg.Environment,
-		"environmentCheck": map[string]any{"ok": ok, "reason": reason, "at": at},
 	})
 }
 

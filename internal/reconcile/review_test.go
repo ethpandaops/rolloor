@@ -8,8 +8,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// These tests pin the behaviours the first review found missing.
-
 func TestUpdateHookReceivesTheDesiredDigest(t *testing.T) {
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
@@ -35,6 +33,7 @@ func TestUpdateHookReceivesTheDesiredDigest(t *testing.T) {
 func TestSuspensionAndGroupMoveMidBatch(t *testing.T) {
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
+	h.world.set(func(w *world) { w.notReady[tA1], w.notReady[tA2] = true, true })
 	h.release(imgA, d2)
 	r := h.active("a")
 	h.tick()
@@ -273,14 +272,23 @@ func TestWavesAreContiguousAfterDegradedTargets(t *testing.T) {
 	h.tick()
 	require.Equal(t, Halted, h.active("a").State)
 
-	h.world.set(func(w *world) { delete(w.updateFail, tA6) })
+	h.world.set(func(w *world) {
+		delete(w.updateFail, tA6)
+		w.notReady[tA6] = true
+	})
+
+	for range h.cfg.ReadinessProbe.FailureThreshold {
+		h.c.ProbeAll(h.ctx)
+	}
+
 	h.release(imgA, d3)
 
 	r := h.active("a")
-	require.True(t, r.Targets[0].DegradedBefore)
+	require.True(t, r.Targets[0].NotReadyBefore)
 	require.Equal(t, 2, r.Targets[0].Wave)
 	require.Equal(t, []string{tA6}, r.Batches[0].Targets, "the degraded wave-2 target goes alone")
-	require.Equal(t, "0.0% of 50%", r.Unavailable, "a degraded node costs nothing")
+	require.True(t, r.Targets[0].Free)
+	require.Equal(t, "20.0% of 50%", r.Unavailable)
 }
 
 func TestNodeDegradedCostsNothingForAllItsTargets(t *testing.T) {
@@ -300,12 +308,27 @@ func TestNodeDegradedCostsNothingForAllItsTargets(t *testing.T) {
 	h.tick()
 	require.Equal(t, Halted, h.active("a").State)
 
-	h.world.set(func(w *world) { delete(w.updateFail, tA3) })
+	h.world.set(func(w *world) {
+		delete(w.updateFail, tA3)
+
+		for _, id := range []string{tA3, tA3VC, tA4} {
+			w.notReady[id] = true
+		}
+	})
+
+	for range h.cfg.ReadinessProbe.FailureThreshold {
+		h.c.ProbeAll(h.ctx)
+	}
+
 	h.release(imgA, d3)
 
 	r := h.active("a")
-	require.Equal(t, []string{tA3, "a-3/vc", tA4}, r.Batches[0].Targets)
-	require.Equal(t, "0.0% of 50%", r.Unavailable, "both nodes were quarantined in the halted batch, so both are free")
+	require.Equal(t, []string{tA3, tA3VC, tA4}, r.Batches[0].Targets)
+	require.Equal(t, "40.0% of 50%", r.Unavailable)
+
+	for _, rt := range r.Targets[:3] {
+		require.True(t, rt.Free)
+	}
 }
 
 func TestRestartRerunsInterruptedUpdates(t *testing.T) {

@@ -10,8 +10,6 @@ import (
 	"github.com/ethpandaops/rolloor/internal/targets"
 )
 
-// These tests pin the second review round.
-
 func TestSyncLeavesNothingBehindWhenTheStoreRefuses(t *testing.T) {
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
@@ -120,7 +118,7 @@ func TestBudgetStaysHeldWhileAnEndedRolloutMayStillBeLanding(t *testing.T) {
 	h.clock.Advance(h.cfg.Hooks.Timeout*5 + time.Second)
 
 	h.c.mu.Lock()
-	busy := h.c.inFlightNodes(h.clock.Now())
+	busy := h.c.unavailableNodes(h.clock.Now())
 	h.c.mu.Unlock()
 	require.NotContains(t, busy, tA4[:3], "a-4 is no longer held")
 	require.Contains(t, busy, "a-3", "still in group b's open batch")
@@ -254,13 +252,19 @@ func TestDegradedNodeCostsNothingForAnotherGroup(t *testing.T) {
 	h.tick()
 	h.tick()
 	require.Equal(t, Halted, h.active("a").State)
-	require.Equal(t, Degraded, h.view(tA3).Health)
+	require.NotNil(t, h.view(tA3).Quarantine)
+	h.world.set(func(w *world) { w.notReady[tA3] = true })
+
+	for range h.cfg.ReadinessProbe.FailureThreshold {
+		h.c.ProbeAll(h.ctx)
+	}
 
 	h.release(imgB, d2)
 	rb := h.active("b")
 	require.Equal(t, Running, rb.State)
 	require.Equal(t, []string{tA3el, "b-1/el"}, rb.Batches[0].Targets, "a-3 is free, so both weighted nodes fit")
-	require.Equal(t, "20.0% of 50%", rb.Unavailable)
+	require.True(t, rb.Targets[0].Free)
+	require.Equal(t, "40.0% of 50%", rb.Unavailable)
 }
 
 func TestLateInspectionOfAForgottenTargetIsDropped(t *testing.T) {

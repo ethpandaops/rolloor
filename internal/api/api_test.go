@@ -122,6 +122,7 @@ func newFixture(t *testing.T) *fixture {
 	require.NoError(t, err)
 
 	f.c.InspectAll(f.ctx)
+	f.c.ProbeAll(f.ctx)
 	require.NoError(t, f.c.Tick(f.ctx))
 
 	s := New(cfg, f.c, func() *targets.Set { return f.set }, f.auth, f.bc, "test", logrus.New())

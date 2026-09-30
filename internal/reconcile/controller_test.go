@@ -62,10 +62,11 @@ func TestNewValidatesOptionsAndRestores(t *testing.T) {
 	restarted := h.newController()
 	r := restarted.Rollouts()
 	require.Len(t, r, 1)
-	require.Equal(t, Running, r[0].State)
+	require.Equal(t, Soaking, r[0].State)
 	require.Len(t, restarted.Suspensions(), 1)
 	require.Equal(t, ModeManual, restarted.Fleet().Groups[1].Policy.Mode)
-	require.Equal(t, Progressing, mustView(t, restarted, tA1).Health)
+	require.Equal(t, Healthy, mustView(t, restarted, tA1).Health)
+	require.Equal(t, h.view(tA1).Readiness, mustView(t, restarted, tA1).Readiness)
 
 	// Default id generator and clock work too.
 	c, err := New(h.ctx, &Options{Config: h.cfg, Targets: func() *targets.Set { return h.set }, Resolver: h.world, Runner: h.world, Store: NewMemoryStore(), Log: logrus.New()})
@@ -95,12 +96,8 @@ func TestStoreFailureStopsNewWorkUntilFlushed(t *testing.T) {
 	h.tick()
 
 	updates := len(h.world.callsFor("update"))
-	inspects := len(h.world.callsFor("inspect"))
-	readies := len(h.world.callsFor("ready"))
 	h.ticks(3, 0)
 	require.Equal(t, updates, len(h.world.callsFor("update")))
-	require.Equal(t, inspects, len(h.world.callsFor("inspect")))
-	require.Equal(t, readies, len(h.world.callsFor("ready")))
 
 	_, err := h.c.Events(h.ctx, EventQuery{})
 	require.ErrorIs(t, err, errFake)
@@ -108,7 +105,6 @@ func TestStoreFailureStopsNewWorkUntilFlushed(t *testing.T) {
 	// Once the store is back, everything is rewritten and work resumes.
 	h.store.Fail = nil
 	h.tick()
-	require.Greater(t, len(h.world.callsFor("ready")), readies)
 	require.Equal(t, Complete, h.drive(h.active("a").ID, 80, 20*time.Second).State)
 }
 
@@ -144,7 +140,7 @@ func TestInspectorRecordsHookErrors(t *testing.T) {
 	h.world.set(func(w *world) { w.runErr["inspect"] = errFake })
 	h.c.InspectAll(h.ctx)
 	h.c.InspectAll(h.ctx)
-	require.Equal(t, "not reachable: fake", h.view(tA1).Reason)
+	require.Equal(t, HealthUnknown, h.view(tA1).Health)
 }
 
 func TestViewsCoverEveryShape(t *testing.T) {
@@ -185,7 +181,7 @@ func TestViewsCoverEveryShape(t *testing.T) {
 	g, _, _ = h.c.Group("a")
 	require.NotNil(t, g.Rollout)
 	require.Equal(t, 2, g.Rollout.OnNewBuild, "targets mid-update count as on the new build once the digest landed")
-	require.Equal(t, Progressing, g.Health)
+	require.Equal(t, Healthy, g.Health)
 
 	rs := h.c.Rollouts()
 	require.Len(t, rs, 1)

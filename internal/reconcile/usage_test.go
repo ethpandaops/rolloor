@@ -207,15 +207,16 @@ func (h *harness) requireBudget() {
 		return
 	}
 
-	set := h.current()
+	if used <= h.admissionUsed {
+		return
+	}
 
-	h.c.mu.RLock()
-	defer h.c.mu.RUnlock()
+	require.Empty(h.t, h.admission, "admission raised unavailable weight from %v to %v over %v", h.admissionUsed, used, allowed)
 
 	weighted := 0
 
-	for node := range h.c.inFlightNodes(h.clock.Now()) {
-		if set.NodeWeight(node) > 0 {
+	for node := range h.oracleUnavailable() {
+		if h.current().NodeWeight(node) > 0 {
 			weighted++
 		}
 	}
@@ -299,7 +300,8 @@ func TestUsageABadBuildStopsAtOneNodeAndTheFixGoesThereFirst(t *testing.T) {
 	bad := h.until(h.active(clientAlpha).ID, Halted, 20)
 
 	require.Equal(t, []string{"obs-1/server"}, h.on(d2), "one observer took the bad build")
-	require.Equal(t, Degraded, h.view("obs-1/server").Health)
+	require.Equal(t, Healthy, h.view("obs-1/server").Health)
+	require.Equal(t, bad.ID, h.view("obs-1/server").Quarantine.Rollout)
 	require.Contains(t, bad.Reason, "quarantined")
 
 	// The team ships a fix. It supersedes the halted rollout and starts on
@@ -310,7 +312,7 @@ func TestUsageABadBuildStopsAtOneNodeAndTheFixGoesThereFirst(t *testing.T) {
 
 	fix := h.active(clientAlpha)
 	require.Equal(t, "obs-1/server", fix.Targets[0].ID)
-	require.True(t, fix.Targets[0].DegradedBefore)
+	require.False(t, fix.Targets[0].NotReadyBefore)
 
 	h.settle(100)
 	require.Equal(t, Complete, h.rollout(fix.ID).State)
@@ -534,7 +536,7 @@ func TestUsageForceSkipsTheChecksButNotTheBudget(t *testing.T) {
 
 	r := h.rolloutsOf(clientAlpha)[0]
 	require.Equal(t, Complete, r.State)
-	require.Equal(t, [][]string{{observer}, {"node-1"}, {"node-2"}, {"node-3"}}, batchNodes(&r))
+	require.Equal(t, [][]string{{observer}, {"node-1", "node-2"}, {"node-3"}}, batchNodes(&r))
 	require.Equal(t, h.clientTargets(clientAlpha), h.on(d2))
 }
 
@@ -676,8 +678,8 @@ func TestUsageAnObserverOnlyClientNeverWaitsForTheBudget(t *testing.T) {
 		h.step()
 	}
 
-	used, allowed := h.unavailable()
-	require.InDelta(t, allowed, used, 0)
+	used, _ := h.unavailable()
+	require.InDelta(t, 0, used, 0)
 
 	// delta runs only on the weightless observers, so it goes anyway.
 	h.release(imgDelta, d2)
@@ -839,4 +841,113 @@ func dropLines(doc, fragment string) string {
 	lines := strings.Split(doc, "\n")
 
 	return strings.Join(slices.DeleteFunc(lines, func(l string) bool { return strings.Contains(l, fragment) }), "\n")
+}
+
+func TestUsageUnrelatedOutageConsumesBudget(t *testing.T) {
+	h := newFleet(t, replaceLine(usageConfig, "maxUnavailable: 25%", "maxUnavailable: 10%"))
+	h.world.set(func(w *world) { w.notReady["node-8/store"] = true })
+
+	for range h.cfg.ReadinessProbe.FailureThreshold {
+		h.c.ProbeAll(h.ctx)
+	}
+
+	h.release(imgEcho, d2)
+	r := h.active("echo")
+	require.Equal(t, WaitingForBudget, r.State)
+	require.Empty(t, h.world.callsFor("update"))
+	require.Equal(t, Degraded, h.view("node-8/store").Health)
+	used, _ := h.unavailable()
+	require.InDelta(t, 100, used, 0)
+
+	h.world.set(func(w *world) { delete(w.notReady, "node-8/store") })
+	h.settle(30)
+	require.Equal(t, Complete, h.rollout(r.ID).State)
+	require.Equal(t, []string{"node-5/tool"}, h.on(d2))
+}
+
+func TestUsageFleetWideFailureRollsItsFixWithoutBudgetWait(t *testing.T) {
+	h := newFleet(t, replaceLine(usageConfig, "duration: 5m", "duration: 0s"))
+	h.world.set(func(w *world) {
+		for _, target := range h.current().Targets {
+			w.notReady[target.ID] = true
+			w.recoverOnUpdate[target.ID] = true
+			w.registry[target.Image] = d2
+		}
+	})
+
+	for range h.cfg.ReadinessProbe.FailureThreshold {
+		h.c.ProbeAll(h.ctx)
+	}
+
+	used, allowed := h.unavailable()
+	require.Greater(t, used, allowed)
+
+	h.clock.Advance(h.cfg.Registry.Poll)
+	h.tick()
+
+	for _, r := range h.c.Rollouts() {
+		require.Equal(t, Running, r.State)
+		require.NotEmpty(t, r.Batches)
+
+		for _, rt := range r.Targets {
+			if rt.Batch > 0 {
+				require.True(t, rt.Free)
+			}
+		}
+	}
+
+	h.settle(100)
+
+	for _, v := range h.c.Targets(nil) {
+		require.Equal(t, d2, v.Live)
+		require.Equal(t, Healthy, v.Health)
+	}
+}
+
+func TestUsageTargetRecoversWithoutRollout(t *testing.T) {
+	h := newFleet(t, usageConfig)
+	h.world.set(func(w *world) { w.notReady["node-1/server"] = true })
+
+	for range h.cfg.ReadinessProbe.FailureThreshold {
+		h.clock.Advance(h.cfg.ReadinessProbe.Period)
+		h.tick()
+	}
+
+	failed := h.view("node-1/server")
+	require.Equal(t, Degraded, failed.Health)
+	require.Equal(t, Synced, failed.Sync)
+	require.Equal(t, Degraded, h.c.Fleet().Health)
+
+	h.world.set(func(w *world) { delete(w.notReady, "node-1/server") })
+	h.clock.Advance(h.cfg.ReadinessProbe.Period)
+	h.tick()
+	recovered := h.view("node-1/server")
+	require.Equal(t, Healthy, recovered.Health)
+	require.True(t, recovered.Readiness.Since.After(failed.Readiness.Since))
+	require.Equal(t, Healthy, h.c.Fleet().Health)
+	require.Empty(t, h.c.Rollouts())
+	require.Empty(t, h.world.callsFor("update"))
+}
+
+func TestUsageFlappingBelowFailureThresholdStaysHealthy(t *testing.T) {
+	h := newFleet(t, usageConfig)
+	since := h.view("node-1/server").Readiness.Since
+
+	for range 4 {
+		h.world.set(func(w *world) { w.notReady["node-1/server"] = true })
+
+		for range h.cfg.ReadinessProbe.FailureThreshold - 1 {
+			h.clock.Advance(h.cfg.ReadinessProbe.Period)
+			h.c.ProbeAll(h.ctx)
+			require.Equal(t, Healthy, h.view("node-1/server").Health)
+		}
+
+		h.world.set(func(w *world) { delete(w.notReady, "node-1/server") })
+		h.clock.Advance(h.cfg.ReadinessProbe.Period)
+		h.c.ProbeAll(h.ctx)
+		require.Equal(t, since, h.view("node-1/server").Readiness.Since)
+	}
+
+	require.Equal(t, Healthy, h.c.Fleet().Health)
+	require.Empty(t, h.c.Rollouts())
 }

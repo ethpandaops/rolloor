@@ -1,12 +1,7 @@
 {{define "fleet"}}
 <div id="fleet" hx-get="/{{if .ShowHidden}}?hidden=1{{end}}" hx-trigger="every 5s" hx-swap="outerHTML">
 <div class="bar">
-  <div class="env-check {{if .Fleet.EnvOK}}ok{{else}}bad{{end}}">
-    {{if .Fleet.EnvCheck}}
-      {{if .Fleet.EnvOK}}Environment check passing.{{if .Fleet.EnvReason}} {{.Fleet.EnvReason}}{{end}} Automated rollouts may run.
-      {{else}}Environment check failing: {{.Fleet.EnvReason}}. Automated rollouts are paused; a person may still sync.{{end}}
-    {{else}}No environment check configured.{{end}}
-  </div>
+  <div class="badges">{{template "sync-badge" .Fleet.Sync}} {{template "health-badge" .Fleet.Health}}</div>
   <div class="budget">Disruption budget: {{.Fleet.Unavailable}} of {{.Fleet.MaxUnavailable}} unavailable</div>
 </div>
 

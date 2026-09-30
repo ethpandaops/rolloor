@@ -34,7 +34,7 @@
 
 <div class="cards">
   <div class="card"><h3>Sync status</h3><div class="big">{{template "sync-badge" .Group.Sync}}</div><p>{{.Group.OnDesired}} of {{.Group.Targets}} on {{short (first .Group.Desired)}}{{with first .Group.Revisions}} ({{.}}){{end}}.</p></div>
-  <div class="card"><h3>Health</h3><div class="big">{{template "health-badge" .Group.Health}}</div><p>{{.Group.Reason}}</p></div>
+  <div class="card"><h3>Health</h3><div class="big">{{template "health-badge" .Group.Health}}</div></div>
   <div class="card"><h3>Current rollout</h3>
     {{if .Group.Rollout}}<div class="big"><a href="/rollouts/{{.Group.Rollout.ID}}">{{.Group.Rollout.Digest}}</a> {{template "state-badge" .Group.Rollout.State}}</div><p>{{.Group.Rollout.Reason}} Running for {{dur .Group.Rollout.Running}}.</p>
     {{else}}<div class="big muted">none</div><p>Nothing in flight.</p>{{end}}
@@ -43,7 +43,7 @@
 
 
 <table class="targets">
-  <thead><tr><th>Node</th><th>Target</th><th>Sync</th><th>Health</th><th>Why</th></tr></thead>
+  <thead><tr><th>Node</th><th>Target</th><th>Sync</th><th>Health</th><th>Why</th><th>Quarantine</th></tr></thead>
   <tbody>
   {{range .Targets}}
     <tr>
@@ -52,6 +52,7 @@
       <td>{{template "sync-badge" .Sync}}</td>
       <td>{{template "health-badge" .Health}}</td>
       <td>{{.Reason}}</td>
+      <td>{{with .Quarantine}}<a href="/rollouts/{{.Rollout}}">Quarantined</a>: {{.Reason}}{{end}}</td>
     </tr>
   {{end}}
   </tbody>

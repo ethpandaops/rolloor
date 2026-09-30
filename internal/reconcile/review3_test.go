@@ -47,7 +47,8 @@ func TestRetryOfATargetAlreadyOnTheDigestOnlyReinspects(t *testing.T) {
 	h.tick()
 
 	require.Equal(t, updates, len(h.world.callsFor("update:"+tA1)))
-	require.Equal(t, PhaseUpdating, h.phases(h.active("a"))[tA1])
+	require.True(t, h.active("a").Targets[0].Updated)
+	require.Equal(t, Healthy, h.view(tA1).Health)
 }
 
 func TestFlushAlsoWritesDeletions(t *testing.T) {

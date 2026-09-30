@@ -53,7 +53,7 @@ func (s *sim) checkAdmission(id string) {
 		}
 
 		rt := r.target(id)
-		if rt.Free || s.before.open[r.ID+"/"+id] || s.before.inflight[rt.Node] || set.NodeWeight(rt.Node) == 0 {
+		if s.before.open[r.ID+"/"+id] || s.admission[rt.Node] || set.NodeWeight(rt.Node) == 0 {
 			return
 		}
 
@@ -102,22 +102,16 @@ func (s *sim) snapshot() {
 
 	s.edited, s.started = false, false
 
-	b := propBefore{active: map[string]*RolloutView{}, free: map[string]bool{}, inflight: map[string]bool{}, open: map[string]bool{}}
+	b := propBefore{active: map[string]*RolloutView{}, open: map[string]bool{}}
 
 	h := s.h
 	b.used, _ = h.unavailable()
-
-	b.degraded = s.degradedNodes()
+	s.admission = h.oracleUnavailable()
+	s.admissionUsed = b.used
 
 	for _, r := range h.c.Rollouts() {
 		if r.State.Active() {
 			b.active[r.Group] = &r
-		}
-
-		for _, rt := range r.Targets {
-			if rt.Free && rt.Batch > 0 {
-				b.free[r.ID+"/"+rt.ID] = true
-			}
 		}
 
 		if cur := r.CurrentBatch(); r.State.Active() && cur != nil {
@@ -126,14 +120,6 @@ func (s *sim) snapshot() {
 			}
 		}
 	}
-
-	h.c.mu.RLock()
-
-	for node := range h.c.inFlightNodes(h.clock.Now()) {
-		b.inflight[node] = true
-	}
-
-	h.c.mu.RUnlock()
 
 	s.before = b
 }
@@ -159,19 +145,13 @@ func (s *sim) check() error {
 
 	h := s.h
 
-	// The budget is a limit on admission: a step may leave more weight
-	// unavailable than allowed only when the targets file changed under it,
-	// when one node heavier than the budget went while nothing else was
-	// unavailable, or when a new process started from a disk that was behind
-	// the old one's memory.
-	if used, allowed := h.unavailable(); used > allowed && used > s.before.used && !s.edited && !s.started && s.weightedUnavailable() > 1 {
+	// Probe observations may increase outages without any controller admission.
+	// New admissions must stay within budget or add only the lone rounded node.
+	if used, allowed := h.unavailable(); used > allowed && used > s.admissionUsed && !s.edited && !s.started && s.weightedUnavailable() > 1 {
 		return fmt.Errorf("unavailable weight rose from %v to %v, over the %v the budget allows", s.before.used, used, allowed)
 	}
 
-	// A halt earlier in the same tick may have degraded a node before
-	// another group's batch took it, so a free admission is checked against
-	// quarantines at either end of the step.
-	degraded := s.degradedNodes()
+	// Readiness and admissions, not quarantine, establish zero-cost grants.
 	active := map[string]string{}
 
 	for _, r := range h.c.Rollouts() {
@@ -179,7 +159,7 @@ func (s *sim) check() error {
 			return fmt.Errorf("rollout %s left terminal state %s for %s", r.ID, was, r.State)
 		}
 
-		if err := s.checkRollout(&r, degraded); err != nil {
+		if err := s.checkRollout(&r); err != nil {
 			return err
 		}
 
@@ -203,36 +183,13 @@ func (s *sim) check() error {
 	return nil
 }
 
-// degradedNodes is every node with a quarantined target, and every
-// quarantined target, which may have moved since its rollout began.
-func (s *sim) degradedNodes() map[string]bool {
-	set := s.h.current()
-	nodes := map[string]bool{}
-
-	s.h.c.mu.RLock()
-	defer s.h.c.mu.RUnlock()
-
-	for id := range s.h.c.degraded {
-		nodes[id] = true
-
-		if t, ok := set.Get(id); ok {
-			nodes[t.Node] = true
-		}
-	}
-
-	return nodes
-}
-
 // weightedUnavailable counts the unavailable nodes that carry weight.
 func (s *sim) weightedUnavailable() int {
 	set := s.h.current()
 
-	s.h.c.mu.RLock()
-	defer s.h.c.mu.RUnlock()
-
 	n := 0
 
-	for node := range s.h.c.inFlightNodes(s.h.clock.Now()) {
+	for node := range s.h.oracleUnavailable() {
 		if set.NodeWeight(node) > 0 {
 			n++
 		}
@@ -243,8 +200,8 @@ func (s *sim) weightedUnavailable() int {
 
 // checkRollout asserts the shape of one rollout: batch sizes, wave order,
 // manual policy, what completion means, and that a node was admitted free
-// only when it was already degraded.
-func (s *sim) checkRollout(r *RolloutView, after map[string]bool) error {
+// only when its node was already unavailable.
+func (s *sim) checkRollout(r *RolloutView) error {
 	if _, seen := s.manual[r.ID]; !seen {
 		s.manual[r.ID] = s.modes[r.Group] == ModeManual
 	}
@@ -279,7 +236,7 @@ func (s *sim) checkRollout(r *RolloutView, after map[string]bool) error {
 	// strategy it was cut under follows waves.
 	for _, a := range r.Targets {
 		for _, b := range r.Targets {
-			if a.DegradedBefore || b.DegradedBefore || a.Batch == 0 || b.Batch == 0 {
+			if a.NotReadyBefore || b.NotReadyBefore || a.Batch == 0 || b.Batch == 0 {
 				continue
 			}
 
@@ -293,12 +250,6 @@ func (s *sim) checkRollout(r *RolloutView, after map[string]bool) error {
 	for _, rt := range r.Targets {
 		if r.State == Complete && rt.Phase != PhasePassed && rt.Phase != PhaseSkipped {
 			return fmt.Errorf("rollout %s is Complete with %s %s", r.ID, rt.ID, rt.Phase)
-		}
-
-		// A new process may load a grant an earlier one made, from a disk
-		// that was behind its memory; grants are checked as they are made.
-		if !s.started && rt.Free && rt.Batch > 0 && !s.before.free[r.ID+"/"+rt.ID] && !s.before.degraded[rt.Node] && !s.before.degraded[rt.ID] && !after[rt.Node] {
-			return fmt.Errorf("rollout %s admitted %s free, but node %s was not degraded", r.ID, rt.ID, rt.Node)
 		}
 	}
 

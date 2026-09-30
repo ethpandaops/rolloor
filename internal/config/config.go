@@ -15,11 +15,10 @@ import (
 
 // Hook names the binary runs. Anything else named in a targets file is an error.
 const (
-	HookInspect     = "inspect"
-	HookUpdate      = "update"
-	HookReady       = "ready"
-	HookSoak        = "soak"
-	HookEnvironment = "environment"
+	HookInspect = "inspect"
+	HookUpdate  = "update"
+	HookReady   = "ready"
+	HookSoak    = "soak"
 )
 
 // TargetHooks are the hooks a target may name a program for.
@@ -38,6 +37,7 @@ type Config struct {
 	DisruptionBudget DisruptionBudget `yaml:"disruptionBudget"`
 	Hooks            Hooks            `yaml:"hooks"`
 	Inspect          Inspect          `yaml:"inspect"`
+	ReadinessProbe   ReadinessProbe   `yaml:"readinessProbe"`
 	// Strategy is how every group rolls out unless its policy names one of
 	// Strategies. A named strategy starts from Strategy and overrides only
 	// the fields it sets.
@@ -83,16 +83,9 @@ type Registry struct {
 
 // Hooks locates and bounds the programs.
 type Hooks struct {
-	Dir         string            `yaml:"dir" default:"/etc/rolloor/hooks"`
-	Timeout     time.Duration     `yaml:"timeout" default:"60s"`
-	Defaults    map[string]string `yaml:"defaults"`
-	Environment EnvironmentHook   `yaml:"environment"`
-}
-
-// EnvironmentHook is the optional environment-wide check.
-type EnvironmentHook struct {
-	Program  string        `yaml:"program"`
-	Interval time.Duration `yaml:"interval" default:"30s"`
+	Dir      string            `yaml:"dir" default:"/etc/rolloor/hooks"`
+	Timeout  time.Duration     `yaml:"timeout" default:"60s"`
+	Defaults map[string]string `yaml:"defaults"`
 }
 
 // Inspect paces live-state observation.
@@ -102,6 +95,13 @@ type Inspect struct {
 	// FailureThreshold is how many inspections in a row may fail before a
 	// target reads Unknown.
 	FailureThreshold int `yaml:"failureThreshold" default:"3"`
+}
+
+// ReadinessProbe paces independent assessment of each target's readiness.
+type ReadinessProbe struct {
+	Period           time.Duration `yaml:"period" default:"30s"`
+	FailureThreshold int           `yaml:"failureThreshold" default:"3"`
+	SuccessThreshold int           `yaml:"successThreshold" default:"1"`
 }
 
 // Strategy is how a rollout cuts batches and watches them.
@@ -303,6 +303,10 @@ func (c *Config) Validate() error {
 
 	if c.Inspect.Interval <= 0 || c.Inspect.Concurrency <= 0 || c.Inspect.FailureThreshold <= 0 {
 		return fmt.Errorf("config: inspect.interval, concurrency and failureThreshold must be positive")
+	}
+
+	if c.ReadinessProbe.Period <= 0 || c.ReadinessProbe.FailureThreshold <= 0 || c.ReadinessProbe.SuccessThreshold <= 0 {
+		return fmt.Errorf("config: readinessProbe.period, failureThreshold and successThreshold must be positive")
 	}
 
 	for h := range c.Hooks.Defaults {

@@ -25,9 +25,7 @@ type SyncRequest struct {
 }
 
 // Sync asks for the selected groups to converge now. Tags are re-resolved
-// first so the request acts on the current digests. A manual rollout waiting
-// for a sync starts; a group with no rollout gets one; an active rollout is
-// marked as a person's, so the environment check no longer holds it.
+// first; a manual rollout waiting for a sync starts, or a new one is created.
 func (c *Controller) Sync(ctx context.Context, req SyncRequest) ([]string, error) {
 	set := c.targets()
 
@@ -99,7 +97,7 @@ func (c *Controller) Sync(ctx context.Context, req SyncRequest) ([]string, error
 				r.Strategy = req.Strategy
 			}
 
-			if r.State == WaitingForSync || r.State == WaitingForEnvironment {
+			if r.State == WaitingForSync {
 				r.State, r.Reason, r.UpdatedAt = Running, "Started by "+req.Actor, now
 			}
 		})
@@ -244,7 +242,7 @@ func (c *Controller) Pause(ctx context.Context, actor, rolloutID string) error {
 	}
 
 	switch r.State {
-	case Running, Soaking, WaitingForBudget, WaitingForEnvironment:
+	case Running, Soaking, WaitingForBudget:
 	case WaitingForSync, Paused, Halted, Aborted, Superseded, Complete:
 		return fmt.Errorf("rollout is %s: %w", r.State, ErrState)
 	}

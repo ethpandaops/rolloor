@@ -54,6 +54,12 @@ inspect:
   # Failed inspections in a row before a target reads Unknown.
   failureThreshold: 3
 
+readinessProbe:
+  # Availability is assessed even when no rollout is active.
+  period: 10s
+  failureThreshold: 3
+  successThreshold: 1
+
 strategy:
   # One node first, to catch a bad build before it spreads.
   firstBatch: 1

@@ -45,7 +45,7 @@ func TestTwoTargetsOnOneNodeSortByID(t *testing.T) {
 
 	r := h.active("a")
 	require.Equal(t, tA3, r.Targets[2].ID)
-	require.Equal(t, "a-3/vc", r.Targets[3].ID)
+	require.Equal(t, tA3VC, r.Targets[3].ID)
 
 	// Batch sizes count nodes: two nodes take a-3's two targets and a-4's,
 	// and a-3 costs its weight once.
@@ -54,7 +54,7 @@ func TestTwoTargetsOnOneNodeSortByID(t *testing.T) {
 	h.ticks(4, 20*time.Second)
 	h.tick()
 	r = h.active("a")
-	require.Equal(t, []string{tA3, "a-3/vc", tA4}, r.Batches[1].Targets)
+	require.Equal(t, []string{tA3, tA3VC, tA4}, r.Batches[1].Targets)
 	require.Equal(t, "40.0% of 50%", r.Unavailable)
 	require.Contains(t, r.Reason, "updating 3 targets on 2 nodes")
 }
@@ -208,7 +208,8 @@ func TestRestoreBringsBackQuarantineAndStrategyFallback(t *testing.T) {
 	require.Equal(t, Halted, h.active("a").State)
 
 	restarted := h.newController()
-	require.Equal(t, Degraded, mustView(t, restarted, tA1).Health)
+	require.Equal(t, Healthy, mustView(t, restarted, tA1).Health)
+	require.Equal(t, restarted.Rollouts()[0].ID, mustView(t, restarted, tA1).Quarantine.Rollout)
 	require.Equal(t, Halted, restarted.Rollouts()[0].State)
 
 	// A stored strategy that has since been removed falls back to the default.
@@ -226,9 +227,7 @@ func TestRunWithCancelledContextAndTickerPaths(t *testing.T) {
 	h.clock.Advance(h.cfg.Registry.Poll)
 	require.ErrorIs(t, h.c.Tick(ctx), context.Canceled)
 
-	// Environment check due under a cancelled context reports it.
-	cfg := replaceLine(testConfig, "  defaults: {soak: \"\"}", "  defaults: {soak: \"\"}\n  environment: {program: env, interval: 30s}")
-	cfg = replaceLine(cfg, "inspect: {interval: 30s, concurrency: 4, failureThreshold: 2}", "inspect: {interval: 5ms, concurrency: 4, failureThreshold: 2}")
+	cfg := replaceLine(testConfig, "inspect: {interval: 30s, concurrency: 4, failureThreshold: 2}", "inspect: {interval: 5ms, concurrency: 4, failureThreshold: 2}")
 	h2 := newHarness(t, cfg, testTargets)
 	h2.tick()
 	h2.clock.Advance(30 * time.Second)
@@ -279,8 +278,8 @@ func TestGroupReasonShowsQuarantineWithoutRollout(t *testing.T) {
 
 	r := h.active("a")
 	require.NoError(t, h.c.Abort(h.ctx, actor, r.ID))
-	require.Contains(t, h.c.Fleet().Groups[0].Reason, "soak soak-a failed")
-	require.Equal(t, Degraded, h.c.Fleet().Groups[0].Health)
+	require.Equal(t, Healthy, h.c.Fleet().Groups[0].Health)
+	require.Equal(t, r.ID, h.view(tA1).Quarantine.Rollout)
 }
 
 func TestSnapshotSortsRolloutsAndSuspensions(t *testing.T) {
@@ -304,4 +303,22 @@ func TestSnapshotSortsRolloutsAndSuspensions(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, h.c.Suspensions(), 2)
 	require.Equal(t, "id-1", h.c.Suspensions()[0].ID)
+}
+
+func TestUndurableRolloutWithdrawsDueSoak(t *testing.T) {
+	h := newHarness(t, testConfig, testTargets)
+	h.prime()
+	h.release(imgA, d2)
+	id := h.active("a").ID
+	h.tick()
+	require.Equal(t, Soaking, h.rollout(id).State)
+	soaks := len(h.world.callsFor("soak"))
+	h.world.set(func(w *world) { w.registry[imgB] = d2 })
+	h.store.FailRollouts = errFake
+	h.clock.Advance(h.cfg.Registry.Poll)
+	require.NoError(t, h.c.Tick(h.ctx))
+	require.Equal(t, Soaking, h.rollout(id).State)
+	require.Len(t, h.world.callsFor("soak"), soaks)
+	h.store.FailRollouts = nil
+	require.Equal(t, Complete, h.drive(id, 40, h.cfg.Strategy.Soak.Interval).State)
 }

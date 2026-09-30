@@ -175,6 +175,7 @@ func newFixture(t *testing.T, loginURL func(string) string) *fixture {
 	require.NoError(t, err)
 
 	f.c.InspectAll(f.ctx)
+	f.c.ProbeAll(f.ctx)
 	require.NoError(t, f.c.Tick(f.ctx))
 
 	s, err := New(cfg, f.c, func() *targets.Set { return f.set }, f.auth, loginURL, "test", logrus.New())
@@ -200,6 +201,8 @@ func (f *fixture) release() {
 	f.c.Refresh(f.ctx, "test")
 
 	for range 6 {
+		f.c.InspectAll(f.ctx)
+		f.c.ProbeAll(f.ctx)
 		require.NoError(f.t, f.c.Tick(f.ctx))
 	}
 }

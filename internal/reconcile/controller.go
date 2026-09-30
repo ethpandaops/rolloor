@@ -79,10 +79,6 @@ type Controller struct {
 	aborted     map[string]string
 	hookRuns    map[string]map[string]HookRun
 
-	envOK        bool
-	envReason    string
-	envCheckedAt time.Time
-
 	lastResolve   time.Time
 	lastTick      time.Time
 	refreshWanted bool
@@ -92,6 +88,7 @@ type Controller struct {
 	// resolveMu serializes registry scans so an older scan cannot publish
 	// over a newer one.
 	resolveMu     sync.Mutex
+	probeMu       sync.Mutex
 	resolveErrors map[string]string
 	targetsError  string
 	nextEventID   int64
@@ -124,7 +121,6 @@ func New(ctx context.Context, opts *Options) (*Controller, error) {
 		aborted:       map[string]string{},
 		hookRuns:      map[string]map[string]HookRun{},
 		resolveErrors: map[string]string{},
-		envOK:         true,
 		nudge:         make(chan struct{}, 1),
 	}
 
@@ -153,6 +149,16 @@ func New(ctx context.Context, opts *Options) (*Controller, error) {
 
 	c.restore(snap)
 
+	var removed []string
+
+	for id := range c.live {
+		if _, present := c.targets().Get(id); !present {
+			removed = append(removed, id)
+		}
+	}
+
+	c.Forget(ctx, removed)
+
 	return c, nil
 }
 
@@ -169,8 +175,8 @@ func (c *Controller) restore(snap *Snapshot) {
 		c.suspensions[s.ID] = s
 	}
 
-	for id, l := range snap.Live {
-		c.live[id] = l
+	for id := range snap.Live {
+		c.live[id] = snap.Live[id]
 	}
 
 	for id, reason := range snap.Degraded {
@@ -245,17 +251,12 @@ func (c *Controller) Nudge() {
 	}
 }
 
-// Tick advances everything as far as the present moment allows: resolve tags
-// if due, run the environment check if due, expire suspensions, open rollouts
-// for groups that need one, and move every active rollout one step.
+// Tick resolves tags, expires suspensions, opens rollouts and advances active
+// operations from their observations.
 func (c *Controller) Tick(ctx context.Context) error {
 	now := c.clock.Now()
 
 	if err := c.resolveIfDue(ctx, now); err != nil {
-		return err
-	}
-
-	if err := c.checkEnvironmentIfDue(ctx, now); err != nil {
 		return err
 	}
 
@@ -412,49 +413,6 @@ func (c *Controller) ReportTargetsError(ctx context.Context, err error) {
 	c.event(ctx, now, &Event{Actor: ControllerActor, Action: "targets.invalid", Reason: msg})
 }
 
-// checkEnvironmentIfDue runs the environment hook on its interval.
-func (c *Controller) checkEnvironmentIfDue(ctx context.Context, now time.Time) error {
-	prog := c.cfg.Hooks.Environment.Program
-	if prog == "" {
-		return nil
-	}
-
-	c.mu.Lock()
-	due := c.envCheckedAt.IsZero() || now.Sub(c.envCheckedAt) >= c.cfg.Hooks.Environment.Interval
-	c.mu.Unlock()
-
-	if !due {
-		return nil
-	}
-
-	res, err := c.runner.Run(ctx, prog, config.HookEnvironment, "", map[string]string{"environment": c.cfg.Environment})
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.envCheckedAt = now
-
-	ok := err == nil && res.OK
-	reason := res.Reason
-
-	if err != nil {
-		reason = err.Error()
-	}
-
-	if ok != c.envOK {
-		action := "environment.passing"
-		if !ok {
-			action = "environment.failing"
-		}
-
-		c.event(ctx, now, &Event{Actor: ControllerActor, Action: action, Reason: reason})
-	}
-
-	c.envOK, c.envReason = ok, reason
-
-	return ctx.Err()
-}
-
 func (c *Controller) expireSuspensions(ctx context.Context, now time.Time) {
 	for id, s := range c.suspensions {
 		if !now.Before(s.ExpiresAt) {
@@ -530,7 +488,7 @@ func (c *Controller) writeOwed(ctx context.Context) error {
 // quarantine or abort marker must not come back after a restart, so the
 // tables are replaced whole.
 func (c *Controller) decisions() *Snapshot {
-	snap := &Snapshot{Degraded: c.degraded, Aborted: c.aborted, Desired: c.desired}
+	snap := &Snapshot{Degraded: c.degraded, Aborted: c.aborted, Desired: c.desired, Live: c.live, HookRuns: c.hookRuns}
 
 	for _, r := range c.rollouts {
 		snap.Rollouts = append(snap.Rollouts, r)
@@ -588,7 +546,12 @@ func (c *Controller) setLiveLocked(ctx context.Context, now, observedAt time.Tim
 	}
 
 	if ok {
-		l = Live{Digest: digest, SeenAt: now}
+		since := l.DigestSince
+		if l.Digest != digest || since.IsZero() {
+			since = now
+		}
+
+		l = Live{Digest: digest, SeenAt: now, DigestSince: since, Readiness: l.Readiness}
 	} else {
 		l.Failures++
 		l.Reason = reason

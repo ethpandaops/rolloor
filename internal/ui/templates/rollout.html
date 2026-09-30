@@ -7,7 +7,7 @@
     {{$rid := .Rollout.ID}}{{$next := printf "/rollouts/%s" .Rollout.ID}}
     {{if eq .Rollout.State "Paused"}}
       <form method="post" action="/actions/promote" class="inline"><input type="hidden" name="rollout" value="{{$rid}}"><input type="hidden" name="next" value="{{$next}}"><button class="primary" {{if not .Can.OK}}disabled title="{{.Can.Why}}"{{end}}>Promote</button></form>
-    {{else if or (eq .Rollout.State "Running") (eq .Rollout.State "Soaking") (eq .Rollout.State "WaitingForBudget") (eq .Rollout.State "WaitingForEnvironment")}}
+    {{else if or (eq .Rollout.State "Running") (eq .Rollout.State "Soaking") (eq .Rollout.State "WaitingForBudget")}}
       <form method="post" action="/actions/pause" class="inline"><input type="hidden" name="rollout" value="{{$rid}}"><input type="hidden" name="next" value="{{$next}}"><button {{if or (not .Can.OK) .Rollout.PausePending}}disabled title="{{if .Rollout.PausePending}}pause already pending{{else}}{{.Can.Why}}{{end}}"{{end}}>Pause</button></form>
     {{else if eq .Rollout.State "Halted"}}
       <details class="dialog"><summary {{if not .Can.OK}}class="disabled" title="{{.Can.Why}}"{{end}}>Retry…</summary>
@@ -34,9 +34,9 @@
   <p>{{.Rollout.Reason}}</p>
   {{if .Quarantine}}
   <div class="quarantine"><h3>{{len .Quarantine}} quarantined targets</h3><p>Left as they are so you can look at them; the digest column on each node says what they run.</p>
-    <ul>{{range .Quarantine}}<li><code>{{.ID}}</code> {{template "health-badge" "Degraded"}} <span class="muted">{{.Reason}}</span></li>{{end}}</ul></div>
+    <ul>{{range .Quarantine}}<li><code>{{.ID}}</code> <span class="muted">{{.Reason}}</span></li>{{end}}</ul></div>
   {{end}}
-  <p class="muted">A new {{.Rollout.Group}} build clears this halt. The quarantined targets update first.</p>
+  <p class="muted">A new {{.Rollout.Group}} build clears this halt. Targets that are not ready update first.</p>
 </div>
 {{else}}
 <div class="cards">

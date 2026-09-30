@@ -59,6 +59,7 @@ func TestCollector(t *testing.T) {
 	require.NoError(t, err)
 
 	c.InspectAll(ctx)
+	c.ProbeAll(ctx)
 	require.NoError(t, c.Tick(ctx))
 
 	reg := prometheus.NewRegistry()
@@ -75,7 +76,6 @@ func TestCollector(t *testing.T) {
 	require.Contains(t, names, "rolloor_target_info")
 	require.Contains(t, names, "rolloor_rollout_state")
 	require.Contains(t, names, "rolloor_disruption_budget_ratio")
-	require.Contains(t, names, "rolloor_environment_check_passing")
 
 	out, err := testutil.GatherAndCount(reg)
 	require.NoError(t, err)
@@ -84,12 +84,11 @@ func TestCollector(t *testing.T) {
 	require.InDelta(t, 0, syncValue(reconcile.Synced), 0)
 	require.InDelta(t, 1, syncValue(reconcile.OutOfSync), 0)
 	require.InDelta(t, 2, syncValue(reconcile.Unknown), 0)
-	require.InDelta(t, 2, syncValue(reconcile.SyncState("x")), 0)
 	require.InDelta(t, 0, healthValue(reconcile.Healthy), 0)
 	require.InDelta(t, 1, healthValue(reconcile.Progressing), 0)
 	require.InDelta(t, 2, healthValue(reconcile.Degraded), 0)
 	require.InDelta(t, 3, healthValue(reconcile.Suspended), 0)
-	require.InDelta(t, 0, healthValue(reconcile.Health("x")), 0)
+	require.InDelta(t, 4, healthValue(reconcile.HealthUnknown), 0)
 }
 
 func TestHookRunner(t *testing.T) {

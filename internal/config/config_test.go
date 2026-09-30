@@ -18,6 +18,7 @@ func TestParseMinimal(t *testing.T) {
 	require.Equal(t, time.Minute, cfg.Strategy.Soak.Interval)
 	require.Equal(t, 1, cfg.Strategy.Soak.FailureLimit)
 	require.Equal(t, 3, cfg.Inspect.FailureThreshold)
+	require.Equal(t, ReadinessProbe{Period: 30 * time.Second, FailureThreshold: 3, SuccessThreshold: 1}, cfg.ReadinessProbe)
 	require.Empty(t, cfg.Strategies)
 	require.Equal(t, "inspect", cfg.Hooks.Defaults[HookInspect])
 	require.True(t, cfg.Strategy.UsesWaves())
@@ -97,6 +98,10 @@ func TestValidateErrors(t *testing.T) {
 		"unnamed strategy":               "environment: x\nstrategies: {\"\": {batchSize: 1}}\n",
 		"trusted token without audience": "environment: x\nauth: {mode: oidc, issuer: i, clientId: c, redirectUrl: r, trustedTokens: [{issuer: j}]}\n",
 		"strategy not a mapping":         "environment: x\nstrategies: {fast: [1]}\n",
+		"zero probe period":              "environment: x\nreadinessProbe: {period: 0s}\n",
+		"negative probe failures":        "environment: x\nreadinessProbe: {failureThreshold: -1}\n",
+		"zero probe successes":           "environment: x\nreadinessProbe: {successThreshold: 0}\n",
+		"removed environment hook":       "environment: x\nhooks: {environment: {program: check}}\n",
 	}
 
 	for name, raw := range cases {
