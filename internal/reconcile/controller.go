@@ -159,6 +159,12 @@ func New(ctx context.Context, opts *Options) (*Controller, error) {
 
 	c.Forget(ctx, removed)
 
+	for _, r := range c.rollouts {
+		if !r.State.Active() {
+			c.clearRolloutQuarantine(ctx, r)
+		}
+	}
+
 	return c, nil
 }
 

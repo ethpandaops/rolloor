@@ -351,6 +351,7 @@ func (c *Controller) Abort(ctx context.Context, actor, rolloutID string) error {
 		return err
 	}
 
+	c.clearRolloutQuarantine(ctx, r)
 	c.aborted[r.Group] = key
 	c.event(ctx, now, &Event{Actor: ControllerActor, Action: "rollout.aborted", Group: r.Group, Rollout: r.ID, Reason: reason})
 

@@ -146,7 +146,7 @@ func (c *Controller) retryFits(set *targets.Set, r *Rollout, now time.Time) (str
 
 	budget := c.cfg.DisruptionBudget.MaxUnavailable.OfWeight(set.TotalWeight())
 	inflight := c.unavailableWeight(set)
-	alone := budget > 0 && len(busy) == 0 && len(nodes) == 1
+	alone := budget > 0 && inflight == 0 && len(nodes) == 1
 
 	if cost == 0 || inflight+cost <= budget || alone {
 		return "", true

@@ -57,7 +57,18 @@ func (c *Controller) desiredForImage(group, image string, set *targets.Set) (str
 func (c *Controller) finish(ctx context.Context, now time.Time, r *Rollout, state RolloutState, reason string) {
 	c.end(now, r, state, reason)
 	_ = c.saveRollout(ctx, r)
+	c.clearRolloutQuarantine(ctx, r)
 	c.event(ctx, now, &Event{Actor: ControllerActor, Action: "rollout." + lower(state), Group: r.Group, Rollout: r.ID, Reason: reason})
+}
+
+func (c *Controller) clearRolloutQuarantine(ctx context.Context, r *Rollout) {
+	for i := range r.Targets {
+		rt := &r.Targets[i]
+		if q := c.quarantineFor(rt.ID); q != nil && q.Rollout == r.ID {
+			delete(c.degraded, rt.ID)
+			_ = c.persist(ctx, c.store.ClearDegraded(ctx, rt.ID))
+		}
+	}
 }
 
 // end is the in-memory part of finishing. A target whose update was
@@ -356,7 +367,7 @@ func (c *Controller) startBatch(ctx context.Context, now time.Time, r *Rollout, 
 			// As maxUnavailable rounds up to one pod on a DaemonSet, a budget
 			// above zero lets one node go when nothing else is unavailable,
 			// however heavy; otherwise such a node could never be updated.
-			alone := budget > 0 && len(busy) == 0 && len(nodes) == 0
+			alone := budget > 0 && inflight == 0 && cost == 0
 			if inflight+cost+w > budget && w > 0 && !alone {
 				continue
 			}

@@ -432,8 +432,7 @@ func TestFlushRewritesQuarantineAndAbortMarkers(t *testing.T) {
 	require.Equal(t, Halted, h.active("a").State)
 	require.NoError(t, h.c.Abort(h.ctx, actor, h.active("a").ID))
 
-	// A failing tick marks the state dirty; the recovering tick writes the
-	// quarantine and the abort marker again along with the rollouts.
+	// Recovery must preserve deletions as well as the abort marker.
 	h.store.Fail = errFake
 	h.world.set(func(w *world) { w.registry[imgB] = d2 })
 	h.clock.Advance(h.cfg.Registry.Poll)
@@ -449,6 +448,6 @@ func TestFlushRewritesQuarantineAndAbortMarkers(t *testing.T) {
 
 	snap, err := h.store.Load(h.ctx)
 	require.NoError(t, err)
-	require.Contains(t, snap.Degraded, tA1)
+	require.NotContains(t, snap.Degraded, tA1)
 	require.Contains(t, snap.Aborted, "a")
 }

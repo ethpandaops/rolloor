@@ -16,10 +16,10 @@ The spec is `tasks/prd.md`.
 
 1. The registry is polled; a tag now points at a new digest.
 2. `inspect` reports what each container runs. Those behind form a rollout per group (the value of a configured label).
-3. Targets are sorted (not ready at rollout creation first, then by `wave` label, node, id) and cut into batches of nodes (the `strategy`: `firstBatch`, `batchSize`) that fit the disruption budget; a batch takes all of a node's targets in the group. An already-unavailable node adds no unavailable weight. When nothing else is unavailable, one node may go however heavy it is, as `maxUnavailable` rounds up to one pod on a Kubernetes DaemonSet; `maxUnavailable: 0` admits only nodes already unavailable or weightless.
+3. Targets are sorted (not ready at rollout creation first, then by `wave` label, node, id) and cut into batches of nodes (the `strategy`: `firstBatch`, `batchSize`) that fit the disruption budget; a batch takes all of a node's targets in the group. An already-unavailable node adds no unavailable weight. When unavailable weight and the batch's cost are both zero, one weighted node may go however heavy it is, as `maxUnavailable` rounds up to one pod on a Kubernetes DaemonSet; weightless nodes never consume the budget. `maxUnavailable: 0` admits only nodes already unavailable or weightless.
 4. `update` starts each update. The independent inspector observes the new digest, then the rollout waits for a successful readiness probe that began after that digest was first seen. The rollout does not run `ready`.
 5. `soak` compares the batch against the containers not yet reached, every `interval` for `duration`. Passing moves on; more than `failureLimit` failed checks halts and quarantines the batch.
-6. A newer digest supersedes a halted or running rollout. Currently not-ready targets go first in the next one. Quarantine is rollout metadata, not observed health or digest drift: a quarantined target can be Healthy and Synced, and does not need an update solely to clear its quarantine.
+6. A newer digest supersedes a halted or running rollout. Currently not-ready targets go first in the next one. Quarantine is rollout metadata, not observed health or digest drift: it ends on abort or supersession, or when a retried target passes its batch. A quarantined target can be Healthy and Synced, and does not need an update solely to clear its quarantine.
 
 People can sync, pause, promote, abort, retry, suspend targets with an expiry, and set a group's policy (automated or manual, a named strategy, pinned digests).
 

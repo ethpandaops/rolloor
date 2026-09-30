@@ -267,7 +267,7 @@ func TestRemovingEveryTargetOfAnImageMidRollout(t *testing.T) {
 	require.Equal(t, PhaseSkipped, h.phases(final)["b-1/el"])
 }
 
-func TestGroupReasonShowsQuarantineWithoutRollout(t *testing.T) {
+func TestAbortClearsQuarantineWithoutChangingHealth(t *testing.T) {
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
 	h.world.set(func(w *world) { w.soakFail[soakA] = true })
@@ -277,9 +277,15 @@ func TestGroupReasonShowsQuarantineWithoutRollout(t *testing.T) {
 	h.tick()
 
 	r := h.active("a")
+	require.Equal(t, r.ID, h.view(tA1).Quarantine.Rollout)
+	h.store.FailRollouts = errFake
+	require.ErrorIs(t, h.c.Abort(h.ctx, actor, r.ID), errFake)
+	require.Equal(t, r.ID, h.view(tA1).Quarantine.Rollout)
+	h.store.FailRollouts = nil
 	require.NoError(t, h.c.Abort(h.ctx, actor, r.ID))
 	require.Equal(t, Healthy, h.c.Fleet().Groups[0].Health)
-	require.Equal(t, r.ID, h.view(tA1).Quarantine.Rollout)
+	require.Nil(t, h.view(tA1).Quarantine)
+	require.Nil(t, mustView(t, h.newController(), tA1).Quarantine)
 }
 
 func TestSnapshotSortsRolloutsAndSuspensions(t *testing.T) {
@@ -321,4 +327,23 @@ func TestUndurableRolloutWithdrawsDueSoak(t *testing.T) {
 	require.Len(t, h.world.callsFor("soak"), soaks)
 	h.store.FailRollouts = nil
 	require.Equal(t, Complete, h.drive(id, 40, h.cfg.Strategy.Soak.Interval).State)
+}
+
+func TestRestartClearsQuarantineFromEndedRollout(t *testing.T) {
+	h := newHarness(t, testConfig, testTargets)
+	h.prime()
+	h.world.set(func(w *world) { w.updateFail[tA1] = refused })
+	h.release(imgA, d2)
+	r := h.active("a")
+	require.Equal(t, Halted, r.State)
+
+	h.store.mu.Lock()
+	h.store.rollouts[r.ID].State = Superseded
+	h.store.mu.Unlock()
+
+	h.c = h.newController()
+	require.Nil(t, h.view(tA1).Quarantine)
+	snap, err := h.store.Load(h.ctx)
+	require.NoError(t, err)
+	require.NotContains(t, snap.Degraded, tA1)
 }

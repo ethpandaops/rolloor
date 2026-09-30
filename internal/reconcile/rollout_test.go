@@ -1,6 +1,7 @@
 package reconcile
 
 import (
+	"fmt"
 	"slices"
 	"testing"
 	"time"
@@ -154,6 +155,8 @@ func TestSoakFailureHaltsQuarantinesAndRetries(t *testing.T) {
 	require.Equal(t, Running, h.active("a").State)
 	require.Equal(t, PhasePassed, h.phases(h.active("a"))[tA1])
 	require.Equal(t, Healthy, h.view(tA1).Health)
+	require.Nil(t, h.view(tA1).Quarantine)
+	require.Nil(t, mustView(t, h.newController(), tA1).Quarantine)
 	require.ErrorIs(t, h.c.Retry(h.ctx, actor, r.ID, "again"), ErrState)
 }
 
@@ -175,6 +178,8 @@ func TestNewDigestSupersedesHaltAndDegradedGoFirst(t *testing.T) {
 	old := h.rollout(first.ID)
 	require.Equal(t, Superseded, old.State)
 	require.Contains(t, old.Reason, "moved to 3333333")
+	require.Nil(t, h.view(tA1).Quarantine)
+	require.Nil(t, mustView(t, h.newController(), tA1).Quarantine)
 
 	next := h.active("a")
 	require.NotEqual(t, first.ID, next.ID)
@@ -820,8 +825,7 @@ func TestSyncDoesNotRedeployQuarantinedDesiredBuild(t *testing.T) {
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
 
-	// a-1 takes d2 but never reports ready; the rollout halts and is
-	// aborted, leaving a-1 quarantined while it runs the desired digest.
+	// Aborting clears operation metadata without changing observed readiness.
 	h.world.set(func(w *world) { w.notReady[tA1] = true })
 	h.release(imgA, d2)
 	h.ticks(3, 0)
@@ -840,7 +844,7 @@ func TestSyncDoesNotRedeployQuarantinedDesiredBuild(t *testing.T) {
 	r := h.active("a")
 	require.Equal(t, Complete, h.drive(r.ID, 100, 20*time.Second).State)
 	require.Equal(t, Healthy, h.view(tA1).Health)
-	require.Equal(t, halted.ID, h.view(tA1).Quarantine.Rollout)
+	require.Nil(t, h.view(tA1).Quarantine)
 }
 
 // oneNodeConfig allows 100 weight, one weighted node of these fleets at a time.
@@ -960,4 +964,52 @@ func TestRetryWaitsForTheBudgetWhenItsQuarantineWasLifted(t *testing.T) {
 	h.world.set(func(w *world) { w.notReady["n2/b"] = false })
 	require.Equal(t, Complete, h.drive(rb.ID, 100, 20*time.Second).State)
 	require.Equal(t, Complete, h.drive(ra.ID, 100, 20*time.Second).State)
+}
+
+func TestWeightlessNodesDoNotBlockAHeavyNodeGoingAlone(t *testing.T) {
+	for _, notReady := range []bool{false, true} {
+		t.Run(fmt.Sprintf("not-ready-%t", notReady), func(t *testing.T) {
+			h := newHarness(t, replaceLine(testConfig, "maxUnavailable: 50%", "maxUnavailable: 10%"), `
+- {id: n0/a, node: n0, weight: 0, image: org/a:t, labels: {client: a, owner: a}}
+- {id: n1/a, node: n1, weight: 300, image: org/a:t, labels: {client: a, owner: a}}
+- {id: n2/b, node: n2, weight: 100, image: org/b:t, labels: {client: b, owner: b}}
+`)
+			h.prime()
+			h.world.set(func(w *world) { w.notReady["n0/a"] = notReady })
+
+			for range h.cfg.ReadinessProbe.FailureThreshold {
+				h.c.ProbeAll(h.ctx)
+			}
+
+			h.release(imgA, d2)
+			r := h.active("a")
+			require.Equal(t, []string{"n0/a", tN1A}, r.Batches[0].Targets)
+			require.True(t, r.target(tN1A).UpdateDone)
+			require.False(t, r.target(tN1A).Free)
+		})
+	}
+}
+
+func TestWeightlessOutageDoesNotBlockAHeavyNodeRetry(t *testing.T) {
+	h := newHarness(t, replaceLine(testConfig, "maxUnavailable: 50%", "maxUnavailable: 10%"), `
+- {id: n0/b, node: n0, weight: 0, image: org/b:t, labels: {client: b, owner: b}}
+- {id: n1/a, node: n1, weight: 300, image: org/a:t, labels: {client: a, owner: a}}
+`)
+	h.prime()
+	h.world.set(func(w *world) { w.updateFail[tN1A] = boom })
+	h.release(imgA, d2)
+	r := h.active("a")
+	require.Equal(t, Halted, r.State)
+	h.clock.Advance(h.cfg.Hooks.Timeout*5 + time.Second)
+	h.world.set(func(w *world) {
+		delete(w.updateFail, tN1A)
+		w.notReady["n0/b"] = true
+	})
+
+	for range h.cfg.ReadinessProbe.FailureThreshold {
+		h.c.ProbeAll(h.ctx)
+	}
+
+	require.NoError(t, h.c.Retry(h.ctx, actor, r.ID, "updater recovered"))
+	require.Equal(t, Complete, h.drive(r.ID, 20, time.Second).State)
 }
