@@ -1,9 +1,8 @@
-# rolloor for the Kurtosis devnet example, laid out the way one devnet's
-# instance would be. run.sh runs the rolloor image with this file at
-# /etc/rolloor/config.yaml and mounts the hooks, targets and registry
-# certificate beside it.
+# rolloor for the Kurtosis devnet example, laid out like one devnet's instance.
+# run.sh runs the rolloor image with this file at /etc/rolloor/config.yaml and
+# mounts the hooks, targets and registry certificate beside it.
 
-# Shown in the page header.
+# Shown in the page header and passed to hooks as ROLLOOR_ENVIRONMENT.
 environment: kurtosis-example
 
 # Where the web UI, API and metrics listen.
@@ -16,6 +15,7 @@ dataDir: /var/lib/rolloor
 # devnet, ansible writes it from the inventory.
 targetsDir: /etc/rolloor/targets.d
 
+# Which target labels rolloor gives meaning to.
 labels:
   # One rollout per client: lighthouse targets move together, geth apart.
   group: client
@@ -24,63 +24,89 @@ labels:
   # Fleet page headings: el, cl, vc.
   section: role
 
+# How image tags are resolved to digests.
 registry:
   # How often every tag is resolved. A devnet would use a minute or more.
   poll: 10s
   # The example registry signs its certificate itself.
   caFile: /etc/rolloor/registry.crt
 
+# How much weight may be unavailable at once, across every rollout.
 disruptionBudget:
   # Four nodes of 32 validators each: at most two nodes' validators may be
-  # restarting at once.
+  # unavailable at once, whether restarting or down for other reasons.
   maxUnavailable: 50%
 
+# The programs rolloor runs.
 hooks:
   # The example's shell hooks (examples/kurtosis/hooks).
   dir: /etc/rolloor/hooks
-  # Each hook run is killed after this long; an update must show its digest,
-  # and then pass ready, within five times this.
+  # Each hook run is killed after this long.
   timeout: 30s
-  # Used by any target that does not name its own under `hooks`.
+  # Used by any target that does not name its own under `hooks`. Beacon
+  # nodes name soak-beacon; other targets have no soak.
   defaults:
+    # Prints the digest watchtower says the container runs.
     inspect: inspect
+    # Asks watchtower to update the container to the desired digest.
     update: update
+    # Passes while the container is running, whatever build it runs.
     ready: ready-running
 
+# How running digests are read.
 inspect:
   # How often each container's running digest is read from its node.
   interval: 10s
+  # How many inspect programs run at once.
   concurrency: 8
   # Failed inspections in a row before a target reads Unknown.
   failureThreshold: 3
 
+# Availability is probed on every target, in or out of a rollout.
 readinessProbe:
-  # Availability is assessed even when no rollout is active.
+  # How often each target's ready program runs.
   period: 10s
+  # Failed probes in a row before a target reads not ready.
   failureThreshold: 3
+  # Passing probes in a row before it reads ready again.
   successThreshold: 1
 
+# How every group rolls out.
 strategy:
   # One node first, to catch a bad build before it spreads.
   firstBatch: 1
   # Then half the nodes per batch.
   batchSize: 50%
+  # Time allowed to observe the new digest and readiness after an update.
+  progressDeadline: 150s
+  # How failed update programs are tried again.
+  retry:
+    # Update attempts per target, the first included.
+    limit: 5
+  # How each ready batch is compared with the nodes not yet updated.
   soak:
-    # Watch each batch for a minute against the nodes not yet updated.
+    # Watch each batch for a minute.
     duration: 60s
     # Compare every 15 seconds.
     interval: 15s
     # A restarted node can briefly have fewer peers; tolerate two bad checks.
     failureLimit: 2
+    # Checks in a row that could not run, tolerated before the rollout halts.
+    consecutiveErrorLimit: 4
 
+# Applies to every group without a stored policy.
 defaultPolicy:
   # Rollouts start as soon as a new build is seen.
   mode: automated
 
+# Who may sign in and act.
 auth:
   # No sign-in in CI; history records the remote address.
   mode: none
 
+# The process's own logging.
 log:
+  # Least severe level written.
   level: info
+  # text for people, json for log collectors.
   format: text

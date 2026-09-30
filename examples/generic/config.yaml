@@ -1,7 +1,7 @@
 # rolloor configuration for the generic example: six nginx containers on a
 # local registry, no workload knowledge anywhere.
 
-# Shown in the page header; the only place the environment's name appears.
+# Shown in the page header and passed to hooks as ROLLOOR_ENVIRONMENT.
 environment: example
 
 # Where the web UI, API and metrics listen.
@@ -13,6 +13,7 @@ dataDir: /tmp/rolloor-example/data
 # Every *.yaml file here is read as a list of targets, and reloaded on change.
 targetsDir: examples/generic/targets.d
 
+# Which target labels rolloor gives meaning to.
 labels:
   # Rollouts, policies and fleet tiles are per value of this label.
   group: app
@@ -20,20 +21,24 @@ labels:
   owner: owner
   # Optional: fleet page headings.
   section: tier
+  # Lower values of this label update first; targets.yaml uses 0 and 1.
+  wave: wave
 
+# How image tags are resolved to digests.
 registry:
-  # How often every image tag is resolved to a digest.
+  # How often every image tag is resolved.
   poll: 5s
   # Registries spoken to over plain HTTP.
   plainHttp:
     - localhost:5050
 
+# How much weight may be unavailable at once, across every rollout.
 disruptionBudget:
-  # Share of weight allowed to be unavailable, including unrelated outages.
-  # The weighted nodes carry 30 in all; 40% is 12, so one healthy weighted
-  # node can update at a time.
+  # Counts unrelated outages too. The weighted nodes carry 30 in all; 40% is
+  # 12, so one healthy weighted node can update at a time.
   maxUnavailable: 40%
 
+# The programs rolloor runs.
 hooks:
   # Programs are bare names under this directory.
   dir: examples/generic/hooks
@@ -41,11 +46,16 @@ hooks:
   timeout: 5s
   # Programs used for targets that do not name their own under `hooks`.
   defaults:
+    # Prints the digest a container runs.
     inspect: inspect
+    # Recreates a container from the desired digest.
     update: update
+    # Passes while the container answers 200, whatever build it runs.
     ready: ready
+    # Passes while updated containers answer as reliably as the rest.
     soak: soak
 
+# How running digests are read.
 inspect:
   # How often every target's running digest is read.
   interval: 5s
@@ -54,15 +64,34 @@ inspect:
   # Inspections in a row that may fail before a target reads Unknown.
   failureThreshold: 2
 
+# Availability is probed on every target, in or out of a rollout.
 readinessProbe:
-  # Poll availability independently of rollout progress.
+  # How often each target's ready program runs.
   period: 5s
+  # Failed probes in a row before a target reads not ready.
   failureThreshold: 3
+  # Passing probes in a row before it reads ready again.
   successThreshold: 1
 
+# How every group rolls out.
 strategy:
   # Nodes per batch, as a share of the rollout's nodes or a count.
   batchSize: 50%
+  # Time allowed to observe the new digest and readiness after an update.
+  progressDeadline: 60s
+  # How failed update programs are tried again.
+  retry:
+    # Update attempts per target, the first included.
+    limit: 5
+    # Delay between attempts.
+    backoff:
+      # Before the second attempt.
+      duration: 10s
+      # Each later delay is this many times the previous one.
+      factor: 2
+      # No delay is longer than this.
+      maxDuration: 3m
+  # How each ready batch is compared with the targets not yet reached.
   soak:
     # How long each batch is watched before the next one starts.
     duration: 10s
@@ -70,15 +99,22 @@ strategy:
     interval: 2s
     # Failed checks tolerated before the rollout halts.
     failureLimit: 1
+    # Checks in a row that could not run, tolerated before the rollout halts.
+    consecutiveErrorLimit: 4
 
+# Applies to every group without a stored policy.
 defaultPolicy:
   # automated: rollouts start by themselves; manual: they wait for a sync.
   mode: automated
 
+# Who may sign in and act.
 auth:
   # No sign-in: everyone may act, and history records the remote address.
   mode: none
 
+# The process's own logging.
 log:
+  # Least severe level written: debug, info, warn or error.
   level: info
+  # text for people, json for log collectors.
   format: text

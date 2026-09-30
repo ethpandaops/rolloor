@@ -116,7 +116,7 @@ func TestValidateErrors(t *testing.T) {
 		"zero probe period":              "environment: x\nreadinessProbe: {period: 0s}\n",
 		"negative probe failures":        "environment: x\nreadinessProbe: {failureThreshold: -1}\n",
 		"zero probe successes":           "environment: x\nreadinessProbe: {successThreshold: 0}\n",
-		"removed environment hook":       "environment: x\nhooks: {environment: {program: check}}\n",
+		"unknown hook settings":          "environment: x\nhooks: {probe: {program: check}}\n",
 		"zero progress deadline":         "environment: x\nstrategy: {progressDeadline: 0s}\n",
 		"negative retry limit":           "environment: x\nstrategy: {retry: {limit: -1}}\n",
 		"zero backoff duration":          "environment: x\nstrategy: {retry: {backoff: {duration: 0s}}}\n",

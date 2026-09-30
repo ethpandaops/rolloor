@@ -238,8 +238,8 @@ func TestSoakEvidenceIsTheCompletedCheck(t *testing.T) {
 }
 
 func TestDegradedNodeCostsNothingForAnotherGroup(t *testing.T) {
-	// a-3 carries a-3/cl (group a) and a-3/el (group b). Quarantine a-3/cl,
-	// then group b's rollout must not pay for a-3 either.
+	// One node carries both groups. Its observed outage is already charged,
+	// so repairing the other group adds no unavailable weight for that node.
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
 	h.world.set(func(w *world) {
