@@ -336,8 +336,6 @@ func (s *sim) edit() string {
 		return "edit: nothing"
 	}
 
-	s.edited = true
-
 	old := s.h.current()
 
 	set, err := targets.Parse([]byte(s.fleet.yaml()), &testRules)

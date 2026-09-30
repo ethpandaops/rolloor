@@ -34,7 +34,9 @@ const (
 	mine      = "mine"
 	tA3el     = "a-3/el"
 	tA3VC     = "a-3/vc"
+	tN0A      = "n0/a"
 	tN1A      = "n1/a"
+	tN2A      = "n2/a"
 
 	imgA  = "org/a:t"
 	imgB  = "org/b:t"
@@ -335,7 +337,6 @@ type harness struct {
 	notes         *notes
 	c             *Controller
 	ids           int
-	beforeTick    func()
 	admission     map[string]bool
 	admissionUsed float64
 	// setMu guards set for tests that swap it while programs are running.
@@ -418,10 +419,6 @@ func (h *harness) tick() {
 	h.c.ProbeAll(h.ctx)
 	h.admission = h.oracleUnavailable()
 	h.admissionUsed, _ = h.unavailable()
-
-	if h.beforeTick != nil {
-		h.beforeTick()
-	}
 
 	require.NoError(h.t, h.c.Tick(h.ctx))
 }
@@ -514,6 +511,10 @@ func (h *harness) oracleUnavailable() map[string]bool {
 	h.c.mu.RLock()
 	defer h.c.mu.RUnlock()
 
+	return h.oracleUnavailableLocked(set, now, "", nil)
+}
+
+func (h *harness) oracleUnavailableLocked(set *targets.Set, now time.Time, changed string, before *Rollout) map[string]bool {
 	nodes := map[string]bool{}
 
 	for _, t := range set.Targets {
@@ -523,7 +524,15 @@ func (h *harness) oracleUnavailable() map[string]bool {
 		}
 	}
 
-	for _, r := range h.c.rollouts {
+	for id, r := range h.c.rollouts {
+		if id == changed {
+			r = before
+		}
+
+		if r == nil {
+			continue
+		}
+
 		h.oracleRolloutUnavailableLocked(set, now, r, nodes)
 	}
 

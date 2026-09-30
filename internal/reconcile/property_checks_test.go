@@ -6,6 +6,10 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 // dispatched checks an update at the moment the process runs it: the batch
@@ -31,38 +35,79 @@ func (s *sim) dispatched(disk *MemoryStore, id, digest string) {
 		}
 	}
 
-	s.checkAdmission(id)
-
 	s.mu.Lock()
 	s.dispatches = append(s.dispatches, propDispatch{id: id, group: t.group, digest: digest})
 	s.mu.Unlock()
 }
 
-// checkAdmission asserts the budget when a newly admitted target's update
-// runs, after every batch of the tick was cut: the weight unavailable is
-// within the budget, or the target's node is the only weighted node
-// unavailable. A node already counted, free or weightless adds nothing.
-func (s *sim) checkAdmission(id string) {
-	h := s.h
-	set := h.current()
+// admissionProblem checks a durable reservation before its hooks run, using
+// current observations and the previous reservation rather than Free flags.
+// The caller holds the controller lock while publishing the decision.
+func (s *sim) admissionProblem(r, before *Rollout) error {
+	b := r.CurrentBatch()
+	if !r.State.Active() || b == nil {
+		return nil
+	}
 
-	for _, r := range h.c.Rollouts() {
-		b := r.CurrentBatch()
-		if !r.State.Active() || b == nil || !slices.Contains(b.Targets, id) {
+	var prior *Batch
+	if before != nil {
+		prior = before.CurrentBatch()
+	}
+
+	var nodes map[string]bool
+
+	for _, id := range b.Targets {
+		rt := r.target(id)
+		if rt.Phase != PhasePending && rt.Phase != PhaseUpdating && rt.Phase != PhaseReady {
 			continue
 		}
 
-		rt := r.target(id)
-		if s.before.open[r.ID+"/"+id] || s.admission[rt.Node] || set.NodeWeight(rt.Node) == 0 {
-			return
+		if prior != nil && prior.Number == b.Number {
+			old := before.target(id)
+			if old != nil && old.Batch == b.Number && (old.Phase == PhasePending || old.Phase == PhaseUpdating || old.Phase == PhaseReady) {
+				continue
+			}
 		}
 
-		if used, allowed := h.unavailable(); used > allowed && s.weightedUnavailable() > 1 {
-			s.violation("%s was admitted with %v unavailable, over the %v the budget allows", id, used, allowed)
+		if nodes == nil {
+			nodes = map[string]bool{}
 		}
 
-		return
+		nodes[rt.Node] = true
 	}
+
+	if len(nodes) == 0 {
+		return nil
+	}
+
+	h := s.h
+	set := h.current()
+	busy := h.oracleUnavailableLocked(set, h.clock.Now(), r.ID, before)
+
+	var used, cost float64
+
+	for node := range busy {
+		used += set.NodeWeight(node)
+	}
+
+	for node := range nodes {
+		weight := set.NodeWeight(node)
+		if busy[node] || weight == 0 {
+			delete(nodes, node)
+
+			continue
+		}
+
+		cost += weight
+	}
+
+	allowed := h.cfg.DisruptionBudget.MaxUnavailable.OfWeight(set.TotalWeight())
+	if cost == 0 || used+cost <= allowed || (allowed > 0 && used == 0 && len(nodes) == 1) {
+		return nil
+	}
+
+	return fmt.Errorf("rollout %s batch %d admitted %v available weight with %v already unavailable, over the %v the budget allows; charged nodes=%v",
+		r.ID, b.Number, cost, used, allowed, nodes)
 }
 
 // propDispatch is one update the process ran during a step.
@@ -75,7 +120,7 @@ type propDispatch struct {
 // rollout at the end ran no update.
 func (s *sim) checkHeld(dispatches []propDispatch) error {
 	for _, d := range dispatches {
-		r, had := s.before.active[d.group]
+		r, had := s.before[d.group]
 		if !had {
 			continue
 		}
@@ -92,36 +137,21 @@ func (s *sim) checkHeld(dispatches []propDispatch) error {
 	return nil
 }
 
-// snapshot records what the next step's checks compare against. While no
-// process runs, the last one's record stands, and an edit counts until a
-// process checks after it.
+// snapshot records the held rollouts to compare against the next step.
 func (s *sim) snapshot() {
 	if s.down {
 		return
 	}
 
-	s.edited, s.started = false, false
+	before := map[string]*RolloutView{}
 
-	b := propBefore{active: map[string]*RolloutView{}, open: map[string]bool{}}
-
-	h := s.h
-	b.used, _ = h.unavailable()
-	s.admission = h.oracleUnavailable()
-	s.admissionUsed = b.used
-
-	for _, r := range h.c.Rollouts() {
+	for _, r := range s.h.c.Rollouts() {
 		if r.State.Active() {
-			b.active[r.Group] = &r
-		}
-
-		if cur := r.CurrentBatch(); r.State.Active() && cur != nil {
-			for _, id := range cur.Targets {
-				b.open[r.ID+"/"+id] = true
-			}
+			before[r.Group] = &r
 		}
 	}
 
-	s.before = b
+	s.before = before
 }
 
 // check asserts what must hold after every step.
@@ -145,13 +175,6 @@ func (s *sim) check() error {
 
 	h := s.h
 
-	// Probe observations may increase outages without any controller admission.
-	// New admissions must stay within budget or add only the lone rounded node.
-	if used, allowed := h.unavailable(); used > allowed && used > s.admissionUsed && !s.edited && !s.started && s.weightedUnavailable() > 1 {
-		return fmt.Errorf("unavailable weight rose from %v to %v, over the %v the budget allows", s.before.used, used, allowed)
-	}
-
-	// Readiness and admissions, not quarantine, establish zero-cost grants.
 	active := map[string]string{}
 
 	for _, r := range h.c.Rollouts() {
@@ -181,21 +204,6 @@ func (s *sim) check() error {
 	}
 
 	return nil
-}
-
-// weightedUnavailable counts the unavailable nodes that carry weight.
-func (s *sim) weightedUnavailable() int {
-	set := s.h.current()
-
-	n := 0
-
-	for node := range s.h.oracleUnavailable() {
-		if set.NodeWeight(node) > 0 {
-			n++
-		}
-	}
-
-	return n
 }
 
 // checkRollout asserts the shape of one rollout: batch sizes, wave order,
@@ -254,4 +262,120 @@ func (s *sim) checkRollout(r *RolloutView) error {
 	}
 
 	return nil
+}
+
+func TestPropertyControllerInvariantsAdmissionBudget(t *testing.T) {
+	const fleet = `
+- {id: n0/a, node: n0, weight: 0, image: org/a:t, labels: {client: a, owner: a}}
+- {id: n1/a, node: n1, weight: 100, image: org/a:t, labels: {client: a, owner: a}}
+- {id: n1/b, node: n1, weight: 100, image: org/a:t, labels: {client: a, owner: a}}
+- {id: n2/a, node: n2, weight: 100, image: org/a:t, labels: {client: a, owner: a}}
+`
+
+	cases := []struct {
+		name        string
+		budget      string
+		unavailable []string
+		targets     []string
+		retry       bool
+		reserved    bool
+		rejected    bool
+	}{
+		{name: "fits exactly", budget: "100", targets: []string{tN1A}},
+		{name: "lone heavy node with weightless outage", budget: "1", unavailable: []string{tN0A}, targets: []string{tN1A}},
+		{name: "two available nodes despite free flags", budget: "1", targets: []string{tN1A, tN2A}, rejected: true},
+		{name: "weighted outage blocks another heavy node", budget: "100", unavailable: []string{tN2A}, targets: []string{tN1A}, rejected: true},
+		{name: "zero cost above budget", budget: "0", unavailable: []string{tN2A}, targets: []string{tN2A, tN0A}},
+		{name: "two targets charge one node", budget: "1", targets: []string{tN1A, "n1/b"}},
+		{name: "zero budget rejects available weight", budget: "0", targets: []string{tN1A}, rejected: true},
+		{name: "retry charges recovered nodes", budget: "100", targets: []string{tN1A, tN2A}, retry: true, rejected: true},
+		{name: "retry adds no unavailable weight", budget: "0", unavailable: []string{tN2A}, targets: []string{tN2A, tN0A}, retry: true},
+		{name: "persisted reservation is not a new admission", budget: "0", targets: []string{tN1A}, reserved: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := replaceLine(testConfig, "maxUnavailable: 50%", "maxUnavailable: "+tc.budget)
+			h := newHarness(t, cfg, fleet)
+			h.cfg.ReadinessProbe.FailureThreshold = 1
+			h.prime()
+			h.world.set(func(w *world) {
+				for _, id := range tc.unavailable {
+					w.notReady[id] = true
+				}
+			})
+			h.c.ProbeAll(h.ctx)
+
+			r := &Rollout{ID: "proposed", Group: "a", State: Running,
+				Desired: map[string]string{imgA: d2}, Batches: []Batch{{Number: 1, Targets: tc.targets}}}
+
+			for _, id := range tc.targets {
+				target, ok := h.current().Get(id)
+				require.True(t, ok)
+
+				r.Targets = append(r.Targets, RolloutTarget{ID: id, Node: target.Node, Batch: 1, Phase: PhasePending, Free: true})
+			}
+
+			var before *Rollout
+			if tc.retry || tc.reserved {
+				before = cloneRollout(r)
+			}
+
+			if tc.retry {
+				before.State = Halted
+				before.Batches[0].EndedAt = h.clock.Now()
+
+				for i := range before.Targets {
+					before.Targets[i].Phase = PhaseFailed
+				}
+			}
+
+			if before != nil {
+				require.NoError(t, h.store.SaveRollout(h.ctx, before))
+			}
+
+			s := &sim{h: h, terminal: map[string]RolloutState{}, manual: map[string]bool{}, strategy: map[string]string{}}
+			p := &process{MemoryStore: h.store, sim: s, writes: -1}
+			h.c.mu.Lock()
+			h.c.rollouts[r.ID] = r
+			writeErr := p.SaveRollout(h.ctx, r)
+			h.c.mu.Unlock()
+			require.NoError(t, writeErr)
+
+			err := s.check()
+
+			if tc.rejected {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestPropertyControllerInvariantsInspectionCanRestoreAnEndedHoldWithoutAdmission(t *testing.T) {
+	h := newHarness(t, testConfig, `
+- {id: n1/a, node: n1, weight: 100, image: org/a:t, labels: {client: a, owner: a}}
+- {id: n2/a, node: n2, weight: 100, image: org/a:t, labels: {client: a, owner: a}}
+`)
+	h.cfg.ReadinessProbe.FailureThreshold = 1
+	h.prime()
+	h.release(imgA, d2)
+	require.NoError(t, h.c.Abort(h.ctx, actor, h.active("a").ID))
+	h.world.set(func(w *world) { w.notReady[tN2A] = true })
+	h.clock.Advance(time.Nanosecond)
+	h.c.ProbeAll(h.ctx)
+	used, allowed := h.unavailable()
+	require.Equal(t, float64(100), used)
+	require.Equal(t, float64(100), allowed)
+
+	s := &sim{h: h, terminal: map[string]RolloutState{}, manual: map[string]bool{}, strategy: map[string]string{}}
+	s.snapshot()
+	h.world.set(func(w *world) { w.runErr["inspect"] = errFake })
+	h.c.InspectAll(h.ctx)
+	h.c.InspectAll(h.ctx)
+	used, _ = h.unavailable()
+	require.Equal(t, float64(200), used)
+	require.Len(t, h.world.callsFor("update"), 1)
+	require.NoError(t, s.check())
 }

@@ -95,7 +95,7 @@ func TestASkipReachesTheStoreBeforeTheBudgetItFreesIsSpent(t *testing.T) {
 	// b waits for n1's share of the budget.
 	h.world.set(func(w *world) {
 		w.updateStuck["n1/a"] = true
-		w.notReady["n0/a"] = true
+		w.notReady[tN0A] = true
 		w.registry[imgB] = d2
 	})
 	h.release(imgA, d2)

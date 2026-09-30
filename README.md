@@ -110,6 +110,12 @@ make cover    # coverage floors per package (100% where decisions are made)
 make lint     # golangci-lint and the word lint
 ```
 
-`internal/reconcile/property_test.go` runs the controller through random fleets, failures, verbs, restarts, crashes and store outages, checking the budget and the other rules after every step and that everything converges once the failures stop. A failing seed reproduces with `ROLLOOR_SIM_SEED=<n>`.
+`internal/reconcile/property_test.go` runs the controller through random fleets, failures, verbs, restarts, crashes and store outages. It checks each newly persisted batch or reopened retry against current observations and its previous reservation before hooks run, charging each newly unavailable node once. The only positive-cost exception is one weighted node alone when unavailable weight is zero and the budget is above zero. Failed observations may increase unavailable weight without admitting anything; they do not waive the next admission's budget check. Other invariants are checked after every step, and everything must converge once failures stop. A failing seed reproduces with `ROLLOOR_SIM_SEED=<n>`.
+
+Run the broader simulation without cached results:
+
+```sh
+ROLLOOR_SIM_SEEDS=10000 go test -count=1 -run TestPropertyControllerInvariants ./internal/reconcile
+```
 
 Go 1.25. Nothing in this repository is specific to a workload; deployments bring their own hooks and targets. `scripts/lint-words.sh` fails the build if the first workload's words appear in any tracked file.

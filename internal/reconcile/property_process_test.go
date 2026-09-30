@@ -73,7 +73,20 @@ func (p *process) SaveRollout(ctx context.Context, r *Rollout) error {
 		return nil
 	}
 
-	return p.MemoryStore.SaveRollout(ctx, r)
+	p.MemoryStore.mu.Lock()
+	before := p.rollouts[r.ID]
+	p.MemoryStore.mu.Unlock()
+
+	problem := p.sim.admissionProblem(r, before)
+	if err := p.MemoryStore.SaveRollout(ctx, r); err != nil {
+		return err
+	}
+
+	if problem != nil {
+		p.sim.violation("%v", problem)
+	}
+
+	return nil
 }
 
 func (p *process) SavePolicy(ctx context.Context, group string, pol Policy) error {

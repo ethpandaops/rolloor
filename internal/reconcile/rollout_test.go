@@ -336,7 +336,7 @@ func TestRetryStaysWithinBudget(t *testing.T) {
 	h.quarantine()
 
 	// A not-ready target can be repaired without adding unavailable weight.
-	h.world.set(func(w *world) { w.notReady["n2/a"] = true })
+	h.world.set(func(w *world) { w.notReady[tN2A] = true })
 	h.release(imgA, d2)
 
 	start, _ := h.unavailable()
@@ -366,7 +366,7 @@ func TestQuarantineClearedOnSharedNodeStaysWithinBudget(t *testing.T) {
 	// New builds for both groups: b moves n1/b again, and a takes n1/a for
 	// free beside it plus n2/a at full weight. a's targets stay in flight.
 	h.world.set(func(w *world) {
-		w.updateStuck[tN1A], w.updateStuck["n2/a"] = true, true
+		w.updateStuck[tN1A], w.updateStuck[tN2A] = true, true
 		w.registry[imgA], w.registry[imgB] = d2, d3
 	})
 	h.clock.Advance(h.cfg.Registry.Poll)
@@ -979,7 +979,7 @@ func TestWeightlessNodesDoNotBlockAHeavyNodeGoingAlone(t *testing.T) {
 - {id: n2/b, node: n2, weight: 100, image: org/b:t, labels: {client: b, owner: b}}
 `)
 			h.prime()
-			h.world.set(func(w *world) { w.notReady["n0/a"] = notReady })
+			h.world.set(func(w *world) { w.notReady[tN0A] = notReady })
 
 			for range h.cfg.ReadinessProbe.FailureThreshold {
 				h.c.ProbeAll(h.ctx)
@@ -987,7 +987,7 @@ func TestWeightlessNodesDoNotBlockAHeavyNodeGoingAlone(t *testing.T) {
 
 			h.release(imgA, d2)
 			r := h.active("a")
-			require.Equal(t, []string{"n0/a", tN1A}, r.Batches[0].Targets)
+			require.Equal(t, []string{tN0A, tN1A}, r.Batches[0].Targets)
 			require.True(t, r.target(tN1A).UpdateDone)
 			require.False(t, r.target(tN1A).Free)
 		})

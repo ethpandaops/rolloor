@@ -50,14 +50,6 @@ func (s *propSuspension) matches(t *propTarget) bool {
 	return true
 }
 
-// propBefore is what the checks compare a step against.
-type propBefore struct {
-	used float64
-	// active is each group's active rollout.
-	active map[string]*RolloutView
-	open   map[string]bool
-}
-
 // sim is one simulated environment. Besides the harness it keeps its own
 // record of what it did to the controller and the world, so the checks rest
 // on evidence the controller did not produce.
@@ -68,26 +60,21 @@ type sim struct {
 	proc  *process
 	log   *logrus.Logger
 
-	// down is set while no process runs because the store refused to load;
-	// started when a new process began during the step.
-	down    bool
-	started bool
-	outage  bool
-	edited  bool
+	// down is set when the store refused to load and no process runs.
+	down   bool
+	outage bool
 
 	digests int
 	builds  map[string][]string
 	modes   map[string]string
 	pins    map[string]map[string]string
 
-	suspended     []propSuspension
-	terminal      map[string]RolloutState
-	manual        map[string]bool
-	strategy      map[string]string
-	before        propBefore
-	admission     map[string]bool
-	admissionUsed float64
-	trail         []string
+	suspended []propSuspension
+	terminal  map[string]RolloutState
+	manual    map[string]bool
+	strategy  map[string]string
+	before    map[string]*RolloutView
+	trail     []string
 
 	mu         sync.Mutex
 	violations []string
@@ -107,10 +94,6 @@ func newSim(t *testing.T, rng *rand.Rand) (*sim, string) {
 		h: newHarness(t, cfg, fleet.yaml()), rng: rng, fleet: fleet, log: log,
 		builds: map[string][]string{}, modes: map[string]string{}, pins: map[string]map[string]string{},
 		terminal: map[string]RolloutState{}, manual: map[string]bool{}, strategy: map[string]string{},
-	}
-	s.h.beforeTick = func() {
-		s.admission = s.h.oracleUnavailable()
-		s.admissionUsed, _ = s.h.unavailable()
 	}
 
 	s.h.world.set(func(w *world) { w.registry[propImage("c")] = d1 })
@@ -135,7 +118,7 @@ func (s *sim) start() {
 		return
 	}
 
-	h.c, s.down, s.started = c, false, true
+	h.c, s.down = c, false
 }
 
 func (s *sim) violation(format string, args ...any) {
