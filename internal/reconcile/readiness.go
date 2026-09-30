@@ -4,59 +4,12 @@ import (
 	"context"
 	"time"
 
-	"golang.org/x/sync/errgroup"
-
 	"github.com/ethpandaops/rolloor/internal/config"
-	"github.com/ethpandaops/rolloor/internal/hooks"
 )
 
 // ProbeAll assesses every target independently of any rollout.
 func (c *Controller) ProbeAll(ctx context.Context) {
-	c.probeMu.Lock()
-	defer c.probeMu.Unlock()
-
-	set := c.targets()
-	c.mu.RLock()
-
-	inputs := make([]HookInput, len(set.Targets))
-	for i := range set.Targets {
-		inputs[i] = c.hookInput(set, &set.Targets[i])
-	}
-
-	c.mu.RUnlock()
-
-	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(c.limit)
-
-	for i := range set.Targets {
-		t := set.Targets[i]
-		in := inputs[i]
-
-		g.Go(func() error {
-			started := c.clock.Now()
-			res, err := c.runner.Run(gctx, c.programFor(&t, config.HookReady), config.HookReady, t.ID, in)
-
-			if gctx.Err() != nil {
-				return nil
-			}
-
-			if err != nil {
-				res = hooks.Result{Program: c.programFor(&t, config.HookReady), Reason: err.Error(), ExitCode: -1, RanAt: c.clock.Now()}
-			}
-
-			c.mu.Lock()
-			defer c.mu.Unlock()
-
-			if c.setReadinessLocked(gctx, t.ID, started, res.OK, res.Reason) {
-				c.recordHookRun(gctx, t.ID, config.HookReady, &res)
-			}
-
-			return nil
-		})
-	}
-
-	_ = g.Wait()
-
+	c.observeTargets(ctx, c.targets().Targets, config.HookReady)
 	c.Nudge()
 }
 
