@@ -147,10 +147,13 @@ type RolloutTarget struct {
 	Reason string      `json:"reason,omitempty"`
 	// UpdateDone is set once the update hook has returned success; Updated
 	// once inspect has seen the desired digest running.
-	UpdateDone   bool      `json:"updateDone"`
-	Updated      bool      `json:"updated"`
-	UpdatedAt    time.Time `json:"updatedAt,omitzero"`
-	DigestSeenAt time.Time `json:"digestSeenAt,omitzero"`
+	UpdateDone     bool      `json:"updateDone"`
+	Updated        bool      `json:"updated"`
+	UpdatedAt      time.Time `json:"updatedAt,omitzero"`
+	DigestSeenAt   time.Time `json:"digestSeenAt,omitzero"`
+	UpdateAttempts int       `json:"updateAttempts"`
+	RetryAt        time.Time `json:"retryAt,omitzero"`
+	UpdateError    string    `json:"updateError,omitempty"`
 	// NotReadyBefore fixes the observation-based priority at rollout creation.
 	NotReadyBefore bool `json:"notReadyBefore,omitempty"`
 	// Free records that admission added no unavailable node.
@@ -179,6 +182,7 @@ type SoakCheck struct {
 	At        time.Time `json:"at"`
 	Program   string    `json:"program"`
 	OK        bool      `json:"ok"`
+	Error     bool      `json:"error,omitempty"`
 	Reason    string    `json:"reason"`
 	Updated   string    `json:"updated,omitempty"`
 	Remaining string    `json:"remaining,omitempty"`
@@ -194,6 +198,7 @@ type SoakProgress struct {
 	LastCheckStartedAt time.Time   `json:"lastCheckStartedAt,omitzero"`
 	Streak             int         `json:"streak"`
 	Failures           int         `json:"failures"`
+	ConsecutiveErrors  int         `json:"consecutiveErrors"`
 	Checks             []SoakCheck `json:"checks,omitempty"`
 }
 
@@ -205,6 +210,8 @@ type Rollout struct {
 	// Desired is image → digest at creation; the rollout moves targets here.
 	Desired   map[string]string `json:"desired"`
 	Revisions map[string]string `json:"revisions,omitempty"`
+	// GroupDesiredKey includes images already in sync when the operation began.
+	GroupDesiredKey string `json:"groupDesiredKey,omitempty"`
 	// From is image → the digest most targets ran before, for display.
 	From map[string]string `json:"from,omitempty"`
 

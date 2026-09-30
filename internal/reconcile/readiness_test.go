@@ -55,6 +55,7 @@ func TestReadinessThresholdsSurviveRestart(t *testing.T) {
 func TestProbeMustBeginAfterDigestObservation(t *testing.T) {
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
+	h.world.set(func(w *world) { w.updateStuck[tA1] = true })
 	h.release(imgA, d2)
 	id := h.active("a").ID
 	entered, release := h.world.gate("ready:" + tA1)
@@ -69,8 +70,8 @@ func TestProbeMustBeginAfterDigestObservation(t *testing.T) {
 	}
 
 	h.clock.Advance(time.Second)
+	h.world.set(func(w *world) { w.running[tA1] = d2 })
 	h.c.InspectAll(h.ctx)
-	require.NoError(t, h.c.Tick(h.ctx))
 	release()
 	wg.Wait()
 	require.NoError(t, h.c.Tick(h.ctx))
@@ -227,9 +228,9 @@ func TestFreshProbeRemainsValidAfterLaterInspection(t *testing.T) {
 	h.prime()
 	h.release(imgA, d2)
 	id := h.active("a").ID
+	firstSeen := h.clock.Now()
 	h.clock.Advance(time.Second)
 	h.c.InspectAll(h.ctx)
-	firstSeen := h.clock.Now()
 	h.clock.Advance(time.Nanosecond)
 	h.c.ProbeAll(h.ctx)
 	h.clock.Advance(time.Second)
@@ -292,6 +293,7 @@ func TestHealthyReadinessWithUnresolvedDesiredBuild(t *testing.T) {
 func TestProbeDuringInspectionCannotAcknowledgeNewBuild(t *testing.T) {
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
+	h.world.set(func(w *world) { w.updateStuck[tA1] = true })
 	h.release(imgA, d2)
 	id := h.active("a").ID
 	entered, release := h.world.gate("inspect:" + tA1)
@@ -306,6 +308,7 @@ func TestProbeDuringInspectionCannotAcknowledgeNewBuild(t *testing.T) {
 	}
 
 	h.clock.Advance(time.Second)
+	h.world.set(func(w *world) { w.running[tA1] = d2 })
 	h.c.ProbeAll(h.ctx)
 	h.clock.Advance(time.Second)
 	release()
@@ -344,4 +347,28 @@ func TestRetryUsesTargetsOwnDesiredDigest(t *testing.T) {
 	defer h.world.mu.Unlock()
 
 	require.Equal(t, d3, h.world.running["n1/b"])
+}
+
+func TestBatchObservesDigestAndReadinessWithoutPeriodicLoops(t *testing.T) {
+	cfg := replaceLine(testConfig, "interval: 30s", "interval: 1h")
+	cfg += "\nreadinessProbe: {period: 1h, failureThreshold: 1, successThreshold: 1}\n"
+	h := newHarness(t, cfg, retryFleet+"- {id: a-1/cl, node: a-1, weight: 0, image: org/b:t, labels: {client: b, owner: b}}\n")
+	h.prime()
+	h.world.set(func(w *world) {
+		w.registry[imgA] = d2
+		w.notReady[tA1] = true
+	})
+	h.clock.Advance(h.cfg.Registry.Poll)
+	require.NoError(t, h.c.Tick(h.ctx))
+	r := h.active("a")
+	require.Equal(t, d2, h.view(tN1A).Live)
+	require.Equal(t, 1, h.rolloutTarget(r.ID, tN1A).UpdateAttempts)
+	require.Equal(t, PhaseUpdating, h.phases(r)[tN1A])
+	h.clock.Advance(time.Nanosecond)
+	require.NoError(t, h.c.Tick(h.ctx))
+	require.Equal(t, Healthy, h.view(tN1A).Health)
+	require.Equal(t, Healthy, h.view(tA1).Health)
+	require.NoError(t, h.c.Tick(h.ctx))
+	require.Equal(t, Soaking, h.rollout(r.ID).State)
+	require.Equal(t, Healthy, h.view(tN1A).Health)
 }

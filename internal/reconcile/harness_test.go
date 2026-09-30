@@ -60,7 +60,7 @@ hooks:
   defaults: {soak: ""}
 inspect: {interval: 30s, concurrency: 4, failureThreshold: 2}
 labels: {group: client, owner: owner, section: role, hiddenGroups: [side]}
-strategy: {batchSize: 2, soak: {duration: 60s, interval: 20s, failureLimit: 1}}
+strategy: {batchSize: 2, progressDeadline: 50s, retry: {limit: 1}, soak: {duration: 60s, interval: 20s, failureLimit: 1}}
 strategies:
   nosoak:  {batchSize: 50%, soak: {duration: 0s}}
   careful: {firstBatch: 1, batchSize: 50%, soak: {duration: 0s}, pauseAfterFirstBatch: true}
@@ -100,6 +100,7 @@ type world struct {
 	soakFail        map[string]bool
 	soakStdout      string
 	runErr          map[string]error
+	runResult       map[string]hooks.Result
 	gates           map[string]chan struct{}
 	entered         chan struct{}
 	resolved        int
@@ -120,6 +121,7 @@ func newWorld() *world {
 		recoverOnUpdate: map[string]bool{},
 		soakFail:        map[string]bool{},
 		runErr:          map[string]error{},
+		runResult:       map[string]hooks.Result{},
 		gates:           map[string]chan struct{}{},
 	}
 }
@@ -189,6 +191,10 @@ func (w *world) Run(_ context.Context, program, hook, targetID string, input any
 
 	if err, ok := w.runErr[program]; ok {
 		return hooks.Result{}, err
+	}
+
+	if res, ok := w.runResult[program]; ok {
+		return res, nil
 	}
 
 	res := hooks.Result{Program: program, OK: true, RanAt: time.Now()}
@@ -456,6 +462,15 @@ func (h *harness) rollout(id string) RolloutView {
 	require.True(h.t, ok, "rollout %s", id)
 
 	return r
+}
+
+func (h *harness) rolloutTarget(rolloutID, targetID string) *RolloutTarget {
+	h.t.Helper()
+	r := h.rollout(rolloutID)
+	rt := r.target(targetID)
+	require.NotNil(h.t, rt)
+
+	return rt
 }
 
 func (h *harness) active(group string) RolloutView {

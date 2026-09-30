@@ -22,6 +22,7 @@ type job struct {
 	hook    string
 	program string
 	input   any
+	retryAt time.Time
 	// soakIDs are the batch targets a soak job speaks for.
 	soakIDs []string
 }
@@ -189,6 +190,9 @@ func (c *Controller) retryBatch(ctx context.Context, now time.Time, r *Rollout) 
 			rt.Phase, rt.Reason, rt.UpdatedAt = PhaseUpdating, "retrying: waiting for the digest", now
 			rt.DigestSeenAt = time.Time{}
 			rt.UpdateDone, rt.Updated = true, false
+			rt.UpdateAttempts = 0
+			rt.RetryAt = time.Time{}
+			rt.UpdateError = ""
 
 			if live, known := c.liveKnown(id); !known || live != r.Desired[t.Image] {
 				rt.Phase, rt.Reason, rt.UpdateDone = PhasePending, "retrying: running the update again", false
@@ -205,6 +209,7 @@ func (c *Controller) retryBatch(ctx context.Context, now time.Time, r *Rollout) 
 // Ineligible targets are skipped where they are.
 func (c *Controller) planBatch(ctx context.Context, now time.Time, r *Rollout, set *targets.Set) []job {
 	b := r.CurrentBatch()
+	st := c.strategy(r.Strategy)
 
 	var jobs []job
 
@@ -226,7 +231,11 @@ func (c *Controller) planBatch(ctx context.Context, now time.Time, r *Rollout, s
 		case PhasePending:
 			allReady = false
 			changed = true
-			rt.Phase, rt.Reason, rt.UpdatedAt = PhaseUpdating, "update running", now
+
+			rt.Phase, rt.Reason = PhaseUpdating, "update running"
+			if rt.UpdatedAt.IsZero() {
+				rt.UpdatedAt = now
+			}
 
 			// An already-observed digest needs verification, not another update
 			// that could collide with one still finishing.
@@ -236,7 +245,21 @@ func (c *Controller) planBatch(ctx context.Context, now time.Time, r *Rollout, s
 				continue
 			}
 
-			jobs = append(jobs, job{rollout: r.ID, target: id, hook: config.HookUpdate, program: c.programFor(&t, config.HookUpdate), input: c.hookInput(set, &t)})
+			if why := updateDeadlineReason(now, rt, &st, r.Desired[t.Image]); why != "" {
+				c.withdraw(jobs)
+				c.halt(ctx, now, r, id, why)
+
+				return nil
+			}
+
+			if rt.UpdateAttempts >= max(st.Retry.Limit, 1) {
+				c.withdraw(jobs)
+				c.halt(ctx, now, r, id, "update retry limit reached after an interrupted update")
+
+				return nil
+			}
+
+			jobs = append(jobs, c.updateJob(now, r, rt, set, &t))
 		case PhaseUpdating:
 			live, known := c.liveKnown(id)
 			if known && live == r.Desired[t.Image] && rt.UpdateDone {
@@ -260,15 +283,23 @@ func (c *Controller) planBatch(ctx context.Context, now time.Time, r *Rollout, s
 
 			allReady = false
 
-			if deadline := c.cfg.Hooks.Timeout * 5; now.Sub(rt.UpdatedAt) > deadline {
-				why := fmt.Sprintf("did not reach %s within %s", shortDigest(r.Desired[t.Image]), deadline)
-				if rt.Updated {
-					why = fmt.Sprintf("%s within %s", rt.Reason, deadline)
-				}
-
+			if why := updateDeadlineReason(now, rt, &st, r.Desired[t.Image]); why != "" {
+				c.withdraw(jobs)
 				c.halt(ctx, now, r, id, why)
 
 				return nil
+			}
+
+			if !rt.RetryAt.IsZero() {
+				changed = true
+
+				if now.Before(rt.RetryAt) {
+					rt.Reason = fmt.Sprintf("%s; retrying in %s", updateFailure(rt, &st), rt.RetryAt.Sub(now).Round(time.Second))
+				} else {
+					jobs = append(jobs, c.updateJob(now, r, rt, set, &t))
+				}
+
+				continue
 			}
 
 			reason := "waiting for the digest"
@@ -384,7 +415,7 @@ func (c *Controller) planSoak(ctx context.Context, now time.Time, r *Rollout, se
 		return nil
 	}
 
-	fresh := !r.Soak.LastCheckAt.IsZero() && now.Sub(r.Soak.LastCheckAt) <= 2*st.Soak.Interval
+	fresh := r.Soak.ConsecutiveErrors == 0 && !r.Soak.LastCheckAt.IsZero() && now.Sub(r.Soak.LastCheckAt) <= 2*st.Soak.Interval
 	if fresh && r.Soak.Streak > 0 && now.Sub(r.Soak.StartedAt) >= st.Soak.Duration {
 		c.passBatch(ctx, now, r, soakPassed(&r.Soak))
 
@@ -547,7 +578,7 @@ func (c *Controller) halt(ctx context.Context, now time.Time, r *Rollout, culpri
 
 		rt.Phase, rt.Reason = PhaseFailed, reason
 		if !c.readyOnBuild(rt) {
-			rt.HoldUntil = now.Add(c.updateDeadline())
+			rt.HoldUntil = now.Add(c.strategy(r.Strategy).ProgressDeadline)
 		}
 
 		c.degraded[id] = reason
@@ -565,13 +596,20 @@ func (c *Controller) halt(ctx context.Context, now time.Time, r *Rollout, culpri
 // withdraw takes back jobs that will not run: a target whose update was
 // about to be dispatched waits for it again, as after a restart.
 func (c *Controller) withdraw(jobs []job) {
-	for _, j := range jobs {
+	for i := range jobs {
+		j := &jobs[i]
 		if j.hook != config.HookUpdate {
 			continue
 		}
 
 		if rt := c.rollouts[j.rollout].target(j.target); rt.Phase == PhaseUpdating && !rt.UpdateDone {
 			rt.Phase, rt.Reason = PhasePending, "waiting for the store before running the update"
+			rt.UpdateAttempts--
+			rt.RetryAt = j.retryAt
+
+			if rt.UpdateAttempts == 0 {
+				rt.UpdatedAt = time.Time{}
+			}
 		}
 	}
 }
@@ -585,13 +623,15 @@ func (c *Controller) execute(ctx context.Context, jobs []job) []outcome {
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(c.limit)
 
-	for i, j := range jobs {
+	for i := range jobs {
+		j := &jobs[i]
+
 		g.Go(func() error {
 			started := c.clock.Now()
 			res, err := c.runner.Run(gctx, j.program, j.hook, j.target, j.input)
 
 			mu.Lock()
-			out[i] = outcome{job: j, res: res, err: err, started: started}
+			out[i] = outcome{job: *j, res: res, err: err, started: started}
 			mu.Unlock()
 
 			return nil
@@ -666,12 +706,14 @@ func (c *Controller) applyTargetResult(ctx context.Context, now time.Time, r *Ro
 	}
 
 	if !o.res.OK {
-		c.halt(ctx, now, r, o.target, "update failed: "+o.res.Reason)
+		c.retryUpdate(ctx, now, r, rt, o.res.Reason)
 
 		return
 	}
 
 	rt.UpdateDone, rt.Reason = true, "update started, waiting for the digest"
+	rt.RetryAt = time.Time{}
+	rt.UpdateError = ""
 }
 
 // applySoak folds one check's program results into the soak progress.
@@ -681,30 +723,20 @@ func (c *Controller) applySoak(ctx context.Context, now time.Time, r *Rollout, o
 	}
 
 	st := c.strategy(r.Strategy)
-	allOK := true
+	failed, errored := c.recordSoak(ctx, now, r, outs)
 
-	for i := range outs {
-		o := &outs[i]
-		check := SoakCheck{At: now, Program: o.program, OK: o.res.OK, Reason: o.res.Reason}
-		check.Updated, check.Remaining, check.Unit = parseSoakNumbers(o.res.Stdout)
-		r.Soak.Checks = append(r.Soak.Checks, check)
-
-		for _, id := range o.soakIDs {
-			c.recordHookRun(ctx, id, config.HookSoak, &o.res)
-		}
-
-		if !o.res.OK {
-			allOK = false
-		}
+	if errored >= 0 {
+		r.Soak.ConsecutiveErrors++
+	} else {
+		r.Soak.ConsecutiveErrors = 0
+		r.Soak.LastCheckAt = now
 	}
 
-	r.Soak.LastCheckAt = now
-
-	if allOK {
-		r.Soak.Streak++
-	} else {
+	if failed >= 0 {
 		r.Soak.Streak = 0
 		r.Soak.Failures++
+	} else if errored < 0 {
+		r.Soak.Streak++
 	}
 
 	if r.Force {
@@ -714,8 +746,31 @@ func (c *Controller) applySoak(ctx context.Context, now time.Time, r *Rollout, o
 	}
 
 	if r.Soak.Failures > st.Soak.FailureLimit {
-		last := r.Soak.Checks[len(r.Soak.Checks)-1]
+		last := &r.Soak.Checks[len(r.Soak.Checks)-1]
+
+		for i := len(r.Soak.Checks) - 1; i >= 0; i-- {
+			check := &r.Soak.Checks[i]
+			if !check.OK && !check.Error {
+				last = check
+
+				break
+			}
+		}
+
 		c.halt(ctx, now, r, "", fmt.Sprintf("soak %s failed %d times: %s", last.Program, r.Soak.Failures, last.Reason))
+
+		return
+	}
+
+	if errored >= 0 {
+		last := r.Soak.Checks[errored]
+		why := fmt.Sprintf("soak %s could not run: %s; %d consecutive errors of %d allowed", last.Program, last.Reason, r.Soak.ConsecutiveErrors, st.Soak.ConsecutiveErrorLimit)
+
+		if r.Soak.ConsecutiveErrors > st.Soak.ConsecutiveErrorLimit {
+			c.halt(ctx, now, r, "", why)
+		} else {
+			c.setState(ctx, now, r, Soaking, why)
+		}
 
 		return
 	}
@@ -733,6 +788,29 @@ func (c *Controller) applySoak(ctx context.Context, now time.Time, r *Rollout, o
 
 	c.setState(ctx, now, r, Soaking, fmt.Sprintf("Batch %d in soak, %s left; %d checks failed of %d allowed.",
 		r.CurrentBatch().Number, left.Round(time.Second), r.Soak.Failures, st.Soak.FailureLimit))
+}
+
+func (c *Controller) recordSoak(ctx context.Context, now time.Time, r *Rollout, outs []outcome) (failed, errored int) {
+	failed, errored = -1, -1
+
+	for i := range outs {
+		o := &outs[i]
+		check := SoakCheck{At: now, Program: o.program, OK: o.res.OK, Error: o.err != nil || o.res.TimedOut || o.res.ExitCode < 0, Reason: o.res.Reason}
+		check.Updated, check.Remaining, check.Unit = parseSoakNumbers(o.res.Stdout)
+		r.Soak.Checks = append(r.Soak.Checks, check)
+
+		for _, id := range o.soakIDs {
+			c.recordHookRun(ctx, id, config.HookSoak, &o.res)
+		}
+
+		if check.Error {
+			errored = len(r.Soak.Checks) - 1
+		} else if !check.OK {
+			failed = len(r.Soak.Checks) - 1
+		}
+	}
+
+	return failed, errored
 }
 
 // soakPassed says how a soak ended well.

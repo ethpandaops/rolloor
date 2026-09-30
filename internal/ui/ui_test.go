@@ -61,7 +61,7 @@ environment: test
 disruptionBudget: {maxUnavailable: 100%}
 labels: {group: client, owner: owner, section: role, hiddenGroups: [side]}
 hooks: {dir: /tmp, defaults: {soak: ""}}
-strategy: {batchSize: 100%, soak: {duration: 0s}}
+strategy: {batchSize: 100%, retry: {limit: 1}, soak: {duration: 0s}}
 strategies:
   slow: {batchSize: 1, soak: {duration: 1h, interval: 1s, failureLimit: 1}}
 `

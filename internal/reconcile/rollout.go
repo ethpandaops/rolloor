@@ -27,30 +27,10 @@ func (c *Controller) supersedeChangedRollouts(ctx context.Context, now time.Time
 			continue
 		}
 
-		for img, want := range r.Desired {
-			cur, ok := c.desiredForImage(r.Group, img, set)
-			if ok && cur != want {
-				c.finish(ctx, now, r, Superseded, fmt.Sprintf("%s moved to %s", img, shortDigest(cur)))
-
-				break
-			}
+		if r.GroupDesiredKey != c.groupDesiredKey(r.Group, set) {
+			c.finish(ctx, now, r, Superseded, "group desired images changed")
 		}
 	}
-}
-
-// desiredForImage is the current desired digest for an image within a group,
-// honouring pins.
-func (c *Controller) desiredForImage(group, image string, set *targets.Set) (string, bool) {
-	for i := range set.Targets {
-		t := &set.Targets[i]
-		if set.Group(t) == group && t.Image == image {
-			d, ok := c.desiredFor(group, t)
-
-			return d.Digest, ok
-		}
-	}
-
-	return "", false
 }
 
 // finish moves a rollout to a terminal state and records it.
@@ -87,17 +67,12 @@ func (c *Controller) end(now time.Time, r *Rollout, state RolloutState, reason s
 		}
 
 		if !c.readyOnBuild(rt) {
-			rt.HoldUntil = now.Add(c.updateDeadline())
+			rt.HoldUntil = now.Add(c.strategy(r.Strategy).ProgressDeadline)
 		}
 
 		rt.Phase = PhaseSkipped
 		rt.Reason = string(state)
 	}
-}
-
-// updateDeadline is how long an update may take to show its digest.
-func (c *Controller) updateDeadline() time.Duration {
-	return c.cfg.Hooks.Timeout * 5
 }
 
 // openRollouts creates a rollout for every group with out-of-sync targets and
@@ -212,16 +187,17 @@ func (c *Controller) outOfSync(group string, set *targets.Set) (eligible []*targ
 // newRollout sorts targets not ready at creation first, then wave, node and id.
 func (c *Controller) newRollout(now time.Time, group string, policy Policy, eligible []*targets.Target, desired, from map[string]string, set *targets.Set) *Rollout {
 	r := &Rollout{
-		ID:        c.newID(),
-		Group:     group,
-		Strategy:  policy.Strategy,
-		Desired:   desired,
-		Revisions: map[string]string{},
-		From:      from,
-		State:     Running,
-		Reason:    "Starting",
-		CreatedAt: now,
-		UpdatedAt: now,
+		ID:              c.newID(),
+		Group:           group,
+		Strategy:        policy.Strategy,
+		Desired:         desired,
+		GroupDesiredKey: c.groupDesiredKey(group, set),
+		Revisions:       map[string]string{},
+		From:            from,
+		State:           Running,
+		Reason:          "Starting",
+		CreatedAt:       now,
+		UpdatedAt:       now,
 	}
 
 	for img := range desired {

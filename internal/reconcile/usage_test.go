@@ -12,6 +12,8 @@ import (
 	"github.com/ethpandaops/rolloor/internal/targets"
 )
 
+const tObs1Server = "obs-1/server"
+
 // The usage tests run the controller the way an environment does: a fleet of
 // nodes carrying several clients, builds landing on tags, people acting on
 // rollouts, and the fleet changing underneath. They assert only what someone
@@ -299,9 +301,9 @@ func TestUsageABadBuildStopsAtOneNodeAndTheFixGoesThereFirst(t *testing.T) {
 	h.release(imgAlpha, d2)
 	bad := h.until(h.active(clientAlpha).ID, Halted, 20)
 
-	require.Equal(t, []string{"obs-1/server"}, h.on(d2), "one observer took the bad build")
-	require.Equal(t, Healthy, h.view("obs-1/server").Health)
-	require.Equal(t, bad.ID, h.view("obs-1/server").Quarantine.Rollout)
+	require.Equal(t, []string{tObs1Server}, h.on(d2), "one observer took the bad build")
+	require.Equal(t, Healthy, h.view(tObs1Server).Health)
+	require.Equal(t, bad.ID, h.view(tObs1Server).Quarantine.Rollout)
 	require.Contains(t, bad.Reason, "quarantined")
 
 	// The team ships a fix. It supersedes the halted rollout and starts on
@@ -311,13 +313,13 @@ func TestUsageABadBuildStopsAtOneNodeAndTheFixGoesThereFirst(t *testing.T) {
 	require.Equal(t, Superseded, h.rollout(bad.ID).State)
 
 	fix := h.active(clientAlpha)
-	require.Equal(t, "obs-1/server", fix.Targets[0].ID)
+	require.Equal(t, tObs1Server, fix.Targets[0].ID)
 	require.False(t, fix.Targets[0].NotReadyBefore)
 
 	h.settle(100)
 	require.Equal(t, Complete, h.rollout(fix.ID).State)
 	require.Equal(t, h.clientTargets(clientAlpha), h.on(d3))
-	require.Equal(t, Healthy, h.view("obs-1/server").Health)
+	require.Equal(t, Healthy, h.view(tObs1Server).Health)
 }
 
 func TestUsageTwoClientsShipAtOnceAndShareTheBudget(t *testing.T) {
@@ -359,29 +361,28 @@ func TestUsageATwoImageClientShipsBothImagesTogether(t *testing.T) {
 func TestUsageATwoImageClientShipsItsImagesMinutesApart(t *testing.T) {
 	h := newFleet(t, usageConfig)
 
-	// The server image lands first and its rollout starts; the agent image
-	// lands two minutes later. The server rollout carries on, and the agent
-	// build waits for it, then gets its own rollout.
+	// A later image joins the group's desired build before weighted nodes move.
 	h.release(imgBravoServer, d2)
 	first := h.active(clientBravo)
 	h.ticks(4, 30*time.Second)
 
 	h.release(imgBravoAgent, d2)
-	require.Equal(t, first.ID, h.active(clientBravo).ID, "not superseded: the server image did not move again")
+	require.Equal(t, Superseded, h.rollout(first.ID).State)
+	next := h.active(clientBravo)
+	require.NotEqual(t, first.ID, next.ID)
 
 	h.settle(100)
 
-	var rollouts []RolloutView
+	rollouts := h.rolloutsOf(clientBravo)
+	require.Len(t, rollouts, 2)
+	require.Equal(t, Superseded, rollouts[0].State)
+	require.Equal(t, Complete, rollouts[1].State)
+	require.Equal(t, [][]string{{"node-4"}, {"node-5", "node-6"}}, batchNodes(&rollouts[1]))
 
-	for _, r := range h.c.Rollouts() {
-		if r.Group == clientBravo {
-			rollouts = append(rollouts, r)
-		}
+	for _, id := range h.clientTargets(clientBravo) {
+		require.Equal(t, 1, h.updates()[id], "%s updated once", id)
 	}
 
-	require.Len(t, rollouts, 2)
-	require.Equal(t, Complete, rollouts[0].State)
-	require.Equal(t, Complete, rollouts[1].State)
 	require.Equal(t, h.clientTargets(clientBravo), h.on(d2))
 }
 
@@ -700,7 +701,7 @@ func TestUsageAZeroBudgetMovesOnlyWeightlessNodes(t *testing.T) {
 	r = h.rollout(r.ID)
 	require.Equal(t, WaitingForBudget, r.State)
 	require.Contains(t, r.Reason, "Waiting for the disruption budget")
-	require.Equal(t, []string{"obs-1/server"}, h.on(d2))
+	require.Equal(t, []string{tObs1Server}, h.on(d2))
 }
 
 func TestUsageAClientOnASingleNode(t *testing.T) {
@@ -743,24 +744,23 @@ func TestUsageOneNodesTargetsInDifferentWavesMoveInSeparatePasses(t *testing.T) 
 func TestUsageASlowUpdaterPassesInsideTheDeadlineAndHaltsPastIt(t *testing.T) {
 	h := newFleet(t, usageConfig)
 
-	// obs-1's updater takes a minute to land the build, inside the 2m30s
-	// the update may take (5 hook timeouts).
-	h.world.set(func(w *world) { w.updateStuck["obs-1/server"] = true })
+	// A minute of digest convergence fits within the default progress deadline.
+	h.world.set(func(w *world) { w.updateStuck[tObs1Server] = true })
 	h.release(imgAlpha, d2)
 	h.step()
 	h.step()
 	h.world.set(func(w *world) {
-		w.running["obs-1/server"] = d2
-		delete(w.updateStuck, "obs-1/server")
+		w.running[tObs1Server] = d2
+		delete(w.updateStuck, tObs1Server)
 	})
 	h.settle(100)
 	require.Equal(t, h.clientTargets(clientAlpha), h.on(d2))
 
 	// On the next build it never lands.
-	h.world.set(func(w *world) { w.updateStuck["obs-1/server"] = true })
+	h.world.set(func(w *world) { w.updateStuck[tObs1Server] = true })
 	h.release(imgAlpha, d3)
 	r := h.until(h.active(clientAlpha).ID, Halted, 20)
-	require.Contains(t, r.Reason, "obs-1/server did not reach 3333333 within 2m30s")
+	require.InDelta(t, float64(10*time.Minute), float64(h.clock.Now().Sub(r.target(tObs1Server).UpdatedAt)), float64(time.Millisecond))
 	require.Empty(t, intersect(h.on(d3), h.clientTargets(clientAlpha)))
 }
 
@@ -950,4 +950,72 @@ func TestUsageFlappingBelowFailureThresholdStaysHealthy(t *testing.T) {
 
 	require.Equal(t, Healthy, h.c.Fleet().Health)
 	require.Empty(t, h.c.Rollouts())
+}
+
+func TestUsageAFlakyUpdaterIsRetriedAndPasses(t *testing.T) {
+	h := newFleet(t, usageConfig)
+
+	const id = tObs1Server
+
+	h.world.set(func(w *world) { w.updateFail[id] = "updater unavailable" })
+	h.release(imgAlpha, d2)
+	r := h.active(clientAlpha)
+	require.Equal(t, Running, r.State)
+	require.Equal(t, 1, r.target(id).UpdateAttempts)
+	require.Contains(t, r.target(id).Reason, "update failed (attempt 1 of 5): updater unavailable; retrying in 10s")
+	retryAt := r.target(id).RetryAt
+
+	h.c = h.newController()
+	h.clock.Advance(9 * time.Second)
+	h.tick()
+	require.Equal(t, retryAt, h.rolloutTarget(r.ID, id).RetryAt)
+	require.Len(t, h.world.callsFor("update:"+id), 1)
+	h.clock.Advance(time.Second)
+	h.tick()
+	require.Contains(t, h.rolloutTarget(r.ID, id).Reason, "update failed (attempt 2 of 5): updater unavailable; retrying in 20s")
+
+	h.world.set(func(w *world) { delete(w.updateFail, id) })
+	h.clock.Advance(20 * time.Second)
+	h.tick()
+	require.Equal(t, 3, h.rolloutTarget(r.ID, id).UpdateAttempts)
+	require.Nil(t, h.view(id).Quarantine)
+	h.settle(100)
+	require.Equal(t, Complete, h.rollout(r.ID).State)
+	require.Equal(t, h.clientTargets(clientAlpha), h.on(d2))
+	require.Equal(t, 3, h.updates()[id])
+}
+
+func TestUsageAnUpdaterThatStaysDownHaltsAtItsRetryLimit(t *testing.T) {
+	h := newFleet(t, usageConfig)
+
+	const id = tObs1Server
+
+	h.world.set(func(w *world) { w.updateFail[id] = "updater unavailable" })
+	h.release(imgAlpha, d2)
+	r := h.until(h.active(clientAlpha).ID, Halted, 20)
+	require.Contains(t, r.Reason, "update failed (attempt 5 of 5): updater unavailable; retry limit reached")
+	require.Equal(t, 5, r.target(id).UpdateAttempts)
+	require.Len(t, h.world.callsFor("update:"+id), 5)
+	require.Empty(t, h.on(d2))
+	require.Equal(t, r.ID, h.view(id).Quarantine.Rollout)
+	h.ticks(3, time.Minute)
+	require.Len(t, h.world.callsFor("update:"+id), 5)
+}
+
+func TestUsageASoakCheckThatCannotRunDoesNotRejectTheBuild(t *testing.T) {
+	h := newFleet(t, usageConfig)
+	h.world.set(func(w *world) { w.runErr[soakServer] = errors.New("cannot start check") })
+	h.release(imgAlpha, d2)
+	r := h.until(h.active(clientAlpha).ID, Halted, 20)
+	require.Contains(t, r.Reason, "soak soak-server could not run: cannot start check")
+	require.Equal(t, 0, r.Soak.Failures)
+	require.Equal(t, 0, r.Soak.Streak)
+	require.Equal(t, 5, r.Soak.ConsecutiveErrors)
+	require.Equal(t, []string{tObs1Server}, h.on(d2))
+	require.Equal(t, Healthy, h.view(tObs1Server).Health)
+
+	for _, check := range r.Soak.Checks {
+		require.True(t, check.Error)
+		require.False(t, check.OK)
+	}
 }

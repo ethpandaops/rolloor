@@ -17,9 +17,9 @@ The spec is `tasks/prd.md`.
 1. The registry is polled; a tag now points at a new digest.
 2. `inspect` reports what each container runs. Those behind form a rollout per group (the value of a configured label).
 3. Targets are sorted (not ready at rollout creation first, then by `wave` label, node, id) and cut into batches of nodes (the `strategy`: `firstBatch`, `batchSize`) that fit the disruption budget; a batch takes all of a node's targets in the group. An already-unavailable node adds no unavailable weight. When unavailable weight and the batch's cost are both zero, one weighted node may go however heavy it is, as `maxUnavailable` rounds up to one pod on a Kubernetes DaemonSet; weightless nodes never consume the budget. `maxUnavailable: 0` admits only nodes already unavailable or weightless.
-4. `update` starts each update. The independent inspector observes the new digest, then the rollout waits for a successful readiness probe that began after that digest was first seen. The rollout does not run `ready`.
-5. `soak` compares the batch against the containers not yet reached, every `interval` for `duration`. Passing moves on; more than `failureLimit` failed checks halts and quarantines the batch.
-6. A newer digest supersedes a halted or running rollout. Currently not-ready targets go first in the next one. Quarantine is rollout metadata, not observed health or digest drift: it ends on abort or supersession, or when a retried target passes its batch. A quarantined target can be Healthy and Synced, and does not need an update solely to clear its quarantine.
+4. `update` starts each update. Failed attempts retry with the strategy's backoff, up to its retry limit or progress deadline. Open batches request inspection and readiness immediately and on each tick through the same recorders as the independent loops. Progress requires the new digest and a successful readiness probe that began after that digest was first seen.
+5. `soak` compares the batch against the containers not yet reached, every `interval` for `duration`. Passing moves on; more than `failureLimit` failed checks halts and quarantines the batch. A check that cannot execute is an error, not evidence for or against the build; more than `consecutiveErrorLimit` consecutive error rounds also halts.
+6. A change to any image/digest choice in a group's full desired key supersedes its halted or running rollout, even when that image was outside the original drift set. Currently not-ready targets go first in the next one. Quarantine is rollout metadata, not observed health or digest drift: it ends on abort or supersession, or when a retried target passes its batch. A quarantined target can be Healthy and Synced, and does not need an update solely to clear its quarantine.
 
 People can sync, pause, promote, abort, retry, suspend targets with an expiry, and set a group's policy (automated or manual, a named strategy, pinned digests).
 
@@ -54,6 +54,31 @@ readinessProbe:
 Consecutive failures and successes must reach their threshold before changing readiness. Probes cover every target with the inspector's concurrency limit. Readiness, transition times, reasons and counters survive restarts; removing a target forgets its observations.
 
 Unavailable weight is the union of nodes with a not-ready or unprobed target, nodes admitted into an update that has not yet been observed ready on its new build, and nodes still held after an ended operation while an update may land. A node is counted once at its configured weight, including outages unrelated to rollouts. Admission charges only nodes newly added to that union.
+
+## Strategy progress and retries
+
+The default strategy and named strategies inherit these settings unless overridden:
+
+```yaml
+strategy:
+  progressDeadline: 10m
+  retry:
+    limit: 5
+    backoff:
+      duration: 10s
+      factor: 2
+      maxDuration: 3m
+  soak:
+    consecutiveErrorLimit: 4
+```
+
+`progressDeadline` starts at a target's first update dispatch and covers update attempts, digest convergence and post-digest readiness. Automatic retries and restarts do not reset it. When an operation ends, updates that may still land hold admission for at most another `progressDeadline` from that ending time, unless readiness is observed sooner. Manual retry starts a fresh attempt window.
+
+`retry.limit` is the total number of update attempts, including the initial dispatch. Zero permits the initial dispatch but no automatic retries. Backoff after failure number `n` is `duration * factor^(n-1)`, capped at `maxDuration`; the initial delay is capped too. Attempts and pending retry times survive restarts. Interrupted dispatches consume an attempt and can be dispatched again only within the remaining attempt and deadline limits.
+
+For soak, runner errors, timeouts and killed programs preserve the passing streak and failure count but cannot pass a batch. A round without an execution error resets the consecutive error count. In a multi-program round, an executed failing comparison still counts as a failure even if another program could not execute; an error prevents that round from counting as a pass. Zero `consecutiveErrorLimit` halts on the first error round.
+
+Stored active rollouts without a full group desired key are superseded on their first tick; the new operation uses the current group build rather than preserving the previous drift-only comparison.
 
 ## Run
 

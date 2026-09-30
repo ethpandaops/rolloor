@@ -115,7 +115,7 @@ func TestBudgetStaysHeldWhileAnEndedRolloutMayStillBeLanding(t *testing.T) {
 	require.Equal(t, []string{tA3el}, rb.Batches[0].Targets)
 
 	// Once the update could no longer be landing, the hold lifts.
-	h.clock.Advance(h.cfg.Hooks.Timeout*5 + time.Second)
+	h.clock.Advance(h.cfg.Strategy.ProgressDeadline + time.Second)
 
 	h.c.mu.Lock()
 	busy := h.c.unavailableNodes(h.clock.Now())
@@ -394,8 +394,9 @@ func TestRefreshAskedForDuringAScanIsKept(t *testing.T) {
 }
 
 func TestInterruptedUpdateRunsAgainAfterRestart(t *testing.T) {
-	h := newHarness(t, testConfig, testTargets)
+	h := newHarness(t, replaceLine(testConfig, "retry: {limit: 1}", "retry: {limit: 5}"), testTargets)
 	h.prime()
+	h.world.set(func(w *world) { w.updateStuck[tA1] = true })
 	h.release(imgA, d2)
 
 	id := h.active("a").ID
@@ -408,6 +409,7 @@ func TestInterruptedUpdateRunsAgainAfterRestart(t *testing.T) {
 
 	updates := len(h.world.callsFor("update"))
 	restarted := h.newController()
+	h.world.set(func(w *world) { delete(w.updateStuck, tA1) })
 	require.NoError(t, restarted.Tick(h.ctx))
 
 	calls := h.world.callsFor("update")

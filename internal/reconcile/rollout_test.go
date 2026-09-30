@@ -177,7 +177,6 @@ func TestNewDigestSupersedesHaltAndDegradedGoFirst(t *testing.T) {
 
 	old := h.rollout(first.ID)
 	require.Equal(t, Superseded, old.State)
-	require.Contains(t, old.Reason, "moved to 3333333")
 	require.Nil(t, h.view(tA1).Quarantine)
 	require.Nil(t, mustView(t, h.newController(), tA1).Quarantine)
 
@@ -204,11 +203,11 @@ func TestUpdateFailureAndReadyTimeoutHalt(t *testing.T) {
 
 	r := h.active("a")
 	require.Equal(t, Halted, r.State)
-	require.Contains(t, r.Reason, "a-2/cl update failed: watcher said no")
+	require.Equal(t, 1, r.target(tA2).UpdateAttempts)
 	require.Equal(t, PhaseFailed, h.phases(r)[tA1])
 	require.Equal(t, "in the halted batch", h.view(tA1).Quarantine.Reason)
 
-	// A target whose digest never lands times out after 5× the hook timeout.
+	// Digest convergence is bounded independently of one hook invocation.
 	h2 := newHarness(t, testConfig, testTargets)
 	h2.prime()
 	h2.world.set(func(w *world) { w.updateStuck[tA1] = true })
@@ -596,8 +595,8 @@ func TestSuspendResumeAndExpiry(t *testing.T) {
 	require.Empty(t, h.c.Suspensions())
 	require.Contains(t, h.notes.actions(), "suspend.expired")
 
-	// The lifted target is out of sync, so a new rollout picks it up at once.
-	require.Equal(t, OutOfSync, h.view(tA1).Sync)
+	// The lifted target is picked up and its digest is observed immediately.
+	require.Equal(t, Synced, h.view(tA1).Sync)
 	require.Equal(t, Progressing, h.view(tA1).Health)
 	require.Equal(t, []string{tA1}, h.active("a").Batches[0].Targets)
 
@@ -794,17 +793,22 @@ func TestSoakNumbersAndPerProgramGrouping(t *testing.T) {
 	require.Empty(t, unit)
 }
 
-func TestSoakHookErrorCountsAsFailure(t *testing.T) {
+func TestSoakHookErrorsHaveTheirOwnLimit(t *testing.T) {
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
 	h.world.set(func(w *world) { w.runErr[soakA] = errFake })
 	h.release(imgA, d2)
 	h.ticks(5, 0)
-	require.Equal(t, 1, h.active("a").Soak.Failures)
-	h.clock.Advance(20 * time.Second)
-	h.tick()
+	require.Equal(t, 0, h.active("a").Soak.Failures)
+	require.Equal(t, 1, h.active("a").Soak.ConsecutiveErrors)
+
+	for range h.cfg.Strategy.Soak.ConsecutiveErrorLimit {
+		h.clock.Advance(h.cfg.Strategy.Soak.Interval)
+		h.tick()
+	}
+
 	require.Equal(t, Halted, h.active("a").State)
-	require.Contains(t, h.active("a").Reason, "fake")
+	require.Contains(t, h.active("a").Reason, "could not run: fake")
 }
 
 func TestSupersededMidBatchSkipsInFlightTargets(t *testing.T) {
@@ -1000,7 +1004,7 @@ func TestWeightlessOutageDoesNotBlockAHeavyNodeRetry(t *testing.T) {
 	h.release(imgA, d2)
 	r := h.active("a")
 	require.Equal(t, Halted, r.State)
-	h.clock.Advance(h.cfg.Hooks.Timeout*5 + time.Second)
+	h.clock.Advance(h.cfg.Strategy.ProgressDeadline + time.Second)
 	h.world.set(func(w *world) {
 		delete(w.updateFail, tN1A)
 		w.notReady["n0/b"] = true
@@ -1012,4 +1016,58 @@ func TestWeightlessOutageDoesNotBlockAHeavyNodeRetry(t *testing.T) {
 
 	require.NoError(t, h.c.Retry(h.ctx, actor, r.ID, "updater recovered"))
 	require.Equal(t, Complete, h.drive(r.ID, 20, time.Second).State)
+}
+
+func TestGroupDesiredKeySupersedesOnAnImageAlreadyInSync(t *testing.T) {
+	h := newHarness(t, testConfig, `
+- {id: n1/a, node: n1, weight: 100, image: org/a:t, labels: {client: a, owner: a}, hooks: {soak: soak-a}}
+- {id: n1/b, node: n1, weight: 100, image: org/b:t, labels: {client: a, owner: a}}
+`)
+	h.prime()
+	h.release(imgA, d2)
+	first := h.active("a")
+	require.NotContains(t, first.Desired, imgB)
+
+	h.c = h.newController()
+	h.tick()
+	require.Equal(t, first.ID, h.active("a").ID)
+	h.release(imgB, d3)
+	require.Equal(t, Superseded, h.rollout(first.ID).State)
+	next := h.active("a")
+	require.NotEqual(t, first.ID, next.ID)
+	require.Equal(t, d3, next.Desired[imgB])
+	require.Equal(t, Complete, h.drive(next.ID, 10, time.Second).State)
+}
+
+func TestStoredRolloutWithoutGroupDesiredKeyIsSuperseded(t *testing.T) {
+	h := newHarness(t, testConfig, retryFleet)
+	h.prime()
+	h.world.set(func(w *world) { w.updateStuck[tN1A] = true })
+	h.release(imgA, d2)
+	first := h.active("a")
+	h.store.mu.Lock()
+	h.store.rollouts[first.ID].GroupDesiredKey = ""
+	h.store.mu.Unlock()
+	h.c = h.newController()
+	h.tick()
+	require.Equal(t, Superseded, h.rollout(first.ID).State)
+	require.NotEqual(t, first.ID, h.active("a").ID)
+	require.Len(t, h.world.callsFor("update:"+tN1A), 2)
+}
+
+func TestEndedUpdateHoldUsesTheRolloutStrategyDeadline(t *testing.T) {
+	cfg := replaceLine(testConfig, "careful: {firstBatch: 1,", "careful: {progressDeadline: 17s, firstBatch: 1,")
+	h := newHarness(t, cfg, retryFleet)
+	h.prime()
+	require.NoError(t, h.c.SetPolicy(h.ctx, actor, "a", Policy{Mode: ModeAutomated, Strategy: careful}))
+	h.world.set(func(w *world) { w.updateStuck[tN1A] = true })
+	h.release(imgA, d2)
+	r := h.active("a")
+	require.NoError(t, h.c.Abort(h.ctx, actor, r.ID))
+	require.Equal(t, h.clock.Now().Add(17*time.Second), h.rolloutTarget(r.ID, tN1A).HoldUntil)
+	used, _ := h.unavailable()
+	require.InDelta(t, 100, used, 0)
+	h.clock.Advance(17 * time.Second)
+	used, _ = h.unavailable()
+	require.InDelta(t, 0, used, 0)
 }

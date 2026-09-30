@@ -52,7 +52,7 @@
   <div class="numbers">
     {{if .LastCheck.Updated}}<div><div class="big">{{.LastCheck.Updated}}{{.LastCheck.Unit}}</div><div class="muted">updated in this batch</div></div>{{end}}
     {{if .LastCheck.Remaining}}<div><div class="big">{{.LastCheck.Remaining}}{{.LastCheck.Unit}}</div><div class="muted">not yet updated</div></div>{{end}}
-    <div class="verdict {{if .LastCheck.OK}}ok{{else}}bad{{end}}">{{if .LastCheck.OK}}Within tolerance{{else}}Outside tolerance{{end}} on check {{len .Rollout.Soak.Checks}}: {{.LastCheck.Reason}}</div>
+    <div class="verdict {{if .LastCheck.Error}}muted{{else if .LastCheck.OK}}ok{{else}}bad{{end}}">{{if .LastCheck.Error}}Check could not run{{else if .LastCheck.OK}}Within tolerance{{else}}Outside tolerance{{end}} on check {{len .Rollout.Soak.Checks}}: {{.LastCheck.Reason}}</div>
   </div>
 </div>
 {{end}}

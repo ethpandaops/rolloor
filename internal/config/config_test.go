@@ -17,6 +17,9 @@ func TestParseMinimal(t *testing.T) {
 	require.Equal(t, 10*time.Minute, cfg.Strategy.Soak.Duration)
 	require.Equal(t, time.Minute, cfg.Strategy.Soak.Interval)
 	require.Equal(t, 1, cfg.Strategy.Soak.FailureLimit)
+	require.Equal(t, 10*time.Minute, cfg.Strategy.ProgressDeadline)
+	require.Equal(t, Retry{Limit: 5, Backoff: Backoff{Duration: 10 * time.Second, Factor: 2, MaxDuration: 3 * time.Minute}}, cfg.Strategy.Retry)
+	require.Equal(t, 4, cfg.Strategy.Soak.ConsecutiveErrorLimit)
 	require.Equal(t, 3, cfg.Inspect.FailureThreshold)
 	require.Equal(t, ReadinessProbe{Period: 30 * time.Second, FailureThreshold: 3, SuccessThreshold: 1}, cfg.ReadinessProbe)
 	require.Empty(t, cfg.Strategies)
@@ -38,16 +41,22 @@ strategy:
   batchSize: 20%
   pauseAfterFirstBatch: true
   waves: false
+  progressDeadline: 90s
+  retry: {limit: 3, backoff: {duration: 5s, factor: 3, maxDuration: 45s}}
   soak:
     duration: 5m
     interval: 30s
     failureLimit: 0
+    consecutiveErrorLimit: 2
 strategies:
   fast:
     batchSize: 50%
     waves: true
+    progressDeadline: 2m
+    retry: {backoff: {factor: 1}}
     soak:
       duration: 0s
+      consecutiveErrorLimit: 0
 defaultPolicy:
   strategy: fast
 `))
@@ -68,6 +77,12 @@ defaultPolicy:
 	require.False(t, cfg.Strategy.UsesWaves(), "overriding waves leaves the default alone")
 	require.Equal(t, time.Duration(0), fast.Soak.Duration)
 	require.Equal(t, 30*time.Second, fast.Soak.Interval)
+	require.Equal(t, 90*time.Second, base.ProgressDeadline)
+	require.Equal(t, 2*time.Minute, fast.ProgressDeadline)
+	require.Equal(t, Retry{Limit: 3, Backoff: Backoff{Duration: 5 * time.Second, Factor: 1, MaxDuration: 45 * time.Second}}, fast.Retry)
+	require.Equal(t, 3, base.Retry.Backoff.Factor)
+	require.Equal(t, 0, fast.Soak.ConsecutiveErrorLimit)
+	require.Equal(t, 2, base.Soak.ConsecutiveErrorLimit)
 	require.Equal(t, []string{"fast"}, cfg.StrategyNames())
 
 	_, ok = cfg.StrategyNamed("warp")
@@ -102,6 +117,12 @@ func TestValidateErrors(t *testing.T) {
 		"negative probe failures":        "environment: x\nreadinessProbe: {failureThreshold: -1}\n",
 		"zero probe successes":           "environment: x\nreadinessProbe: {successThreshold: 0}\n",
 		"removed environment hook":       "environment: x\nhooks: {environment: {program: check}}\n",
+		"zero progress deadline":         "environment: x\nstrategy: {progressDeadline: 0s}\n",
+		"negative retry limit":           "environment: x\nstrategy: {retry: {limit: -1}}\n",
+		"zero backoff duration":          "environment: x\nstrategy: {retry: {backoff: {duration: 0s}}}\n",
+		"zero backoff factor":            "environment: x\nstrategy: {retry: {backoff: {factor: 0}}}\n",
+		"negative maximum backoff":       "environment: x\nstrategy: {retry: {backoff: {maxDuration: -1s}}}\n",
+		"negative error limit":           "environment: x\nstrategy: {soak: {consecutiveErrorLimit: -1}}\n",
 	}
 
 	for name, raw := range cases {

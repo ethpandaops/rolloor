@@ -213,7 +213,7 @@ func (c *Controller) restore(snap *Snapshot) {
 	for _, r := range c.rollouts {
 		for i := range r.Targets {
 			rt := &r.Targets[i]
-			if rt.Phase == PhaseUpdating && !rt.UpdateDone {
+			if rt.Phase == PhaseUpdating && !rt.UpdateDone && rt.RetryAt.IsZero() {
 				rt.Phase, rt.Reason = PhasePending, "update interrupted by a restart; running again"
 			}
 		}
@@ -289,11 +289,14 @@ func (c *Controller) Tick(ctx context.Context) error {
 	c.mu.Unlock()
 
 	results := c.execute(ctx, jobs)
+	now = c.clock.Now()
 
 	c.mu.Lock()
 	c.applyResults(ctx, now, results)
 	c.lastTick = now
 	c.mu.Unlock()
+
+	c.observeBatch(ctx)
 
 	return ctx.Err()
 }
@@ -572,47 +575,101 @@ func (c *Controller) setLiveLocked(ctx context.Context, now, observedAt time.Tim
 
 // InspectAll runs the inspect hook for every target and records the result.
 func (c *Controller) InspectAll(ctx context.Context) {
-	set := c.targets()
+	c.observeTargets(ctx, c.targets().Targets, config.HookInspect)
+}
 
-	// Hook input reads the desired digests, so it is built under the lock
-	// before the programs run.
-	c.mu.Lock()
-
-	inputs := make([]HookInput, len(set.Targets))
-	for i := range set.Targets {
-		inputs[i] = c.hookInput(set, &set.Targets[i])
+func (c *Controller) observeTargets(ctx context.Context, ts []targets.Target, hook string) {
+	if hook == config.HookReady {
+		c.probeMu.Lock()
+		defer c.probeMu.Unlock()
 	}
 
-	c.mu.Unlock()
+	set := c.targets()
+	c.mu.RLock()
+
+	inputs := make([]HookInput, len(ts))
+	for i := range ts {
+		inputs[i] = c.hookInput(set, &ts[i])
+	}
+
+	c.mu.RUnlock()
 
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(c.cfg.Inspect.Concurrency)
 
-	for i := range set.Targets {
-		t := set.Targets[i]
+	for i := range ts {
+		t := &ts[i]
 		in := inputs[i]
 
 		g.Go(func() error {
 			started := c.clock.Now()
-			res, err := c.runner.Run(gctx, c.programFor(&t, config.HookInspect), config.HookInspect, t.ID, in)
+			res, err := c.runner.Run(gctx, c.programFor(t, hook), hook, t.ID, in)
+
+			if hook == config.HookReady && gctx.Err() != nil {
+				return nil
+			}
+
+			if err != nil {
+				res = hooks.Result{Program: c.programFor(t, hook), Reason: err.Error(), ExitCode: -1, RanAt: c.clock.Now()}
+			}
 
 			c.mu.Lock()
 			defer c.mu.Unlock()
 
-			if err != nil {
-				c.setLiveLocked(gctx, c.clock.Now(), started, t.ID, "", false, err.Error())
+			accepted := false
 
-				return nil
+			if hook == config.HookInspect {
+				accepted = c.setLiveLocked(gctx, c.clock.Now(), started, t.ID, strings.TrimSpace(res.Reason), res.OK, res.Reason)
+			} else {
+				accepted = c.setReadinessLocked(gctx, t.ID, started, res.OK, res.Reason)
 			}
 
-			c.recordHookRun(gctx, t.ID, config.HookInspect, &res)
-			c.setLiveLocked(gctx, c.clock.Now(), started, t.ID, strings.TrimSpace(res.Reason), res.OK, res.Reason)
+			if accepted {
+				c.recordHookRun(gctx, t.ID, hook, &res)
+			}
 
 			return nil
 		})
 	}
 
 	_ = g.Wait()
+}
+
+func (c *Controller) observeBatch(ctx context.Context) {
+	set := c.targets()
+	c.mu.RLock()
+
+	var waiting []targets.Target
+
+	seen := map[string]struct{}{}
+
+	for _, r := range c.rollouts {
+		b := r.CurrentBatch()
+		if r.State != Running || b == nil {
+			continue
+		}
+
+		for _, id := range b.Targets {
+			if r.target(id).Phase != PhaseUpdating {
+				continue
+			}
+
+			t, present := set.Get(id)
+			_, duplicate := seen[id]
+
+			if present && !duplicate {
+				waiting = append(waiting, t)
+				seen[id] = struct{}{}
+			}
+		}
+	}
+
+	c.mu.RUnlock()
+
+	if len(waiting) > 0 {
+		c.observeTargets(ctx, waiting, config.HookInspect)
+		c.observeTargets(ctx, waiting, config.HookReady)
+	}
 }
 
 // RunInspector observes every target on the inspect interval until ctx ends.
