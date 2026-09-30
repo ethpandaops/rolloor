@@ -75,29 +75,10 @@ func (c *Controller) planRollouts(ctx context.Context, now time.Time) []job {
 	return jobs
 }
 
-// planRollout is only called for active rollouts; WaitingForSync and Paused
-// have nothing to do until a person acts.
+// planRollout is only called for active rollouts; WaitingForSync, Paused and
+// Halted have nothing to do until a person acts.
 func (c *Controller) planRollout(ctx context.Context, now time.Time, r *Rollout, set *targets.Set) []job {
 	switch r.State {
-	case Halted:
-		if !r.RetryPending {
-			return nil
-		}
-
-		// A retry waiting for room is not a new halt, so history and anyone
-		// following it hear nothing until the batch reopens.
-		if why, fits := c.retryFits(set, r, now); !fits {
-			if r.Reason != why {
-				r.Reason, r.UpdatedAt = why, now
-				_ = c.saveRollout(ctx, r)
-			}
-
-			return nil
-		}
-
-		c.retryBatch(ctx, now, r)
-
-		return c.planBatch(ctx, now, r, set)
 	case Soaking:
 		return c.planSoak(ctx, now, r, set)
 	case Running, WaitingForBudget:
@@ -113,96 +94,6 @@ func (c *Controller) planRollout(ctx context.Context, now time.Time, r *Rollout,
 	default:
 		return nil
 	}
-}
-
-// retryFits checks the same observed-unavailability budget as a new admission.
-func (c *Controller) retryFits(set *targets.Set, r *Rollout, now time.Time) (string, bool) {
-	b := &r.Batches[len(r.Batches)-1]
-	busy := c.unavailableNodes(now)
-	nodes := map[string]struct{}{}
-
-	var cost float64
-
-	for _, id := range b.Targets {
-		rt := r.target(id)
-		if rt.Phase != PhaseFailed {
-			continue
-		}
-
-		t, ok := set.Get(id)
-		if _, skip := c.skipReason(r, set, &t, ok); skip {
-			continue
-		}
-
-		_, counted := busy[rt.Node]
-		_, seen := nodes[rt.Node]
-
-		if counted || seen || set.NodeWeight(rt.Node) == 0 {
-			continue
-		}
-
-		nodes[rt.Node] = struct{}{}
-		cost += set.NodeWeight(rt.Node)
-	}
-
-	budget := c.cfg.DisruptionBudget.MaxUnavailable.OfWeight(set.TotalWeight())
-	inflight := c.unavailableWeight(set)
-	alone := budget > 0 && inflight == 0 && len(nodes) == 1
-
-	if cost == 0 || inflight+cost <= budget || alone {
-		return "", true
-	}
-
-	return fmt.Sprintf("Retry waiting for the disruption budget: %s of %s unavailable; reopening batch %d needs %s.",
-		pct(inflight, set.TotalWeight()), c.cfg.DisruptionBudget.MaxUnavailable.String(), b.Number, pct(cost, set.TotalWeight())), false
-}
-
-// retryBatch reopens failed targets using the current observations and preserves
-// earlier soak attempts.
-func (c *Controller) retryBatch(ctx context.Context, now time.Time, r *Rollout) {
-	busy := c.unavailableNodes(now)
-	set := c.targets()
-	r.RetryPending = false
-	r.Soak = SoakProgress{}
-
-	b := &r.Batches[len(r.Batches)-1]
-	b.EndedAt = time.Time{}
-
-	if b.Soak != nil {
-		b.PriorSoaks = append(b.PriorSoaks, b.Soak)
-		b.Soak = nil
-	}
-
-	for _, id := range b.Targets {
-		rt := r.target(id)
-		if rt.Phase == PhaseFailed {
-			t, present := set.Get(id)
-			if reason, skip := c.skipReason(r, set, &t, present); skip {
-				rt.Phase, rt.Reason = PhaseSkipped, reason
-
-				continue
-			}
-
-			if c.heldReady(r, rt) {
-				rt.HoldUntil = time.Time{}
-			}
-
-			rt.Phase, rt.Reason, rt.UpdatedAt = PhaseUpdating, "retrying: waiting for the digest", now
-			rt.DigestSeenAt = time.Time{}
-			rt.UpdateDone, rt.Updated = true, false
-			rt.UpdateAttempts = 0
-			rt.RetryAt = time.Time{}
-			rt.UpdateError = ""
-
-			if live, known := c.liveKnown(id); !known || live != r.Desired[t.Image] {
-				rt.Phase, rt.Reason, rt.UpdateDone = PhasePending, "retrying: running the update again", false
-			}
-
-			_, rt.Free = busy[rt.Node]
-		}
-	}
-
-	c.setState(ctx, now, r, Running, fmt.Sprintf("Retrying batch %d.", b.Number))
 }
 
 // planBatch dispatches updates and reads the independent observations.
@@ -478,13 +369,14 @@ func (c *Controller) planSoak(ctx context.Context, now time.Time, r *Rollout, se
 }
 
 // remainingForSoak lists the rollout targets not yet reached that use the same
-// soak program, excluding suspended and unknown ones.
+// soak program, excluding suspended and unknown ones. A retried target was
+// reached by the batch that halted, so it is no baseline.
 func (c *Controller) remainingForSoak(r *Rollout, set *targets.Set, prog string) []targets.Target {
 	out := []targets.Target{}
 
 	for i := range r.Targets {
 		rt := &r.Targets[i]
-		if rt.Batch != 0 || rt.Phase != PhasePending {
+		if rt.Batch != 0 || rt.Phase != PhasePending || rt.Retried {
 			continue
 		}
 

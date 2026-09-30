@@ -358,7 +358,9 @@ func (c *Controller) Abort(ctx context.Context, actor, rolloutID string) error {
 	return nil
 }
 
-// Retry reopens a halted rollout's batch; see retryBatch.
+// Retry resumes a halted rollout. The halted batch stays closed on the
+// record; the targets it failed go back to pending ahead of every untried
+// target, with a fresh attempt window.
 func (c *Controller) Retry(ctx context.Context, actor, rolloutID, reason string) error {
 	if reason == "" {
 		return errors.New("a reason is required")
@@ -383,8 +385,28 @@ func (c *Controller) Retry(ctx context.Context, actor, rolloutID, reason string)
 	}
 
 	err := c.commit(ctx, r, func() {
-		r.RetryPending = true
+		for i := range r.Targets {
+			rt := &r.Targets[i]
+			if rt.Phase != PhaseFailed {
+				continue
+			}
+
+			// An earlier update may still land, so an unexpired hold stays
+			// until the target is seen ready on the build.
+			hold := rt.HoldUntil
+			if !now.Before(hold) || c.heldReady(r, rt) {
+				hold = time.Time{}
+			}
+
+			*rt = RolloutTarget{
+				ID: rt.ID, Node: rt.Node, Wave: rt.Wave, Phase: PhasePending, Reason: "waiting to be retried",
+				NotReadyBefore: rt.NotReadyBefore, HoldUntil: hold, Retried: true,
+			}
+		}
+
 		r.Human = true
+		r.Soak = SoakProgress{}
+		r.State, r.Reason, r.UpdatedAt = Running, "Retried by "+actor, now
 	})
 	if err != nil {
 		return err

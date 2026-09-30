@@ -116,8 +116,8 @@ type propDispatch struct {
 }
 
 // checkHeld asserts that a rollout held at the start of the step (paused,
-// halted without a retry, or waiting for a sync) and still its group's
-// rollout at the end ran no update.
+// halted, or waiting for a sync) and still its group's rollout at the end ran
+// no update.
 func (s *sim) checkHeld(dispatches []propDispatch) error {
 	for _, d := range dispatches {
 		r, had := s.before[d.group]
@@ -125,7 +125,7 @@ func (s *sim) checkHeld(dispatches []propDispatch) error {
 			continue
 		}
 
-		if held := r.State == Paused || r.State == WaitingForSync || (r.State == Halted && !r.RetryPending); !held {
+		if held := r.State == Paused || r.State == Halted || r.State == WaitingForSync; !held {
 			continue
 		}
 
@@ -207,8 +207,7 @@ func (s *sim) check() error {
 }
 
 // checkRollout asserts the shape of one rollout: batch sizes, wave order,
-// manual policy, what completion means, and that a node was admitted free
-// only when its node was already unavailable.
+// retry isolation, manual policy and what completion means.
 func (s *sim) checkRollout(r *RolloutView) error {
 	if _, seen := s.manual[r.ID]; !seen {
 		s.manual[r.ID] = s.modes[r.Group] == ModeManual
@@ -228,6 +227,11 @@ func (s *sim) checkRollout(r *RolloutView) error {
 			s.strategy[key] = r.Strategy
 		}
 
+		// A retry batch is sized by the budget alone.
+		if b.Retried {
+			continue
+		}
+
 		st := s.h.c.strategy(s.strategy[key])
 
 		nodes := map[string]struct{}{}
@@ -240,24 +244,92 @@ func (s *sim) checkRollout(r *RolloutView) error {
 		}
 	}
 
-	// A batch that went ahead of a lower wave breaks the order only if the
-	// strategy it was cut under follows waves.
-	for _, a := range r.Targets {
-		for _, b := range r.Targets {
-			if a.NotReadyBefore || b.NotReadyBefore || a.Batch == 0 || b.Batch == 0 {
-				continue
-			}
+	if err := checkRetries(r); err != nil {
+		return err
+	}
 
-			if st := s.h.c.strategy(s.strategy[r.ID+"/"+strconv.Itoa(b.Batch)]); a.Wave < b.Wave && a.Batch > b.Batch && st.UsesWaves() {
-				return fmt.Errorf("rollout %s moved %s (wave %d) in batch %d, after %s (wave %d) in batch %d",
-					r.ID, a.ID, a.Wave, a.Batch, b.ID, b.Wave, b.Batch)
-			}
-		}
+	if err := s.checkWaves(r); err != nil {
+		return err
 	}
 
 	for _, rt := range r.Targets {
 		if r.State == Complete && rt.Phase != PhasePassed && rt.Phase != PhaseSkipped {
 			return fmt.Errorf("rollout %s is Complete with %s %s", r.ID, rt.ID, rt.Phase)
+		}
+	}
+
+	return nil
+}
+
+// checkWaves asserts that a batch went ahead of a lower wave only if the
+// strategy it was cut under ignores waves. A retry repeats targets already
+// ordered, so each target counts where it was first batched.
+func (s *sim) checkWaves(r *RolloutView) error {
+	first := map[string]int{}
+
+	for i := range r.Batches {
+		for _, id := range r.Batches[i].Targets {
+			if _, seen := first[id]; !seen {
+				first[id] = r.Batches[i].Number
+			}
+		}
+	}
+
+	for _, a := range r.Targets {
+		for _, b := range r.Targets {
+			fa, fb := first[a.ID], first[b.ID]
+			if a.NotReadyBefore || b.NotReadyBefore || fa == 0 || fb == 0 {
+				continue
+			}
+
+			if st := s.h.c.strategy(s.strategy[r.ID+"/"+strconv.Itoa(fb)]); a.Wave < b.Wave && fa > fb && st.UsesWaves() {
+				return fmt.Errorf("rollout %s moved %s (wave %d) in batch %d, after %s (wave %d) in batch %d",
+					r.ID, a.ID, a.Wave, fa, b.ID, b.Wave, fb)
+			}
+		}
+	}
+
+	return nil
+}
+
+// checkRetries asserts from batch history that a retry appends batches: a
+// retry batch repeats only retried targets, an ordinary batch repeats none, a
+// target's batch is the last to take it, and none is cut past a waiting retry.
+func checkRetries(r *RolloutView) error {
+	last := map[string]int{}
+	ordinary := 0
+
+	for i := range r.Batches {
+		b := &r.Batches[i]
+		if !b.Retried {
+			ordinary = b.Number
+		}
+
+		for _, id := range b.Targets {
+			_, repeat := last[id]
+			if b.Retried && (!repeat || !r.target(id).Retried) {
+				return fmt.Errorf("rollout %s retry batch %d took %s, which no retry sent back", r.ID, b.Number, id)
+			}
+
+			if !b.Retried && repeat {
+				return fmt.Errorf("rollout %s batch %d took %s again without a retry", r.ID, b.Number, id)
+			}
+
+			last[id] = b.Number
+		}
+	}
+
+	for _, rt := range r.Targets {
+		if rt.Batch != 0 && rt.Batch != last[rt.ID] {
+			return fmt.Errorf("rollout %s puts %s in batch %d, but batch %d last took it", r.ID, rt.ID, rt.Batch, last[rt.ID])
+		}
+
+		if rt.Retried && last[rt.ID] == 0 {
+			return fmt.Errorf("rollout %s retried %s, which no batch took", r.ID, rt.ID)
+		}
+
+		if rt.Retried && rt.Batch == 0 && rt.Phase == PhasePending && ordinary > last[rt.ID] {
+			return fmt.Errorf("rollout %s cut ordinary batch %d while retried %s waited", r.ID, ordinary, rt.ID)
 		}
 	}
 
@@ -321,12 +393,15 @@ func TestPropertyControllerInvariantsAdmissionBudget(t *testing.T) {
 				before = cloneRollout(r)
 			}
 
+			// A retry leaves batch 1 closed, saves its targets waiting to be
+			// retried, then cuts them into batch 2.
 			if tc.retry {
-				before.State = Halted
 				before.Batches[0].EndedAt = h.clock.Now()
+				r.Batches = []Batch{before.Batches[0], {Number: 2, Targets: tc.targets, Retried: true}}
 
 				for i := range before.Targets {
-					before.Targets[i].Phase = PhaseFailed
+					before.Targets[i] = RolloutTarget{ID: r.Targets[i].ID, Node: r.Targets[i].Node, Phase: PhasePending, Retried: true}
+					r.Targets[i].Batch, r.Targets[i].Retried = 2, true
 				}
 			}
 
@@ -349,6 +424,40 @@ func TestPropertyControllerInvariantsAdmissionBudget(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 			}
+		})
+	}
+}
+
+func TestPropertyControllerInvariantsRetryIsolation(t *testing.T) {
+	in := func(id string, batch int, retried bool) RolloutTarget {
+		return RolloutTarget{ID: id, Batch: batch, Phase: PhaseUpdating, Retried: retried}
+	}
+	waiting := RolloutTarget{ID: tN2A, Phase: PhasePending, Retried: true}
+	untried := RolloutTarget{ID: tN0A, Phase: PhasePending}
+	halted := Batch{Number: 1, Targets: []string{tN1A, tN2A}}
+
+	cases := []struct {
+		name     string
+		batches  []Batch
+		targets  []RolloutTarget
+		rejected bool
+	}{
+		{name: "retry batch takes the retried targets that fit", batches: []Batch{halted, {Number: 2, Targets: []string{tN1A}, Retried: true}},
+			targets: []RolloutTarget{in(tN1A, 2, true), waiting, untried}},
+		{name: "ordinary batches resume after the retries", batches: []Batch{halted, {Number: 2, Targets: []string{tN1A, tN2A}, Retried: true}, {Number: 3, Targets: []string{tN0A}}},
+			targets: []RolloutTarget{in(tN1A, 2, true), in(tN2A, 2, true), in(tN0A, 3, false)}},
+		{name: "retry batch mixes in an untried target", batches: []Batch{halted, {Number: 2, Targets: []string{tN1A, tN0A}, Retried: true}},
+			targets: []RolloutTarget{in(tN1A, 2, true), waiting, in(tN0A, 2, true)}, rejected: true},
+		{name: "ordinary batch goes ahead of a waiting retry", batches: []Batch{halted, {Number: 2, Targets: []string{tN0A}}},
+			targets: []RolloutTarget{{ID: tN1A, Phase: PhasePending, Retried: true}, waiting, in(tN0A, 2, false)}, rejected: true},
+		{name: "ordinary batch repeats a target", batches: []Batch{halted, {Number: 2, Targets: []string{tN1A}}},
+			targets: []RolloutTarget{in(tN1A, 2, true), {ID: tN2A, Phase: PhaseSkipped, Retried: true}, untried}, rejected: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := checkRetries(&RolloutView{Rollout: Rollout{ID: "r", Batches: tc.batches, Targets: tc.targets}})
+			require.Equal(t, tc.rejected, err != nil, "%v", err)
 		})
 	}
 }

@@ -207,7 +207,7 @@ func (c *Controller) quarantineFor(id string) *Quarantine {
 
 	var latest *Rollout
 	for _, r := range c.rollouts {
-		if rt := r.target(id); rt != nil && rt.Batch > 0 && rt.Phase != PhasePassed && (latest == nil || r.CreatedAt.After(latest.CreatedAt) || (r.CreatedAt.Equal(latest.CreatedAt) && r.ID > latest.ID)) {
+		if rt := r.target(id); rt != nil && (rt.Batch > 0 || rt.Retried) && rt.Phase != PhasePassed && (latest == nil || r.CreatedAt.After(latest.CreatedAt) || (r.CreatedAt.Equal(latest.CreatedAt) && r.ID > latest.ID)) {
 			latest = r
 			q.Rollout = r.ID
 		}

@@ -3,6 +3,7 @@ package reconcile
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 
@@ -299,23 +300,33 @@ func (c *Controller) startBatch(ctx context.Context, now time.Time, r *Rollout, 
 	}
 
 	st := c.strategy(r.Strategy)
-	wave := remaining[0].Wave
+	retry := slices.ContainsFunc(remaining, func(rt *RolloutTarget) bool { return rt.Retried })
+
+	// Batch sizes count nodes: a batch takes every target the group has on
+	// each node it picks. Retried targets go first and alone, as many as the
+	// budget admits.
+	size := len(remaining)
+	if !retry {
+		size = st.BatchFor(len(r.Batches)+1, len(rolloutNodes(r)))
+	}
 
 	// Readiness priority may place a later wave first; waves remain contiguous
-	// in that sorted order.
+	// in that sorted order. A retry is bounded by the budget alone.
 	var candidates []*RolloutTarget
 
 	for _, rt := range remaining {
-		if rt.Wave != wave && st.UsesWaves() {
+		if rt.Retried != retry {
+			continue
+		}
+
+		if !retry && len(candidates) > 0 && rt.Wave != candidates[0].Wave && st.UsesWaves() {
 			break
 		}
 
 		candidates = append(candidates, rt)
 	}
 
-	// Batch sizes count nodes: a batch takes every target the group has on
-	// each node it picks.
-	size := st.BatchFor(len(r.Batches)+1, len(rolloutNodes(r)))
+	wave := candidates[0].Wave
 	budget := c.cfg.DisruptionBudget.MaxUnavailable.OfWeight(set.TotalWeight())
 	busy := c.unavailableNodes(now)
 	inflight := c.unavailableWeight(set)
@@ -355,28 +366,34 @@ func (c *Controller) startBatch(ctx context.Context, now time.Time, r *Rollout, 
 		picked = append(picked, rt)
 	}
 
+	kind := ""
+	if retry {
+		kind = "retry "
+	}
+
 	if len(picked) == 0 {
 		need := set.NodeWeight(candidates[0].Node)
-		c.setState(ctx, now, r, WaitingForBudget, fmt.Sprintf("Waiting for the disruption budget: %s of %s unavailable; the next batch needs %s.",
-			pct(inflight, set.TotalWeight()), c.cfg.DisruptionBudget.MaxUnavailable.String(), pct(need, set.TotalWeight())))
+		c.setState(ctx, now, r, WaitingForBudget, fmt.Sprintf("Waiting for the disruption budget: %s of %s unavailable; the next %sbatch needs %s.",
+			pct(inflight, set.TotalWeight()), c.cfg.DisruptionBudget.MaxUnavailable.String(), kind, pct(need, set.TotalWeight())))
 
 		return
 	}
 
-	b := Batch{Number: len(r.Batches) + 1, Wave: wave, StartedAt: now}
+	b := Batch{Number: len(r.Batches) + 1, Wave: wave, StartedAt: now, Retried: retry}
 	for _, rt := range picked {
 		rt.Batch, rt.Free = b.Number, nodes[rt.Node]
 		b.Targets = append(b.Targets, rt.ID)
 	}
 
 	r.Batches = append(r.Batches, b)
-	c.setState(ctx, now, r, Running, fmt.Sprintf("Wave %d, batch %d of about %d: updating %d targets on %d nodes.", wave, b.Number, c.estimateBatches(r, &st), len(picked), len(nodes)))
+	c.setState(ctx, now, r, Running, fmt.Sprintf("Wave %d, %sbatch %d of about %d: updating %d targets on %d nodes.", wave, kind, b.Number, c.estimateBatches(r, &st), len(picked), len(nodes)))
 	c.event(ctx, now, &Event{Actor: ControllerActor, Action: "batch.started", Group: r.Group, Rollout: r.ID,
-		Reason: fmt.Sprintf("batch %d: %d targets on %d nodes in wave %d", b.Number, len(picked), len(nodes), wave)})
+		Reason: fmt.Sprintf("%sbatch %d: %d targets on %d nodes in wave %d", kind, b.Number, len(picked), len(nodes), wave)})
 }
 
 // remaining lists unbatched eligible targets in update order. Observed digest
-// convergence needs no operation, regardless of any earlier quarantine.
+// convergence needs no operation, regardless of any earlier quarantine, unless
+// a retry sent the target back to prove itself in a batch.
 func (c *Controller) remaining(r *Rollout, set *targets.Set, now time.Time) []*RolloutTarget {
 	var out []*RolloutTarget
 
@@ -393,13 +410,14 @@ func (c *Controller) remaining(r *Rollout, set *targets.Set, now time.Time) []*R
 			continue
 		}
 
-		if _, known := c.liveKnown(rt.ID); !known {
+		live, known := c.liveKnown(rt.ID)
+		if !known && !rt.Retried {
 			rt.Phase, rt.Reason = PhaseSkipped, "unreachable"
 
 			continue
 		}
 
-		if live, _ := c.liveKnown(rt.ID); live == r.Desired[t.Image] {
+		if live == r.Desired[t.Image] && !rt.Retried {
 			rt.Phase, rt.Reason, rt.UpdatedAt = PhasePassed, "already on the new build", now
 
 			continue

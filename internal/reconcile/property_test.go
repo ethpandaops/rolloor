@@ -208,11 +208,7 @@ func (s *sim) operate() {
 
 		switch r.State {
 		case Halted:
-			if r.RetryPending {
-				_ = h.c.Abort(h.ctx, actor, r.ID)
-			} else {
-				_ = h.c.Retry(h.ctx, actor, r.ID, "healed")
-			}
+			_ = h.c.Retry(h.ctx, actor, r.ID, "healed")
 		case Paused:
 			_ = h.c.Promote(h.ctx, actor, r.ID)
 		case WaitingForSync:

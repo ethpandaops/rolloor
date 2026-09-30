@@ -133,20 +133,28 @@ func TestSoakFailureHaltsQuarantinesAndRetries(t *testing.T) {
 	require.Equal(t, before, len(h.world.callsFor("update")))
 	require.Equal(t, Halted, h.active("a").State)
 
-	// A retry with the probe fixed passes the batch and clears the quarantine.
+	// A retry with the probe fixed passes the retried targets and clears the
+	// quarantine.
+	halted := cloneRollout(&r.Rollout)
 	require.Error(t, h.c.Retry(h.ctx, actor, r.ID, ""))
 	require.ErrorIs(t, h.c.Retry(h.ctx, actor, "nope", "x"), ErrNotFound)
 	require.NoError(t, h.c.Retry(h.ctx, actor, r.ID, "probe was wrong"))
 	h.world.set(func(w *world) { w.soakFail[soakA] = false })
-	h.tick()
 
-	// The failed targets are inspected again before anything is claimed, and
-	// the soak that failed stays on the batch's record.
+	for i := 0; i < 4 && h.active("a").State != Soaking; i++ {
+		h.tick()
+	}
+
+	// The failed targets are inspected again in a new retry batch before
+	// anything is claimed; the halted batch keeps its end and failed soak.
 	retried := h.active("a")
 	require.Equal(t, Soaking, retried.State)
 	require.Equal(t, PhaseReady, h.phases(retried)[tA1])
 	require.Equal(t, 2, retried.OnNewBuild)
-	require.Len(t, retried.Batches[0].PriorSoaks, 1)
+	require.Len(t, retried.Batches, 2)
+	require.Equal(t, halted.Batches[0], retried.Batches[0])
+	require.True(t, retried.Batches[1].Retried)
+	require.ElementsMatch(t, halted.Batches[0].Targets, retried.Batches[1].Targets)
 	require.Equal(t, Healthy, h.view(tA1).Health)
 
 	h.ticks(3, 0)
@@ -954,14 +962,18 @@ func TestRetryWaitsForTheBudgetWhenItsQuarantineWasLifted(t *testing.T) {
 	rb := h.active("b")
 	require.Len(t, rb.Batches, 1)
 
-	// Reopening n1/a now would put both nodes down.
+	// Retrying n1/a now would put both nodes down, so the retry waits for the
+	// budget like any batch and the halted batch stays closed.
 	require.NoError(t, h.c.Retry(h.ctx, actor, ra.ID, "fixed"))
 
 	halts := len(slices.DeleteFunc(h.notes.actions(), func(a string) bool { return a != "rollout.halted" }))
+	updates := len(h.world.callsFor("update:" + tN1A))
 
 	h.ticks(2, 0)
-	require.Equal(t, Halted, h.rollout(ra.ID).State)
-	require.Contains(t, h.rollout(ra.ID).Reason, "Retry waiting for the disruption budget")
+	waiting := h.rollout(ra.ID)
+	require.Equal(t, WaitingForBudget, waiting.State)
+	require.Equal(t, ra.Batches, waiting.Batches)
+	require.Len(t, h.world.callsFor("update:"+tN1A), updates)
 	require.Len(t, slices.DeleteFunc(h.notes.actions(), func(a string) bool { return a != "rollout.halted" }), halts,
 		"waiting is not announced as another halt")
 

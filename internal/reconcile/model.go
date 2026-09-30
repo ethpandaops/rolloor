@@ -161,6 +161,9 @@ type RolloutTarget struct {
 	// HoldUntil keeps the node counted against the budget after the rollout
 	// ended while this target's update may still be landing.
 	HoldUntil time.Time `json:"holdUntil,omitzero"`
+	// Retried marks a target a person sent back after a halt; it goes before
+	// untried targets and passes a batch even when already on the build.
+	Retried bool `json:"retried,omitempty"`
 }
 
 // Batch is one step of a rollout.
@@ -172,9 +175,10 @@ type Batch struct {
 	EndedAt   time.Time `json:"endedAt,omitzero"`
 	Passed    bool      `json:"passed"`
 	// Soak is the batch's soak once it has ended; the open batch's lives on
-	// the rollout. PriorSoaks are the attempts a retry replaced.
-	Soak       *SoakProgress   `json:"soak,omitempty"`
-	PriorSoaks []*SoakProgress `json:"priorSoaks,omitempty"`
+	// the rollout.
+	Soak *SoakProgress `json:"soak,omitempty"`
+	// Retried batches take only targets a retry sent back.
+	Retried bool `json:"retried,omitempty"`
 }
 
 // SoakCheck is one run of one soak program.
@@ -223,7 +227,6 @@ type Rollout struct {
 	Force bool `json:"force"`
 
 	PausePending bool `json:"pausePending,omitempty"`
-	RetryPending bool `json:"retryPending,omitempty"`
 
 	Targets []RolloutTarget `json:"targets"`
 	Batches []Batch         `json:"batches"`

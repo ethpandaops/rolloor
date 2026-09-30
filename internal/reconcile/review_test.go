@@ -478,9 +478,11 @@ func TestRetryAndSyncReportStoreAndContextErrors(t *testing.T) {
 
 	h.store.Fail = errFake
 	require.ErrorIs(t, h.c.Retry(h.ctx, actor, r.ID, "again"), errFake)
-	require.False(t, h.rollout(r.ID).RetryPending)
+	require.Equal(t, r.Rollout, h.rollout(r.ID).Rollout, "a refused retry leaves the halted rollout as it was")
 
 	h.store.Fail = nil
+	require.NoError(t, h.c.Retry(h.ctx, actor, r.ID, "store back"))
+	require.Equal(t, Running, h.rollout(r.ID).State)
 
 	// A sync resolves the registry first, so a cancelled context stops it there.
 	cancelled, cancel := context.WithCancel(h.ctx)
