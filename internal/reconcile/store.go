@@ -37,8 +37,8 @@ type Store interface {
 	ClearAborted(ctx context.Context, group string) error
 	SaveHookRun(ctx context.Context, id string, run *HookRun) error
 	DeleteHookRuns(ctx context.Context, id string) error
-	// ReplaceDecisions rewrites rollouts, quarantines, abort markers,
-	// suspensions and desired digests to exactly the snapshot's, in one step.
+	// ReplaceDecisions replays pending decisions and observations, including
+	// deletions, in one step after a store failure.
 	ReplaceDecisions(ctx context.Context, snap *Snapshot) error
 	AppendEvent(ctx context.Context, e *Event) error
 	Events(ctx context.Context, q EventQuery) ([]Event, error)
@@ -135,8 +135,8 @@ func (m *MemoryStore) Load(context.Context) (*Snapshot, error) {
 
 	sort.Slice(s.Suspensions, func(i, j int) bool { return s.Suspensions[i].ID < s.Suspensions[j].ID })
 
-	for k, v := range m.live {
-		s.Live[k] = v
+	for k := range m.live {
+		s.Live[k] = m.live[k]
 	}
 
 	for k, v := range m.degraded {
@@ -381,6 +381,13 @@ func (m *MemoryStore) ReplaceDecisions(_ context.Context, snap *Snapshot) error 
 
 	m.degraded = maps.Clone(snap.Degraded)
 	m.aborted = maps.Clone(snap.Aborted)
+	m.live = maps.Clone(snap.Live)
+	m.hookRuns = make(map[string]map[string]HookRun, len(snap.HookRuns))
+
+	for id, runs := range snap.HookRuns {
+		m.hookRuns[id] = maps.Clone(runs)
+	}
+
 	m.suspensions = map[string]Suspension{}
 
 	for _, sp := range snap.Suspensions {

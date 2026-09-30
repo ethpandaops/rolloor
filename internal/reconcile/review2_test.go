@@ -10,8 +10,6 @@ import (
 	"github.com/ethpandaops/rolloor/internal/targets"
 )
 
-// These tests pin the second review round.
-
 func TestSyncLeavesNothingBehindWhenTheStoreRefuses(t *testing.T) {
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
@@ -117,10 +115,10 @@ func TestBudgetStaysHeldWhileAnEndedRolloutMayStillBeLanding(t *testing.T) {
 	require.Equal(t, []string{tA3el}, rb.Batches[0].Targets)
 
 	// Once the update could no longer be landing, the hold lifts.
-	h.clock.Advance(h.cfg.Hooks.Timeout*5 + time.Second)
+	h.clock.Advance(h.cfg.Strategy.ProgressDeadline + time.Second)
 
 	h.c.mu.Lock()
-	busy := h.c.inFlightNodes(h.clock.Now())
+	busy := h.c.unavailableNodes(h.clock.Now())
 	h.c.mu.Unlock()
 	require.NotContains(t, busy, tA4[:3], "a-4 is no longer held")
 	require.Contains(t, busy, "a-3", "still in group b's open batch")
@@ -240,8 +238,8 @@ func TestSoakEvidenceIsTheCompletedCheck(t *testing.T) {
 }
 
 func TestDegradedNodeCostsNothingForAnotherGroup(t *testing.T) {
-	// a-3 carries a-3/cl (group a) and a-3/el (group b). Quarantine a-3/cl,
-	// then group b's rollout must not pay for a-3 either.
+	// One node carries both groups. Its observed outage is already charged,
+	// so repairing the other group adds no unavailable weight for that node.
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
 	h.world.set(func(w *world) {
@@ -254,13 +252,19 @@ func TestDegradedNodeCostsNothingForAnotherGroup(t *testing.T) {
 	h.tick()
 	h.tick()
 	require.Equal(t, Halted, h.active("a").State)
-	require.Equal(t, Degraded, h.view(tA3).Health)
+	require.NotNil(t, h.view(tA3).Quarantine)
+	h.world.set(func(w *world) { w.notReady[tA3] = true })
+
+	for range h.cfg.ReadinessProbe.FailureThreshold {
+		h.c.ProbeAll(h.ctx)
+	}
 
 	h.release(imgB, d2)
 	rb := h.active("b")
 	require.Equal(t, Running, rb.State)
 	require.Equal(t, []string{tA3el, "b-1/el"}, rb.Batches[0].Targets, "a-3 is free, so both weighted nodes fit")
-	require.Equal(t, "20.0% of 50%", rb.Unavailable)
+	require.True(t, rb.Targets[0].Free)
+	require.Equal(t, "40.0% of 50%", rb.Unavailable)
 }
 
 func TestLateInspectionOfAForgottenTargetIsDropped(t *testing.T) {
@@ -390,8 +394,9 @@ func TestRefreshAskedForDuringAScanIsKept(t *testing.T) {
 }
 
 func TestInterruptedUpdateRunsAgainAfterRestart(t *testing.T) {
-	h := newHarness(t, testConfig, testTargets)
+	h := newHarness(t, replaceLine(testConfig, "retry: {limit: 1}", "retry: {limit: 5}"), testTargets)
 	h.prime()
+	h.world.set(func(w *world) { w.updateStuck[tA1] = true })
 	h.release(imgA, d2)
 
 	id := h.active("a").ID
@@ -404,6 +409,7 @@ func TestInterruptedUpdateRunsAgainAfterRestart(t *testing.T) {
 
 	updates := len(h.world.callsFor("update"))
 	restarted := h.newController()
+	h.world.set(func(w *world) { delete(w.updateStuck, tA1) })
 	require.NoError(t, restarted.Tick(h.ctx))
 
 	calls := h.world.callsFor("update")
@@ -428,8 +434,7 @@ func TestFlushRewritesQuarantineAndAbortMarkers(t *testing.T) {
 	require.Equal(t, Halted, h.active("a").State)
 	require.NoError(t, h.c.Abort(h.ctx, actor, h.active("a").ID))
 
-	// A failing tick marks the state dirty; the recovering tick writes the
-	// quarantine and the abort marker again along with the rollouts.
+	// Recovery must preserve deletions as well as the abort marker.
 	h.store.Fail = errFake
 	h.world.set(func(w *world) { w.registry[imgB] = d2 })
 	h.clock.Advance(h.cfg.Registry.Poll)
@@ -445,6 +450,6 @@ func TestFlushRewritesQuarantineAndAbortMarkers(t *testing.T) {
 
 	snap, err := h.store.Load(h.ctx)
 	require.NoError(t, err)
-	require.Contains(t, snap.Degraded, tA1)
+	require.NotContains(t, snap.Degraded, tA1)
 	require.Contains(t, snap.Aborted, "a")
 }

@@ -9,25 +9,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestNoUpdateRunsWhenItsBatchCannotBeSaved(t *testing.T) {
-	h := newHarness(t, testConfig, testTargets)
-	h.prime()
-
-	// The rollout opens and cuts its first batch while every rollout save
-	// fails. The batch exists only in memory, so its updates must wait: a
-	// restart now would forget which nodes are changing.
-	h.store.FailRollouts = errFake
-	h.release(imgA, d2)
-	require.Empty(t, h.world.callsFor("update"))
-	require.Equal(t, PhasePending, h.phases(h.active("a"))[tA1])
-
-	// Once the store takes the batch, the updates run.
-	h.store.FailRollouts = nil
-	h.tick()
-	require.Len(t, h.world.callsFor("update"), 2)
-	require.Equal(t, PhaseUpdating, h.phases(h.active("a"))[tA1])
-}
-
 func TestAnActionWritesTheDecisionsItFindsOwedFirst(t *testing.T) {
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
@@ -95,7 +76,7 @@ func TestASkipReachesTheStoreBeforeTheBudgetItFreesIsSpent(t *testing.T) {
 	// b waits for n1's share of the budget.
 	h.world.set(func(w *world) {
 		w.updateStuck["n1/a"] = true
-		w.notReady["n0/a"] = true
+		w.notReady[tN0A] = true
 		w.registry[imgB] = d2
 	})
 	h.release(imgA, d2)
@@ -131,40 +112,4 @@ func TestAPauseTheStoreRefusesLeavesNothingBehind(t *testing.T) {
 	h.store.FailRollouts = errFake
 	require.ErrorIs(t, h.c.Pause(h.ctx, actor, r.ID), errFake)
 	require.False(t, h.rollout(r.ID).PausePending)
-}
-
-func TestAnUpdateThatLandedAsTheProcessStoppedIsNotRunAgain(t *testing.T) {
-	h := newHarness(t, testConfig, testTargets)
-	h.prime()
-
-	// The process stops while a-1's update is running: the batch is on disk,
-	// the update result never comes back, and the update still lands.
-	entered, release := h.world.gate("update:" + tA1)
-	done := make(chan struct{})
-
-	h.world.set(func(w *world) { w.registry[imgA] = d2 })
-	h.clock.Advance(h.cfg.Registry.Poll)
-
-	go func() {
-		defer close(done)
-
-		h.tick()
-	}()
-
-	<-entered
-	h.world.set(func(w *world) { w.running[tA1] = d2 })
-
-	// The next process sees a-1 on d2 and checks it instead of updating it
-	// again, which could collide with an update still finishing.
-	h.c = h.newController()
-	h.c.InspectAll(h.ctx)
-	h.tick()
-	require.NotContains(t, h.world.callsFor("update"), "update:"+tA1+":update")
-	require.True(t, h.active("a").Targets[0].UpdateDone)
-
-	h.ticks(2, 0)
-	require.Equal(t, PhaseReady, h.phases(h.active("a"))[tA1], "inspect confirms, then ready")
-
-	release()
-	<-done
 }

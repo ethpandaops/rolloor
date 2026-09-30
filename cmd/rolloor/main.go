@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"syscall"
 	"time"
 
@@ -160,7 +161,7 @@ func newHookCommand(configPath *string) *cobra.Command {
 	)
 
 	cmd := &cobra.Command{
-		Use:   "hook <inspect|update|ready|soak|environment>",
+		Use:   "hook <inspect|update|ready|soak>",
 		Short: "Run one hook against one target with the document the controller would send",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -191,51 +192,46 @@ func runHook(ctx context.Context, out interface{ Write([]byte) (int, error) }, c
 		return err
 	}
 
-	var input any = map[string]string{"environment": cfg.Environment}
+	if !slices.Contains(config.TargetHooks, hook) {
+		return fmt.Errorf("unknown hook %q", hook)
+	}
 
-	if hook != config.HookEnvironment {
-		t, ok := set.Get(targetID)
-		if !ok {
-			return fmt.Errorf("target %q is not in the targets files", targetID)
+	t, ok := set.Get(targetID)
+	if !ok {
+		return fmt.Errorf("target %q is not in the targets files", targetID)
+	}
+
+	in := reconcile.HookInput{Target: t}
+
+	if desired == "" && hook != config.HookSoak && hook != config.HookReady {
+		resolver, rerr := registry.NewResolver(registryOptions(cfg), log)
+		if rerr != nil {
+			return rerr
 		}
 
-		// Target hooks get the same document the controller sends, desired
-		// digest included, so an update program can be tried by hand without
-		// falling back to the tag. Soak gets this target as the whole batch.
-		in := reconcile.HookInput{Target: t}
-
-		if desired == "" && hook != config.HookSoak {
-			resolver, rerr := registry.NewResolver(registryOptions(cfg), log)
-			if rerr != nil {
-				return rerr
-			}
-
-			res, rerr := resolver.Resolve(ctx, t.Image)
-			if rerr != nil {
-				return fmt.Errorf("resolve %s (pass --desired to skip): %w", t.Image, rerr)
-			}
-
-			desired = res.Digest
+		res, rerr := resolver.Resolve(ctx, t.Image)
+		if rerr != nil {
+			return fmt.Errorf("resolve %s (pass --desired to skip): %w", t.Image, rerr)
 		}
 
-		if desired != "" {
-			in.Desired, in.DesiredRef = desired, reconcile.DesiredRef(t.Image, desired)
-		}
+		desired = res.Digest
+	}
 
-		input = in
-		if hook == config.HookSoak {
-			input = map[string]any{"updated": []targets.Target{t}, "remaining": []targets.Target{}, "rollout": map[string]any{"id": "manual", "group": set.Group(&t), "batch": 1, "wave": set.Wave(&t)}}
-		}
+	if desired != "" {
+		in.Desired, in.DesiredRef = desired, reconcile.DesiredRef(t.Image, desired)
+	}
 
-		if program == "" {
-			program = t.Hooks[hook]
-		}
+	var input any = in
+	if hook == config.HookSoak {
+		input = map[string]any{"updated": []targets.Target{t}, "remaining": []targets.Target{}, "rollout": map[string]any{"id": "manual", "group": set.Group(&t), "batch": 1, "wave": set.Wave(&t)}}
+	}
 
-		if program == "" {
-			program = cfg.Hooks.Defaults[hook]
-		}
-	} else if program == "" {
-		program = cfg.Hooks.Environment.Program
+	if program == "" {
+		program = t.Hooks[hook]
+	}
+
+	if program == "" {
+		program = cfg.Hooks.Defaults[hook]
 	}
 
 	if program == "" {
@@ -360,8 +356,11 @@ func serve(ctx context.Context, configPath string) error {
 	log.WithFields(logrus.Fields{"environment": cfg.Environment, "listen": cfg.Listen, "targets": watcher.Current().Len(), "version": version}).Info("rolloor starting")
 
 	g, gctx := errgroup.WithContext(ctx)
+	controller.InspectAll(gctx)
+	controller.ProbeAll(gctx)
 
 	g.Go(func() error { return controller.RunInspector(gctx) })
+	g.Go(func() error { return controller.RunProber(gctx) })
 	g.Go(func() error { return controller.Run(gctx, tickEvery) })
 	g.Go(func() error { return watcher.Run(gctx) })
 

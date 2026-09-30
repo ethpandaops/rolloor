@@ -61,7 +61,7 @@ environment: test
 disruptionBudget: {maxUnavailable: 100%}
 labels: {group: client, owner: owner, section: role, hiddenGroups: [side]}
 hooks: {dir: /tmp, defaults: {soak: ""}}
-strategy: {batchSize: 100%, soak: {duration: 0s}}
+strategy: {batchSize: 100%, retry: {limit: 1}, soak: {duration: 0s}}
 strategies:
   slow: {batchSize: 1, soak: {duration: 1h, interval: 1s, failureLimit: 1}}
 `
@@ -175,6 +175,7 @@ func newFixture(t *testing.T, loginURL func(string) string) *fixture {
 	require.NoError(t, err)
 
 	f.c.InspectAll(f.ctx)
+	f.c.ProbeAll(f.ctx)
 	require.NoError(t, f.c.Tick(f.ctx))
 
 	s, err := New(cfg, f.c, func() *targets.Set { return f.set }, f.auth, loginURL, "test", logrus.New())
@@ -200,6 +201,8 @@ func (f *fixture) release() {
 	f.c.Refresh(f.ctx, "test")
 
 	for range 6 {
+		f.c.InspectAll(f.ctx)
+		f.c.ProbeAll(f.ctx)
 		require.NoError(f.t, f.c.Tick(f.ctx))
 	}
 }

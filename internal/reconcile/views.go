@@ -24,6 +24,8 @@ type TargetView struct {
 	Rollout    string             `json:"rollout,omitempty"`
 	Suspension *Suspension        `json:"suspension,omitempty"`
 	Hooks      map[string]HookRun `json:"hookRuns,omitempty"`
+	Readiness  Readiness          `json:"readiness"`
+	Quarantine *Quarantine        `json:"quarantine,omitempty"`
 }
 
 // GroupView is the roll-up for one group.
@@ -55,8 +57,7 @@ type RolloutView struct {
 	OnNewBuild int    `json:"onNewBuild"`
 	NotReached int    `json:"notReached"`
 	Total      int    `json:"total"`
-	// UnavailableWeight is the weight mid-update now, across every rollout;
-	// MaxUnavailableWeight is what the disruption budget allows.
+	// UnavailableWeight includes observed outages and unverified updates.
 	UnavailableWeight    float64       `json:"unavailableWeight"`
 	MaxUnavailableWeight float64       `json:"maxUnavailableWeight"`
 	Unavailable          string        `json:"unavailable"`
@@ -70,13 +71,11 @@ type FleetView struct {
 	Targets     int         `json:"targets"`
 	Nodes       int         `json:"nodes"`
 	Weight      float64     `json:"weight"`
-	// MaxUnavailable is the disruption budget as configured; Unavailable
-	// is the share of weight mid-update now.
+	// Unavailable is the share of weight unavailable from observation or updates.
 	MaxUnavailable string            `json:"maxUnavailable"`
 	Unavailable    string            `json:"unavailable"`
-	EnvOK          bool              `json:"environmentOk"`
-	EnvReason      string            `json:"environmentReason"`
-	EnvCheck       string            `json:"environmentCheck,omitempty"`
+	Sync           SyncState         `json:"sync"`
+	Health         Health            `json:"health"`
 	Resolve        map[string]string `json:"registryErrors,omitempty"`
 	At             time.Time         `json:"at"`
 }
@@ -128,7 +127,7 @@ func (c *Controller) Target(id string) (TargetView, bool) {
 
 func (c *Controller) viewLocked(set *targets.Set, t *targets.Target) TargetView {
 	group := set.Group(t)
-	v := TargetView{Target: *t, Group: group, Owner: set.Owner(t), Wave: set.Wave(t), Health: Healthy, Hooks: c.hookRunsFor(t.ID)}
+	v := TargetView{Target: *t, Group: group, Owner: set.Owner(t), Wave: set.Wave(t), Health: Healthy, Hooks: c.hookRunsFor(t.ID), Readiness: c.live[t.ID].Readiness}
 
 	if d, ok := c.desiredFor(group, t); ok {
 		v.Desired, v.Revision = d.Digest, d.Revision
@@ -160,46 +159,61 @@ func (c *Controller) viewLocked(set *targets.Set, t *targets.Target) TargetView 
 		v.Reason = "on " + shortDigest(live) + ", desired " + shortDigest(v.Desired)
 	}
 
-	if s := c.suspensionFor(t); s != nil {
-		v.Health, v.Suspension = Suspended, s
-		v.Reason = "suspended by " + s.Actor + " until " + s.ExpiresAt.UTC().Format("Mon 15:04") + ": " + s.Reason
-	}
+	v.Quarantine = c.quarantineFor(t.ID)
 
-	if reason, ok := c.degraded[t.ID]; ok && v.Health != Suspended {
-		v.Health, v.Reason = Degraded, reason
-	}
+	progressing := false
 
 	if r := c.activeRollout(group); r != nil {
 		if rt := r.target(t.ID); rt != nil {
 			v.Rollout = r.ID
+			progressing = r.CurrentBatch() != nil && rt.Batch == r.CurrentBatch().Number && (rt.Phase == PhasePending || rt.Phase == PhaseUpdating) && !c.readyOnBuild(rt)
 
-			switch rt.Phase {
-			case PhasePending:
-				if v.Health == Healthy {
-					v.Reason = "not reached yet"
-				}
-			case PhaseUpdating, PhaseReady:
-				if v.Health != Suspended {
-					v.Health, v.Reason = Progressing, rt.Reason
-				}
-
-				if rt.Phase == PhaseReady && r.State == Soaking {
-					v.Reason = "in soak for batch " + itoa(rt.Batch)
-				}
-			case PhasePassed:
-				if v.Health == Healthy {
-					v.Reason = "updated in batch " + itoa(rt.Batch)
-				}
-			case PhaseFailed:
-				if v.Health != Suspended {
-					v.Health, v.Reason = Degraded, rt.Reason
-				}
-			case PhaseSkipped:
+			if progressing {
+				v.Reason = rt.Reason
 			}
 		}
 	}
 
+	switch {
+	case c.suspensionFor(t) != nil:
+		s := c.suspensionFor(t)
+		v.Health, v.Suspension = Suspended, s
+		v.Reason = "suspended by " + s.Actor + " until " + s.ExpiresAt.UTC().Format("Mon 15:04") + ": " + s.Reason
+	case progressing:
+		v.Health = Progressing
+	case !v.Readiness.ProbedAt.IsZero() && !v.Readiness.Ready:
+		v.Health, v.Reason = Degraded, v.Readiness.Reason
+	case !known || c.live[t.ID].Failures > 0 || v.Readiness.ProbedAt.IsZero():
+		v.Health = HealthUnknown
+		if c.live[t.ID].Failures > 0 {
+			v.Reason = c.live[t.ID].Reason
+		} else if known {
+			v.Reason = "readiness not observed yet"
+		}
+	default:
+		v.Health = Healthy
+	}
+
 	return v
+}
+
+func (c *Controller) quarantineFor(id string) *Quarantine {
+	reason, held := c.degraded[id]
+	if !held {
+		return nil
+	}
+
+	q := &Quarantine{Reason: reason}
+
+	var latest *Rollout
+	for _, r := range c.rollouts {
+		if rt := r.target(id); rt != nil && (rt.Batch > 0 || rt.Retried) && rt.Phase != PhasePassed && (latest == nil || r.CreatedAt.After(latest.CreatedAt) || (r.CreatedAt.Equal(latest.CreatedAt) && r.ID > latest.ID)) {
+			latest = r
+			q.Rollout = r.ID
+		}
+	}
+
+	return q
 }
 
 // Group returns one group's roll-up and its targets.
@@ -284,17 +298,17 @@ func (c *Controller) groupLocked(set *targets.Set, name string, views []TargetVi
 }
 
 func groupReason(g *GroupView, views []TargetView) string {
+	for i := range views {
+		if views[i].Health == Degraded || views[i].Health == HealthUnknown {
+			return views[i].Reason
+		}
+	}
+
 	switch {
 	case g.Sync == Synced && len(g.Desired) > 0:
 		return "On " + shortDigest(firstValue(g.Desired))
 	case g.Sync == Unknown:
 		return itoa(g.Targets-g.OnDesired) + " targets unreachable or unresolved"
-	}
-
-	for i := range views {
-		if views[i].Health == Degraded {
-			return views[i].Reason
-		}
 	}
 
 	return itoa(g.Targets-g.OnDesired) + " of " + itoa(g.Targets) + " not on " + shortDigest(firstValue(g.Desired))
@@ -309,8 +323,8 @@ func (c *Controller) Fleet() FleetView {
 	defer c.mu.RUnlock()
 
 	f := FleetView{Environment: c.cfg.Environment, Targets: set.Len(), Nodes: len(set.Nodes()), Weight: set.TotalWeight(),
-		MaxUnavailable: c.cfg.DisruptionBudget.MaxUnavailable.String(), EnvOK: c.envOK, EnvReason: c.envReason, EnvCheck: c.cfg.Hooks.Environment.Program, At: now}
-	f.Unavailable = pct(c.inFlightWeight(set), set.TotalWeight())
+		MaxUnavailable: c.cfg.DisruptionBudget.MaxUnavailable.String(), Sync: Synced, Health: Healthy, At: now}
+	f.Unavailable = pct(c.unavailableWeight(set), set.TotalWeight())
 
 	if len(c.resolveErrors) > 0 {
 		f.Resolve = map[string]string{}
@@ -328,6 +342,8 @@ func (c *Controller) Fleet() FleetView {
 		}
 
 		f.Groups = append(f.Groups, c.groupLocked(set, name, views))
+		f.Sync = worseSync(f.Sync, f.Groups[len(f.Groups)-1].Sync)
+		f.Health = worseHealth(f.Health, f.Groups[len(f.Groups)-1].Health)
 	}
 
 	return f
@@ -430,7 +446,7 @@ func (c *Controller) rolloutViewLocked(set *targets.Set, r *Rollout) RolloutView
 	}
 
 	v.MaxUnavailableWeight = c.cfg.DisruptionBudget.MaxUnavailable.OfWeight(set.TotalWeight())
-	v.UnavailableWeight = c.inFlightWeight(set)
+	v.UnavailableWeight = c.unavailableWeight(set)
 	v.Unavailable = pct(v.UnavailableWeight, set.TotalWeight()) + " of " + c.cfg.DisruptionBudget.MaxUnavailable.String()
 
 	end := r.EndedAt
@@ -441,14 +457,6 @@ func (c *Controller) rolloutViewLocked(set *targets.Set, r *Rollout) RolloutView
 	v.Running = end.Sub(r.CreatedAt)
 
 	return v
-}
-
-// EnvironmentStatus reports the last environment check.
-func (c *Controller) EnvironmentStatus() (ok bool, reason string, checkedAt time.Time) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	return c.envOK, c.envReason, c.envCheckedAt
 }
 
 // Suspensions lists active suspensions sorted by id.
@@ -476,12 +484,26 @@ func worseSync(a, b SyncState) SyncState {
 }
 
 func worseHealth(a, b Health) Health {
-	rank := map[Health]int{Healthy: 0, Suspended: 1, Progressing: 2, Degraded: 3}
-	if rank[b] > rank[a] {
+	if healthRank(b) > healthRank(a) {
 		return b
 	}
 
 	return a
+}
+
+func healthRank(h Health) uint8 {
+	switch h {
+	case Healthy:
+		return 0
+	case Suspended:
+		return 1
+	case Progressing:
+		return 2
+	case Degraded:
+		return 3
+	default:
+		return 4
+	}
 }
 
 func firstValue(m map[string]string) string {

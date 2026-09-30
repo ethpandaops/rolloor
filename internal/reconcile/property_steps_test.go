@@ -195,7 +195,7 @@ func (s *sim) pick(states ...RolloutState) (RolloutView, bool) {
 	return found[s.rng.IntN(len(found))], true
 }
 
-var activeStates = []RolloutState{WaitingForSync, Running, Soaking, Paused, WaitingForBudget, WaitingForEnvironment, Halted}
+var activeStates = []RolloutState{WaitingForSync, Running, Soaking, Paused, WaitingForBudget, Halted}
 
 func (s *sim) retry() string {
 	if s.down {
@@ -335,8 +335,6 @@ func (s *sim) edit() string {
 	if what == "" {
 		return "edit: nothing"
 	}
-
-	s.edited = true
 
 	old := s.h.current()
 

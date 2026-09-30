@@ -3,6 +3,7 @@ package reconcile
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 
@@ -27,37 +28,28 @@ func (c *Controller) supersedeChangedRollouts(ctx context.Context, now time.Time
 			continue
 		}
 
-		for img, want := range r.Desired {
-			cur, ok := c.desiredForImage(r.Group, img, set)
-			if ok && cur != want {
-				c.finish(ctx, now, r, Superseded, fmt.Sprintf("%s moved to %s", img, shortDigest(cur)))
-
-				break
-			}
+		if r.GroupDesiredKey != c.groupDesiredKey(r.Group, set) {
+			c.finish(ctx, now, r, Superseded, "group desired images changed")
 		}
 	}
-}
-
-// desiredForImage is the current desired digest for an image within a group,
-// honouring pins.
-func (c *Controller) desiredForImage(group, image string, set *targets.Set) (string, bool) {
-	for i := range set.Targets {
-		t := &set.Targets[i]
-		if set.Group(t) == group && t.Image == image {
-			d, ok := c.desiredFor(group, t)
-
-			return d.Digest, ok
-		}
-	}
-
-	return "", false
 }
 
 // finish moves a rollout to a terminal state and records it.
 func (c *Controller) finish(ctx context.Context, now time.Time, r *Rollout, state RolloutState, reason string) {
 	c.end(now, r, state, reason)
 	_ = c.saveRollout(ctx, r)
+	c.clearRolloutQuarantine(ctx, r)
 	c.event(ctx, now, &Event{Actor: ControllerActor, Action: "rollout." + lower(state), Group: r.Group, Rollout: r.ID, Reason: reason})
+}
+
+func (c *Controller) clearRolloutQuarantine(ctx context.Context, r *Rollout) {
+	for i := range r.Targets {
+		rt := &r.Targets[i]
+		if q := c.quarantineFor(rt.ID); q != nil && q.Rollout == r.ID {
+			delete(c.degraded, rt.ID)
+			_ = c.persist(ctx, c.store.ClearDegraded(ctx, rt.ID))
+		}
+	}
 }
 
 // end is the in-memory part of finishing. A target whose update was
@@ -75,18 +67,13 @@ func (c *Controller) end(now time.Time, r *Rollout, state RolloutState, reason s
 			continue
 		}
 
-		if rt.Phase == PhaseUpdating && !rt.Updated {
-			rt.HoldUntil = now.Add(c.updateDeadline())
+		if !c.readyOnBuild(rt) {
+			rt.HoldUntil = now.Add(c.strategy(r.Strategy).ProgressDeadline)
 		}
 
 		rt.Phase = PhaseSkipped
 		rt.Reason = string(state)
 	}
-}
-
-// updateDeadline is how long an update may take to show its digest.
-func (c *Controller) updateDeadline() time.Duration {
-	return c.cfg.Hooks.Timeout * 5
 }
 
 // openRollouts creates a rollout for every group with out-of-sync targets and
@@ -149,10 +136,7 @@ func (c *Controller) groupDesiredKey(group string, set *targets.Set) string {
 	return desiredKey(desired)
 }
 
-// outOfSync lists the group's targets that should move: desired and live both
-// known and not suspended, and either different or the target quarantined. A
-// quarantined target is not in sync until a batch has verified it, even when
-// it already runs the desired digest.
+// outOfSync lists targets with observed digest drift, excluding suspensions.
 func (c *Controller) outOfSync(group string, set *targets.Set) (eligible []*targets.Target, desired, from map[string]string) {
 	desired = map[string]string{}
 	fromCount := map[string]map[string]int{}
@@ -169,9 +153,8 @@ func (c *Controller) outOfSync(group string, set *targets.Set) (eligible []*targ
 		}
 
 		live, known := c.liveKnown(t.ID)
-		_, quarantined := c.degraded[t.ID]
 
-		if !known || (live == d.Digest && !quarantined) || c.suspensionFor(t) != nil {
+		if !known || live == d.Digest || c.suspensionFor(t) != nil {
 			continue
 		}
 
@@ -202,20 +185,20 @@ func (c *Controller) outOfSync(group string, set *targets.Set) (eligible []*targ
 	return eligible, desired, from
 }
 
-// newRollout builds a rollout with its targets in update order: already
-// degraded first, then by wave, then node, then id.
+// newRollout sorts targets not ready at creation first, then wave, node and id.
 func (c *Controller) newRollout(now time.Time, group string, policy Policy, eligible []*targets.Target, desired, from map[string]string, set *targets.Set) *Rollout {
 	r := &Rollout{
-		ID:        c.newID(),
-		Group:     group,
-		Strategy:  policy.Strategy,
-		Desired:   desired,
-		Revisions: map[string]string{},
-		From:      from,
-		State:     Running,
-		Reason:    "Starting",
-		CreatedAt: now,
-		UpdatedAt: now,
+		ID:              c.newID(),
+		Group:           group,
+		Strategy:        policy.Strategy,
+		Desired:         desired,
+		GroupDesiredKey: c.groupDesiredKey(group, set),
+		Revisions:       map[string]string{},
+		From:            from,
+		State:           Running,
+		Reason:          "Starting",
+		CreatedAt:       now,
+		UpdatedAt:       now,
 	}
 
 	for img := range desired {
@@ -232,17 +215,15 @@ func (c *Controller) newRollout(now time.Time, group string, policy Policy, elig
 			wave = 0
 		}
 
-		_, degraded := c.degraded[t.ID]
-
 		r.Targets = append(r.Targets, RolloutTarget{
-			ID: t.ID, Node: t.Node, Wave: wave, Phase: PhasePending, DegradedBefore: degraded,
+			ID: t.ID, Node: t.Node, Wave: wave, Phase: PhasePending, NotReadyBefore: !c.targetReady(t.ID),
 		})
 	}
 
 	sort.SliceStable(r.Targets, func(i, j int) bool {
 		a, b := r.Targets[i], r.Targets[j]
-		if a.DegradedBefore != b.DegradedBefore {
-			return a.DegradedBefore
+		if a.NotReadyBefore != b.NotReadyBefore {
+			return a.NotReadyBefore
 		}
 
 		if a.Wave != b.Wave {
@@ -259,33 +240,37 @@ func (c *Controller) newRollout(now time.Time, group string, policy Policy, elig
 	return r
 }
 
-// inFlightNodes lists every node with a target mid-update across all
-// rollouts, plus nodes a finished rollout may still be changing. A target
-// admitted while its node was already degraded does not count, even once
-// that node's quarantine is lifted: the budget was never charged for it.
-func (c *Controller) inFlightNodes(now time.Time) map[string]struct{} {
+// unavailableNodes includes observed outages, admitted updates awaiting readiness,
+// and updates that may still land after their operation stopped.
+func (c *Controller) unavailableNodes(now time.Time) map[string]struct{} {
 	nodes := map[string]struct{}{}
+	set := c.targets()
+
+	for _, t := range set.Targets {
+		if !c.targetReady(t.ID) {
+			nodes[t.Node] = struct{}{}
+		}
+	}
 
 	for _, r := range c.rollouts {
-		if !r.State.Active() {
-			for i := range r.Targets {
-				rt := &r.Targets[i]
-				if now.Before(rt.HoldUntil) && !rt.Free {
-					nodes[rt.Node] = struct{}{}
-				}
-			}
+		for i := range r.Targets {
+			rt := &r.Targets[i]
+			_, present := set.Get(rt.ID)
+			forced := present && r.Force && rt.Updated && (rt.Phase == PhaseReady || rt.Phase == PhasePassed) && !c.readyOnBuild(rt)
 
-			continue
+			if (now.Before(rt.HoldUntil) || forced) && !c.heldReady(r, rt) {
+				nodes[rt.Node] = struct{}{}
+			}
 		}
 
 		b := r.CurrentBatch()
-		if b == nil {
+		if !r.State.Active() || b == nil {
 			continue
 		}
 
 		for _, id := range b.Targets {
 			rt := r.target(id)
-			if rt != nil && rt.Phase != PhaseSkipped && !rt.Free {
+			if (rt.Phase == PhasePending || rt.Phase == PhaseUpdating || rt.Phase == PhaseReady) && !c.readyOnBuild(rt) {
 				nodes[rt.Node] = struct{}{}
 			}
 		}
@@ -294,23 +279,10 @@ func (c *Controller) inFlightNodes(now time.Time) map[string]struct{} {
 	return nodes
 }
 
-// nodeDegraded reports whether a node is already disrupted: a target on it
-// is quarantined. Such a node costs nothing against the budget, whichever
-// group is moving it.
-func (c *Controller) nodeDegraded(set *targets.Set, node string) bool {
-	for _, t := range set.Node(node) {
-		if _, degraded := c.degraded[t.ID]; degraded {
-			return true
-		}
-	}
-
-	return false
-}
-
-// inFlightWeight is the weight of the in-flight nodes.
-func (c *Controller) inFlightWeight(set *targets.Set) float64 {
+// unavailableWeight counts each unavailable node's weight once.
+func (c *Controller) unavailableWeight(set *targets.Set) float64 {
 	var w float64
-	for n := range c.inFlightNodes(c.clock.Now()) {
+	for n := range c.unavailableNodes(c.clock.Now()) {
 		w += set.NodeWeight(n)
 	}
 
@@ -327,37 +299,39 @@ func (c *Controller) startBatch(ctx context.Context, now time.Time, r *Rollout, 
 		return
 	}
 
-	if !c.envOK && !r.Human {
-		c.setState(ctx, now, r, WaitingForEnvironment, "Environment check failing: "+c.envReason+". Automated rollouts are paused; a person may still sync.")
+	st := c.strategy(r.Strategy)
+	retry := slices.ContainsFunc(remaining, func(rt *RolloutTarget) bool { return rt.Retried })
 
-		return
+	// Batch sizes count nodes: a batch takes every target the group has on
+	// each node it picks. Retried targets go first and alone, as many as the
+	// budget admits.
+	size := len(remaining)
+	if !retry {
+		size = st.BatchFor(len(r.Batches)+1, len(rolloutNodes(r)))
 	}
 
-	st := c.strategy(r.Strategy)
-	wave := remaining[0].Wave
-
-	// A wave is a contiguous run of the sorted order; degraded targets sort
-	// first and may carry a later wave number, which must not pull the rest
-	// of that wave ahead of the ones between.
+	// Readiness priority may place a later wave first; waves remain contiguous
+	// in that sorted order. A retry is bounded by the budget alone.
 	var candidates []*RolloutTarget
 
 	for _, rt := range remaining {
-		if rt.Wave != wave && st.UsesWaves() {
+		if rt.Retried != retry {
+			continue
+		}
+
+		if !retry && len(candidates) > 0 && rt.Wave != candidates[0].Wave && st.UsesWaves() {
 			break
 		}
 
 		candidates = append(candidates, rt)
 	}
 
-	// Batch sizes count nodes: a batch takes every target the group has on
-	// each node it picks.
-	size := st.BatchFor(len(r.Batches)+1, len(rolloutNodes(r)))
+	wave := candidates[0].Wave
 	budget := c.cfg.DisruptionBudget.MaxUnavailable.OfWeight(set.TotalWeight())
-	busy := c.inFlightNodes(now)
-	inflight := c.inFlightWeight(set)
+	busy := c.unavailableNodes(now)
+	inflight := c.unavailableWeight(set)
 
-	// nodes maps each picked node to whether it was already degraded, which
-	// makes it free for as long as this batch's updates are in flight.
+	// Each admission records whether it added an unavailable node.
 	var (
 		picked []*RolloutTarget
 		nodes  = map[string]bool{}
@@ -370,17 +344,17 @@ func (c *Controller) startBatch(ctx context.Context, now time.Time, r *Rollout, 
 				continue
 			}
 
-			free := c.nodeDegraded(set, rt.Node)
-
+			_, free := busy[rt.Node]
 			w := set.NodeWeight(rt.Node)
-			if _, already := busy[rt.Node]; already || free {
+
+			if free {
 				w = 0
 			}
 
 			// As maxUnavailable rounds up to one pod on a DaemonSet, a budget
 			// above zero lets one node go when nothing else is unavailable,
 			// however heavy; otherwise such a node could never be updated.
-			alone := budget > 0 && inflight+cost == 0
+			alone := budget > 0 && inflight == 0 && cost == 0
 			if inflight+cost+w > budget && w > 0 && !alone {
 				continue
 			}
@@ -392,29 +366,34 @@ func (c *Controller) startBatch(ctx context.Context, now time.Time, r *Rollout, 
 		picked = append(picked, rt)
 	}
 
+	kind := ""
+	if retry {
+		kind = "retry "
+	}
+
 	if len(picked) == 0 {
 		need := set.NodeWeight(candidates[0].Node)
-		c.setState(ctx, now, r, WaitingForBudget, fmt.Sprintf("Waiting for the disruption budget: %s of %s unavailable; the next batch needs %s.",
-			pct(inflight, set.TotalWeight()), c.cfg.DisruptionBudget.MaxUnavailable.String(), pct(need, set.TotalWeight())))
+		c.setState(ctx, now, r, WaitingForBudget, fmt.Sprintf("Waiting for the disruption budget: %s of %s unavailable; the next %sbatch needs %s.",
+			pct(inflight, set.TotalWeight()), c.cfg.DisruptionBudget.MaxUnavailable.String(), kind, pct(need, set.TotalWeight())))
 
 		return
 	}
 
-	b := Batch{Number: len(r.Batches) + 1, Wave: wave, StartedAt: now}
+	b := Batch{Number: len(r.Batches) + 1, Wave: wave, StartedAt: now, Retried: retry}
 	for _, rt := range picked {
 		rt.Batch, rt.Free = b.Number, nodes[rt.Node]
 		b.Targets = append(b.Targets, rt.ID)
 	}
 
 	r.Batches = append(r.Batches, b)
-	c.setState(ctx, now, r, Running, fmt.Sprintf("Wave %d, batch %d of about %d: updating %d targets on %d nodes.", wave, b.Number, c.estimateBatches(r, &st), len(picked), len(nodes)))
+	c.setState(ctx, now, r, Running, fmt.Sprintf("Wave %d, %sbatch %d of about %d: updating %d targets on %d nodes.", wave, kind, b.Number, c.estimateBatches(r, &st), len(picked), len(nodes)))
 	c.event(ctx, now, &Event{Actor: ControllerActor, Action: "batch.started", Group: r.Group, Rollout: r.ID,
-		Reason: fmt.Sprintf("batch %d: %d targets on %d nodes in wave %d", b.Number, len(picked), len(nodes), wave)})
+		Reason: fmt.Sprintf("%sbatch %d: %d targets on %d nodes in wave %d", kind, b.Number, len(picked), len(nodes), wave)})
 }
 
-// remaining lists targets not yet batched, skipping ones that have since been
-// suspended or lost, in update order. A target already on the new build
-// passes without a batch unless it is quarantined.
+// remaining lists unbatched eligible targets in update order. Observed digest
+// convergence needs no operation, regardless of any earlier quarantine, unless
+// a retry sent the target back to prove itself in a batch.
 func (c *Controller) remaining(r *Rollout, set *targets.Set, now time.Time) []*RolloutTarget {
 	var out []*RolloutTarget
 
@@ -431,14 +410,14 @@ func (c *Controller) remaining(r *Rollout, set *targets.Set, now time.Time) []*R
 			continue
 		}
 
-		if _, known := c.liveKnown(rt.ID); !known {
+		live, known := c.liveKnown(rt.ID)
+		if !known && !rt.Retried {
 			rt.Phase, rt.Reason = PhaseSkipped, "unreachable"
 
 			continue
 		}
 
-		_, quarantined := c.degraded[rt.ID]
-		if live, _ := c.liveKnown(rt.ID); live == r.Desired[t.Image] && !quarantined {
+		if live == r.Desired[t.Image] && !rt.Retried {
 			rt.Phase, rt.Reason, rt.UpdatedAt = PhasePassed, "already on the new build", now
 
 			continue

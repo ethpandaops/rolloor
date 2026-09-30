@@ -28,8 +28,6 @@ type Collector struct {
 	targetHealth *prometheus.Desc
 	rolloutState *prometheus.Desc
 	budgetRatio  *prometheus.Desc
-	envPassing   *prometheus.Desc
-	envCheckedAt *prometheus.Desc
 	lastTick     *prometheus.Desc
 }
 
@@ -41,18 +39,16 @@ func NewCollector(c *reconcile.Controller) *Collector {
 		c:            c,
 		targetInfo:   prometheus.NewDesc(namespace+"_target_info", "One series per target with its current digests.", []string{labelID, "node", labelGroup, "owner", "image", "desired", "live"}, nil),
 		targetSync:   prometheus.NewDesc(namespace+"_target_sync", "0 synced, 1 out of sync, 2 unknown.", []string{labelID, labelGroup}, nil),
-		targetHealth: prometheus.NewDesc(namespace+"_target_health", "0 healthy, 1 progressing, 2 degraded, 3 suspended.", []string{labelID, labelGroup}, nil),
+		targetHealth: prometheus.NewDesc(namespace+"_target_health", "0 healthy, 1 progressing, 2 degraded, 3 suspended, 4 unknown.", []string{labelID, labelGroup}, nil),
 		rolloutState: prometheus.NewDesc(namespace+"_rollout_state", "1 for the state a rollout is in.", []string{"rollout", labelGroup, "state"}, nil),
-		budgetRatio:  prometheus.NewDesc(namespace+"_disruption_budget_ratio", "Weight mid-update over what the disruption budget allows.", nil, nil),
-		envPassing:   prometheus.NewDesc(namespace+"_environment_check_passing", "1 when the environment check passes.", nil, nil),
-		envCheckedAt: prometheus.NewDesc(namespace+"_environment_checked_at_seconds", "When the environment check last ran.", nil, nil),
+		budgetRatio:  prometheus.NewDesc(namespace+"_disruption_budget_ratio", "Unavailable weight over what the disruption budget allows.", nil, nil),
 		lastTick:     prometheus.NewDesc(namespace+"_last_tick_timestamp_seconds", "When the reconcile loop last completed a pass.", nil, nil),
 	}
 }
 
 // Describe sends every descriptor.
 func (m *Collector) Describe(ch chan<- *prometheus.Desc) {
-	for _, d := range []*prometheus.Desc{m.targetInfo, m.targetSync, m.targetHealth, m.rolloutState, m.budgetRatio, m.envPassing, m.envCheckedAt, m.lastTick} {
+	for _, d := range []*prometheus.Desc{m.targetInfo, m.targetSync, m.targetHealth, m.rolloutState, m.budgetRatio, m.lastTick} {
 		ch <- d
 	}
 }
@@ -90,15 +86,7 @@ func (m *Collector) Collect(ch chan<- prometheus.Metric) {
 
 	ch <- prometheus.MustNewConstMetric(m.budgetRatio, prometheus.GaugeValue, ratio)
 
-	ok, _, at := m.c.EnvironmentStatus()
-
-	for _, metric := range []prometheus.Metric{
-		prometheus.MustNewConstMetric(m.envPassing, prometheus.GaugeValue, boolValue(ok)),
-		prometheus.MustNewConstMetric(m.envCheckedAt, prometheus.GaugeValue, float64(at.Unix())),
-		prometheus.MustNewConstMetric(m.lastTick, prometheus.GaugeValue, float64(m.c.LastTick().Unix())),
-	} {
-		ch <- metric
-	}
+	ch <- prometheus.MustNewConstMetric(m.lastTick, prometheus.GaugeValue, float64(m.c.LastTick().Unix()))
 }
 
 func syncValue(s reconcile.SyncState) float64 {
@@ -124,17 +112,9 @@ func healthValue(h reconcile.Health) float64 {
 		return 2
 	case reconcile.Suspended:
 		return 3
+	default:
+		return 4
 	}
-
-	return 0
-}
-
-func boolValue(b bool) float64 {
-	if b {
-		return 1
-	}
-
-	return 0
 }
 
 // HookRunner wraps a runner and records how each hook does.

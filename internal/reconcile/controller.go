@@ -79,10 +79,6 @@ type Controller struct {
 	aborted     map[string]string
 	hookRuns    map[string]map[string]HookRun
 
-	envOK        bool
-	envReason    string
-	envCheckedAt time.Time
-
 	lastResolve   time.Time
 	lastTick      time.Time
 	refreshWanted bool
@@ -92,6 +88,7 @@ type Controller struct {
 	// resolveMu serializes registry scans so an older scan cannot publish
 	// over a newer one.
 	resolveMu     sync.Mutex
+	probeMu       sync.Mutex
 	resolveErrors map[string]string
 	targetsError  string
 	nextEventID   int64
@@ -124,7 +121,6 @@ func New(ctx context.Context, opts *Options) (*Controller, error) {
 		aborted:       map[string]string{},
 		hookRuns:      map[string]map[string]HookRun{},
 		resolveErrors: map[string]string{},
-		envOK:         true,
 		nudge:         make(chan struct{}, 1),
 	}
 
@@ -153,6 +149,22 @@ func New(ctx context.Context, opts *Options) (*Controller, error) {
 
 	c.restore(snap)
 
+	var removed []string
+
+	for id := range c.live {
+		if _, present := c.targets().Get(id); !present {
+			removed = append(removed, id)
+		}
+	}
+
+	c.Forget(ctx, removed)
+
+	for _, r := range c.rollouts {
+		if !r.State.Active() {
+			c.clearRolloutQuarantine(ctx, r)
+		}
+	}
+
 	return c, nil
 }
 
@@ -169,8 +181,8 @@ func (c *Controller) restore(snap *Snapshot) {
 		c.suspensions[s.ID] = s
 	}
 
-	for id, l := range snap.Live {
-		c.live[id] = l
+	for id := range snap.Live {
+		c.live[id] = snap.Live[id]
 	}
 
 	for id, reason := range snap.Degraded {
@@ -201,7 +213,7 @@ func (c *Controller) restore(snap *Snapshot) {
 	for _, r := range c.rollouts {
 		for i := range r.Targets {
 			rt := &r.Targets[i]
-			if rt.Phase == PhaseUpdating && !rt.UpdateDone {
+			if rt.Phase == PhaseUpdating && !rt.UpdateDone && rt.RetryAt.IsZero() {
 				rt.Phase, rt.Reason = PhasePending, "update interrupted by a restart; running again"
 			}
 		}
@@ -245,17 +257,12 @@ func (c *Controller) Nudge() {
 	}
 }
 
-// Tick advances everything as far as the present moment allows: resolve tags
-// if due, run the environment check if due, expire suspensions, open rollouts
-// for groups that need one, and move every active rollout one step.
+// Tick resolves tags, expires suspensions, opens rollouts and advances active
+// operations from their observations.
 func (c *Controller) Tick(ctx context.Context) error {
 	now := c.clock.Now()
 
 	if err := c.resolveIfDue(ctx, now); err != nil {
-		return err
-	}
-
-	if err := c.checkEnvironmentIfDue(ctx, now); err != nil {
 		return err
 	}
 
@@ -282,11 +289,14 @@ func (c *Controller) Tick(ctx context.Context) error {
 	c.mu.Unlock()
 
 	results := c.execute(ctx, jobs)
+	now = c.clock.Now()
 
 	c.mu.Lock()
 	c.applyResults(ctx, now, results)
 	c.lastTick = now
 	c.mu.Unlock()
+
+	c.observeBatch(ctx)
 
 	return ctx.Err()
 }
@@ -412,49 +422,6 @@ func (c *Controller) ReportTargetsError(ctx context.Context, err error) {
 	c.event(ctx, now, &Event{Actor: ControllerActor, Action: "targets.invalid", Reason: msg})
 }
 
-// checkEnvironmentIfDue runs the environment hook on its interval.
-func (c *Controller) checkEnvironmentIfDue(ctx context.Context, now time.Time) error {
-	prog := c.cfg.Hooks.Environment.Program
-	if prog == "" {
-		return nil
-	}
-
-	c.mu.Lock()
-	due := c.envCheckedAt.IsZero() || now.Sub(c.envCheckedAt) >= c.cfg.Hooks.Environment.Interval
-	c.mu.Unlock()
-
-	if !due {
-		return nil
-	}
-
-	res, err := c.runner.Run(ctx, prog, config.HookEnvironment, "", map[string]string{"environment": c.cfg.Environment})
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.envCheckedAt = now
-
-	ok := err == nil && res.OK
-	reason := res.Reason
-
-	if err != nil {
-		reason = err.Error()
-	}
-
-	if ok != c.envOK {
-		action := "environment.passing"
-		if !ok {
-			action = "environment.failing"
-		}
-
-		c.event(ctx, now, &Event{Actor: ControllerActor, Action: action, Reason: reason})
-	}
-
-	c.envOK, c.envReason = ok, reason
-
-	return ctx.Err()
-}
-
 func (c *Controller) expireSuspensions(ctx context.Context, now time.Time) {
 	for id, s := range c.suspensions {
 		if !now.Before(s.ExpiresAt) {
@@ -530,7 +497,7 @@ func (c *Controller) writeOwed(ctx context.Context) error {
 // quarantine or abort marker must not come back after a restart, so the
 // tables are replaced whole.
 func (c *Controller) decisions() *Snapshot {
-	snap := &Snapshot{Degraded: c.degraded, Aborted: c.aborted, Desired: c.desired}
+	snap := &Snapshot{Degraded: c.degraded, Aborted: c.aborted, Desired: c.desired, Live: c.live, HookRuns: c.hookRuns}
 
 	for _, r := range c.rollouts {
 		snap.Rollouts = append(snap.Rollouts, r)
@@ -588,7 +555,12 @@ func (c *Controller) setLiveLocked(ctx context.Context, now, observedAt time.Tim
 	}
 
 	if ok {
-		l = Live{Digest: digest, SeenAt: now}
+		since := l.DigestSince
+		if l.Digest != digest || since.IsZero() {
+			since = now
+		}
+
+		l = Live{Digest: digest, SeenAt: now, DigestSince: since, Readiness: l.Readiness}
 	} else {
 		l.Failures++
 		l.Reason = reason
@@ -603,47 +575,101 @@ func (c *Controller) setLiveLocked(ctx context.Context, now, observedAt time.Tim
 
 // InspectAll runs the inspect hook for every target and records the result.
 func (c *Controller) InspectAll(ctx context.Context) {
-	set := c.targets()
+	c.observeTargets(ctx, c.targets().Targets, config.HookInspect)
+}
 
-	// Hook input reads the desired digests, so it is built under the lock
-	// before the programs run.
-	c.mu.Lock()
-
-	inputs := make([]HookInput, len(set.Targets))
-	for i := range set.Targets {
-		inputs[i] = c.hookInput(set, &set.Targets[i])
+func (c *Controller) observeTargets(ctx context.Context, ts []targets.Target, hook string) {
+	if hook == config.HookReady {
+		c.probeMu.Lock()
+		defer c.probeMu.Unlock()
 	}
 
-	c.mu.Unlock()
+	set := c.targets()
+	c.mu.RLock()
+
+	inputs := make([]HookInput, len(ts))
+	for i := range ts {
+		inputs[i] = c.hookInput(set, &ts[i])
+	}
+
+	c.mu.RUnlock()
 
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(c.cfg.Inspect.Concurrency)
 
-	for i := range set.Targets {
-		t := set.Targets[i]
+	for i := range ts {
+		t := &ts[i]
 		in := inputs[i]
 
 		g.Go(func() error {
 			started := c.clock.Now()
-			res, err := c.runner.Run(gctx, c.programFor(&t, config.HookInspect), config.HookInspect, t.ID, in)
+			res, err := c.runner.Run(gctx, c.programFor(t, hook), hook, t.ID, in)
+
+			if hook == config.HookReady && gctx.Err() != nil {
+				return nil
+			}
+
+			if err != nil {
+				res = hooks.Result{Program: c.programFor(t, hook), Reason: err.Error(), ExitCode: -1, RanAt: c.clock.Now()}
+			}
 
 			c.mu.Lock()
 			defer c.mu.Unlock()
 
-			if err != nil {
-				c.setLiveLocked(gctx, c.clock.Now(), started, t.ID, "", false, err.Error())
+			accepted := false
 
-				return nil
+			if hook == config.HookInspect {
+				accepted = c.setLiveLocked(gctx, c.clock.Now(), started, t.ID, strings.TrimSpace(res.Reason), res.OK, res.Reason)
+			} else {
+				accepted = c.setReadinessLocked(gctx, t.ID, started, res.OK, res.Reason)
 			}
 
-			c.recordHookRun(gctx, t.ID, config.HookInspect, &res)
-			c.setLiveLocked(gctx, c.clock.Now(), started, t.ID, strings.TrimSpace(res.Reason), res.OK, res.Reason)
+			if accepted {
+				c.recordHookRun(gctx, t.ID, hook, &res)
+			}
 
 			return nil
 		})
 	}
 
 	_ = g.Wait()
+}
+
+func (c *Controller) observeBatch(ctx context.Context) {
+	set := c.targets()
+	c.mu.RLock()
+
+	var waiting []targets.Target
+
+	seen := map[string]struct{}{}
+
+	for _, r := range c.rollouts {
+		b := r.CurrentBatch()
+		if r.State != Running || b == nil {
+			continue
+		}
+
+		for _, id := range b.Targets {
+			if r.target(id).Phase != PhaseUpdating {
+				continue
+			}
+
+			t, present := set.Get(id)
+			_, duplicate := seen[id]
+
+			if present && !duplicate {
+				waiting = append(waiting, t)
+				seen[id] = struct{}{}
+			}
+		}
+	}
+
+	c.mu.RUnlock()
+
+	if len(waiting) > 0 {
+		c.observeTargets(ctx, waiting, config.HookInspect)
+		c.observeTargets(ctx, waiting, config.HookReady)
+	}
 }
 
 // RunInspector observes every target on the inspect interval until ctx ends.

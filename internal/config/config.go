@@ -15,11 +15,10 @@ import (
 
 // Hook names the binary runs. Anything else named in a targets file is an error.
 const (
-	HookInspect     = "inspect"
-	HookUpdate      = "update"
-	HookReady       = "ready"
-	HookSoak        = "soak"
-	HookEnvironment = "environment"
+	HookInspect = "inspect"
+	HookUpdate  = "update"
+	HookReady   = "ready"
+	HookSoak    = "soak"
 )
 
 // TargetHooks are the hooks a target may name a program for.
@@ -38,6 +37,7 @@ type Config struct {
 	DisruptionBudget DisruptionBudget `yaml:"disruptionBudget"`
 	Hooks            Hooks            `yaml:"hooks"`
 	Inspect          Inspect          `yaml:"inspect"`
+	ReadinessProbe   ReadinessProbe   `yaml:"readinessProbe"`
 	// Strategy is how every group rolls out unless its policy names one of
 	// Strategies. A named strategy starts from Strategy and overrides only
 	// the fields it sets.
@@ -83,16 +83,9 @@ type Registry struct {
 
 // Hooks locates and bounds the programs.
 type Hooks struct {
-	Dir         string            `yaml:"dir" default:"/etc/rolloor/hooks"`
-	Timeout     time.Duration     `yaml:"timeout" default:"60s"`
-	Defaults    map[string]string `yaml:"defaults"`
-	Environment EnvironmentHook   `yaml:"environment"`
-}
-
-// EnvironmentHook is the optional environment-wide check.
-type EnvironmentHook struct {
-	Program  string        `yaml:"program"`
-	Interval time.Duration `yaml:"interval" default:"30s"`
+	Dir      string            `yaml:"dir" default:"/etc/rolloor/hooks"`
+	Timeout  time.Duration     `yaml:"timeout" default:"60s"`
+	Defaults map[string]string `yaml:"defaults"`
 }
 
 // Inspect paces live-state observation.
@@ -102,6 +95,13 @@ type Inspect struct {
 	// FailureThreshold is how many inspections in a row may fail before a
 	// target reads Unknown.
 	FailureThreshold int `yaml:"failureThreshold" default:"3"`
+}
+
+// ReadinessProbe paces independent assessment of each target's readiness.
+type ReadinessProbe struct {
+	Period           time.Duration `yaml:"period" default:"30s"`
+	FailureThreshold int           `yaml:"failureThreshold" default:"3"`
+	SuccessThreshold int           `yaml:"successThreshold" default:"1"`
 }
 
 // Strategy is how a rollout cuts batches and watches them.
@@ -115,8 +115,23 @@ type Strategy struct {
 	// PauseAfterFirstBatch waits for a promote once batch 1 has passed.
 	PauseAfterFirstBatch bool `yaml:"pauseAfterFirstBatch"`
 	// Waves nil means true: batches follow the wave label.
-	Waves *bool `yaml:"waves"`
-	Soak  Soak  `yaml:"soak"`
+	Waves            *bool         `yaml:"waves"`
+	ProgressDeadline time.Duration `yaml:"progressDeadline" default:"10m"`
+	Retry            Retry         `yaml:"retry"`
+	Soak             Soak          `yaml:"soak"`
+}
+
+// Retry bounds update attempts and spaces them with exponential backoff.
+type Retry struct {
+	Limit   int     `yaml:"limit" default:"5"`
+	Backoff Backoff `yaml:"backoff"`
+}
+
+// Backoff caps the delay between update attempts.
+type Backoff struct {
+	Duration    time.Duration `yaml:"duration" default:"10s"`
+	Factor      int           `yaml:"factor" default:"2"`
+	MaxDuration time.Duration `yaml:"maxDuration" default:"3m"`
 }
 
 // BatchFor returns how many of total nodes batch n (from 1) takes.
@@ -139,7 +154,8 @@ type Soak struct {
 	Duration time.Duration `yaml:"duration" default:"10m"`
 	Interval time.Duration `yaml:"interval" default:"1m"`
 	// FailureLimit is how many checks may fail before the rollout halts.
-	FailureLimit int `yaml:"failureLimit" default:"1"`
+	FailureLimit          int `yaml:"failureLimit" default:"1"`
+	ConsecutiveErrorLimit int `yaml:"consecutiveErrorLimit" default:"4"`
 }
 
 // Policy is a group's stored policy; here it is the default.
@@ -305,6 +321,10 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("config: inspect.interval, concurrency and failureThreshold must be positive")
 	}
 
+	if c.ReadinessProbe.Period <= 0 || c.ReadinessProbe.FailureThreshold <= 0 || c.ReadinessProbe.SuccessThreshold <= 0 {
+		return fmt.Errorf("config: readinessProbe.period, failureThreshold and successThreshold must be positive")
+	}
+
 	for h := range c.Hooks.Defaults {
 		if !isTargetHook(h) {
 			return fmt.Errorf("config: hooks.defaults.%s is not a hook", h)
@@ -315,11 +335,12 @@ func (c *Config) Validate() error {
 		return err
 	}
 
-	for name, st := range c.Strategies {
+	for name := range c.Strategies {
 		if name == "" {
 			return fmt.Errorf("config: strategies need a name")
 		}
 
+		st := c.Strategies[name]
 		if err := st.validate("strategies." + name); err != nil {
 			return err
 		}
@@ -373,12 +394,28 @@ func (s *Strategy) validate(field string) error {
 		return fmt.Errorf("config: %s.firstBatch selects nothing", field)
 	}
 
+	if s.ProgressDeadline <= 0 {
+		return fmt.Errorf("config: %s.progressDeadline must be positive", field)
+	}
+
+	if s.Retry.Limit < 0 {
+		return fmt.Errorf("config: %s.retry.limit must not be negative", field)
+	}
+
+	if s.Retry.Backoff.Duration <= 0 || s.Retry.Backoff.Factor < 1 || s.Retry.Backoff.MaxDuration <= 0 {
+		return fmt.Errorf("config: %s.retry.backoff.duration and maxDuration must be positive, factor must be at least 1", field)
+	}
+
 	if s.Soak.Duration > 0 && (s.Soak.Interval <= 0 || s.Soak.Interval > s.Soak.Duration) {
 		return fmt.Errorf("config: %s.soak.interval must be positive and within duration", field)
 	}
 
 	if s.Soak.FailureLimit < 0 {
 		return fmt.Errorf("config: %s.soak.failureLimit must not be negative", field)
+	}
+
+	if s.Soak.ConsecutiveErrorLimit < 0 {
+		return fmt.Errorf("config: %s.soak.consecutiveErrorLimit must not be negative", field)
 	}
 
 	return nil

@@ -44,10 +44,21 @@ func TestRetryOfATargetAlreadyOnTheDigestOnlyReinspects(t *testing.T) {
 	updates := len(h.world.callsFor("update:" + tA1))
 	h.world.set(func(w *world) { w.soakFail[soakA] = false })
 	require.NoError(t, h.c.Retry(h.ctx, actor, r.ID, "probe fixed"))
-	h.tick()
+	require.Equal(t, Complete, h.drive(r.ID, 80, 20*time.Second).State)
+
+	// The landed target passes a retry batch, soak included, with no new update.
+	done := h.rollout(r.ID)
+	rt := done.target(tA1)
+	b := done.Batches[rt.Batch-1]
 
 	require.Equal(t, updates, len(h.world.callsFor("update:"+tA1)))
-	require.Equal(t, PhaseUpdating, h.phases(h.active("a"))[tA1])
+	require.True(t, rt.Updated)
+	require.True(t, b.Retried)
+	require.True(t, b.Passed)
+	require.True(t, slices.ContainsFunc(b.Soak.Checks, func(check SoakCheck) bool {
+		return check.Program == soakA && check.OK && !check.Error
+	}), "the retry passed its soak program")
+	require.Equal(t, Healthy, h.view(tA1).Health)
 }
 
 func TestFlushAlsoWritesDeletions(t *testing.T) {

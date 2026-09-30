@@ -25,9 +25,7 @@ type SyncRequest struct {
 }
 
 // Sync asks for the selected groups to converge now. Tags are re-resolved
-// first so the request acts on the current digests. A manual rollout waiting
-// for a sync starts; a group with no rollout gets one; an active rollout is
-// marked as a person's, so the environment check no longer holds it.
+// first; a manual rollout waiting for a sync starts, or a new one is created.
 func (c *Controller) Sync(ctx context.Context, req SyncRequest) ([]string, error) {
 	set := c.targets()
 
@@ -99,7 +97,7 @@ func (c *Controller) Sync(ctx context.Context, req SyncRequest) ([]string, error
 				r.Strategy = req.Strategy
 			}
 
-			if r.State == WaitingForSync || r.State == WaitingForEnvironment {
+			if r.State == WaitingForSync {
 				r.State, r.Reason, r.UpdatedAt = Running, "Started by "+req.Actor, now
 			}
 		})
@@ -244,7 +242,7 @@ func (c *Controller) Pause(ctx context.Context, actor, rolloutID string) error {
 	}
 
 	switch r.State {
-	case Running, Soaking, WaitingForBudget, WaitingForEnvironment:
+	case Running, Soaking, WaitingForBudget:
 	case WaitingForSync, Paused, Halted, Aborted, Superseded, Complete:
 		return fmt.Errorf("rollout is %s: %w", r.State, ErrState)
 	}
@@ -353,13 +351,16 @@ func (c *Controller) Abort(ctx context.Context, actor, rolloutID string) error {
 		return err
 	}
 
+	c.clearRolloutQuarantine(ctx, r)
 	c.aborted[r.Group] = key
 	c.event(ctx, now, &Event{Actor: ControllerActor, Action: "rollout.aborted", Group: r.Group, Rollout: r.ID, Reason: reason})
 
 	return nil
 }
 
-// Retry reopens a halted rollout's batch; see retryBatch.
+// Retry resumes a halted rollout. The halted batch stays closed on the
+// record; the targets it failed go back to pending ahead of every untried
+// target, with a fresh attempt window.
 func (c *Controller) Retry(ctx context.Context, actor, rolloutID, reason string) error {
 	if reason == "" {
 		return errors.New("a reason is required")
@@ -384,8 +385,28 @@ func (c *Controller) Retry(ctx context.Context, actor, rolloutID, reason string)
 	}
 
 	err := c.commit(ctx, r, func() {
-		r.RetryPending = true
+		for i := range r.Targets {
+			rt := &r.Targets[i]
+			if rt.Phase != PhaseFailed {
+				continue
+			}
+
+			// An earlier update may still land, so an unexpired hold stays
+			// until the target is seen ready on the build.
+			hold := rt.HoldUntil
+			if !now.Before(hold) || c.heldReady(r, rt) {
+				hold = time.Time{}
+			}
+
+			*rt = RolloutTarget{
+				ID: rt.ID, Node: rt.Node, Wave: rt.Wave, Phase: PhasePending, Reason: "waiting to be retried",
+				NotReadyBefore: rt.NotReadyBefore, HoldUntil: hold, Retried: true,
+			}
+		}
+
 		r.Human = true
+		r.Soak = SoakProgress{}
+		r.State, r.Reason, r.UpdatedAt = Running, "Retried by "+actor, now
 	})
 	if err != nil {
 		return err

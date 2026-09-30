@@ -153,7 +153,7 @@ func (f *propFleet) edit(rng *rand.Rand) string {
 }
 
 func propConfig(rng *rand.Rand) string {
-	budget := []string{"10%", "25%", "40%", "60%", "100"}[rng.IntN(5)]
+	budget := []string{"10%", quarterBudget, "40%", "60%", "100"}[rng.IntN(5)]
 	batch := []string{"1", "2", "3", "50%", "100%"}[rng.IntN(5)]
 	soak := []string{"0s", "40s"}[rng.IntN(2)]
 

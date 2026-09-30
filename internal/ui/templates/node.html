@@ -24,7 +24,7 @@
 </dl>
 
 <table class="targets">
-  <thead><tr><th>Target</th><th>Group</th><th>Image</th><th>Live</th><th>Sync</th><th>Health</th><th>Why</th><th></th></tr></thead>
+  <thead><tr><th>Target</th><th>Group</th><th>Image</th><th>Live</th><th>Sync</th><th>Health</th><th>Why</th><th>Quarantine</th><th></th></tr></thead>
   <tbody>
   {{range .Node.Targets}}
     {{$can := index $.Can .ID}}
@@ -36,6 +36,7 @@
       <td>{{template "sync-badge" .Sync}}</td>
       <td>{{template "health-badge" .Health}}</td>
       <td>{{.Reason}}{{if .Rollout}}, <a href="/rollouts/{{.Rollout}}">rollout</a>{{end}}</td>
+      <td>{{with .Quarantine}}<a href="/rollouts/{{.Rollout}}">Quarantined</a>: {{.Reason}}{{end}}</td>
       <td>
         {{if .Suspension}}
           {{$resume := index $.ResumeCan .ID}}

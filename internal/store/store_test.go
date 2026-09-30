@@ -56,7 +56,8 @@ func TestRoundTrip(t *testing.T) {
 	require.NoError(t, s.SaveSuspension(ctx, &reconcile.Suspension{ID: "s2"}))
 	require.NoError(t, s.DeleteSuspension(ctx, "s2"))
 
-	require.NoError(t, s.SaveLive(ctx, t1, &reconcile.Live{Digest: sha, SeenAt: now}))
+	readiness := reconcile.Readiness{Ready: true, Since: now, ProbedAt: now, ObservedAt: now.Add(-time.Second), LastSuccessAt: now.Add(-time.Second), Failures: 0, Successes: 2, Reason: "running"}
+	require.NoError(t, s.SaveLive(ctx, t1, &reconcile.Live{Digest: sha, SeenAt: now, Readiness: readiness}))
 	require.NoError(t, s.SaveLive(ctx, "t2", &reconcile.Live{Failures: 2}))
 	require.NoError(t, s.DeleteLive(ctx, "t2"))
 
@@ -95,6 +96,7 @@ func TestRoundTrip(t *testing.T) {
 	require.Len(t, snap.Suspensions, 1)
 	require.Equal(t, "n1", snap.Suspensions[0].Selector["node"])
 	require.Equal(t, sha, snap.Live[t1].Digest)
+	require.Equal(t, readiness, snap.Live[t1].Readiness)
 	require.Len(t, snap.Live, 1)
 	require.Equal(t, map[string]string{t1: "worse"}, snap.Degraded)
 	require.Equal(t, "sha256:2", snap.Desired[img].Digest)
