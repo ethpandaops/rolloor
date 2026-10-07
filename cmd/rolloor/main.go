@@ -222,8 +222,13 @@ func runHook(ctx context.Context, out interface{ Write([]byte) (int, error) }, c
 	}
 
 	var input any = in
+
 	if hook == config.HookSoak {
-		input = map[string]any{"updated": []targets.Target{t}, "remaining": []targets.Target{}, "rollout": map[string]any{"id": "manual", "group": set.Group(&t), "batch": 1, "wave": set.Wave(&t)}}
+		updated := []struct {
+			targets.Target
+			UpdatedAt time.Time `json:"updatedAt"`
+		}{{Target: t, UpdatedAt: time.Now().UTC()}}
+		input = map[string]any{"updated": updated, "remaining": []targets.Target{}, "rollout": map[string]any{"id": "manual", "group": set.Group(&t), "batch": 1, "wave": set.Wave(&t)}}
 	}
 
 	if program == "" {
@@ -363,6 +368,7 @@ func serve(ctx context.Context, configPath string) error {
 	g.Go(func() error { return controller.RunProber(gctx) })
 	g.Go(func() error { return controller.Run(gctx, tickEvery) })
 	g.Go(func() error { return watcher.Run(gctx) })
+	g.Go(func() error { return watchAutomation(gctx, configPath, controller, log) })
 
 	if teams != nil {
 		g.Go(func() error { return teams.Run(gctx, watchEvery) })
@@ -392,6 +398,39 @@ func serve(ctx context.Context, configPath string) error {
 	}
 
 	return err
+}
+
+func watchAutomation(ctx context.Context, path string, c *reconcile.Controller, log observability.ContextualLogger) error {
+	ticker := time.NewTicker(watchEvery)
+	defer ticker.Stop()
+
+	var modified time.Time
+
+	size := int64(-1)
+
+	for {
+		info, err := os.Stat(path)
+		if err != nil {
+			log.WithContext(ctx).WithError(err).Warn("config reload failed")
+		} else if !info.ModTime().Equal(modified) || info.Size() != size {
+			modified, size = info.ModTime(), info.Size()
+
+			cfg, loadErr := config.Load(path)
+			if loadErr == nil {
+				loadErr = c.ConfigureGroups(ctx, cfg.Paused, cfg.Groups)
+			}
+
+			if loadErr != nil {
+				log.WithContext(ctx).WithError(loadErr).Warn("config reload failed; keeping previous pause and group settings")
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 // buildAuthorizer picks open access or OIDC from the config. The OIDC client

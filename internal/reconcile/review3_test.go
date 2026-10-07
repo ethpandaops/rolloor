@@ -10,21 +10,18 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestRetryAfterAFailedUpdateRunsTheUpdateAgain(t *testing.T) {
+func TestRetryUpdatesATargetNoLongerOnTheBuild(t *testing.T) {
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
-	h.world.set(func(w *world) { w.updateFail[tA2] = "updater unreachable" })
-	h.release(imgA, d2)
-
-	r := h.active("a")
-	require.Equal(t, Halted, r.State)
+	r := h.haltOnBadBuild("a", imgA, d2, tA2)
 
 	updates := len(h.world.callsFor("update:" + tA2))
-	h.world.set(func(w *world) { delete(w.updateFail, tA2) })
-	require.NoError(t, h.c.Retry(h.ctx, actor, r.ID, "updater back"))
+	h.revert(tA2)
+	h.c.InspectAll(h.ctx)
+	require.NoError(t, h.c.Retry(h.ctx, actor, r.ID, "rolled back by hand"))
 	h.tick()
 
-	require.Greater(t, len(h.world.callsFor("update:"+tA2)), updates, "a target that never got the digest is updated again")
+	require.Greater(t, len(h.world.callsFor("update:"+tA2)), updates, "a target that no longer runs the build is updated again")
 	require.Equal(t, Complete, h.drive(r.ID, 80, 20*time.Second).State)
 }
 

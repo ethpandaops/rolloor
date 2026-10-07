@@ -34,7 +34,8 @@ type GroupView struct {
 	Owner     string            `json:"owner"`
 	Section   string            `json:"section,omitempty"`
 	Hidden    bool              `json:"hidden"`
-	Policy    Policy            `json:"policy"`
+	Paused    bool              `json:"paused"`
+	Strategy  string            `json:"strategy,omitempty"`
 	Targets   int               `json:"targets"`
 	Nodes     int               `json:"nodes"`
 	Weight    float64           `json:"weight"`
@@ -135,7 +136,7 @@ func (c *Controller) viewLocked(set *targets.Set, t *targets.Target) TargetView 
 	group := set.Group(t)
 	v := TargetView{Target: *t, Group: group, Owner: set.Owner(t), Wave: set.Wave(t), Health: Healthy, Hooks: c.hookRunsFor(t.ID), Readiness: c.live[t.ID].Readiness}
 
-	if d, ok := c.desiredFor(group, t); ok {
+	if d, ok := c.desiredFor(t); ok {
 		v.Desired, v.Revision = d.Digest, d.Revision
 	}
 
@@ -243,7 +244,7 @@ func (c *Controller) Group(name string) (GroupView, []TargetView, bool) {
 }
 
 func (c *Controller) groupLocked(set *targets.Set, name string, views []TargetView) GroupView {
-	g := GroupView{Name: name, Policy: c.policyFor(name), Sync: Synced, Health: Healthy, Desired: map[string]string{}, Revisions: map[string]string{}}
+	g := GroupView{Name: name, Paused: c.groupPaused(name), Strategy: c.groups[name].Strategy, Sync: Synced, Health: Healthy, Desired: map[string]string{}, Revisions: map[string]string{}}
 	nodes := map[string]struct{}{}
 	images := map[string]struct{}{}
 
@@ -298,6 +299,10 @@ func (c *Controller) groupLocked(set *targets.Set, name string, views []TargetVi
 		g.Reason = r.Reason
 	} else {
 		g.Reason = groupReason(&g, views)
+	}
+
+	if g.Paused {
+		g.Reason = c.configPauseReason(name)
 	}
 
 	return g

@@ -41,7 +41,7 @@ disruptionBudget:
 hooks:
   # The example's shell hooks (examples/kurtosis/hooks).
   dir: /etc/rolloor/hooks
-  # Each hook run is killed after this long.
+  # Each hook run is killed after this long; such a run could not check.
   timeout: 30s
   # Used by any target that does not name its own under `hooks`. Beacon
   # nodes name soak-beacon; other targets have no soak.
@@ -71,7 +71,7 @@ readinessProbe:
   # Passing probes in a row before it reads ready again.
   successThreshold: 1
 
-# How every group rolls out.
+# How every group rolls out unless it names one of `strategies`.
 strategy:
   # One node first, to catch a bad build before it spreads.
   firstBatch: 1
@@ -90,14 +90,31 @@ strategy:
     # Compare every 15 seconds.
     interval: 15s
     # A restarted node can briefly have fewer peers; tolerate two bad checks.
+    # Checks that exit 3 or time out count neither way; the soak waits.
     failureLimit: 2
-    # Checks in a row that could not run, tolerated before the rollout halts.
-    consecutiveErrorLimit: 4
 
-# Applies to every group without a stored policy.
-defaultPolicy:
-  # Rollouts start as soon as a new build is seen.
-  mode: automated
+# Named strategies a client may choose. Each starts from `strategy` and
+# changes only what it sets.
+strategies:
+  # One node at a time.
+  serial:
+    batchSize: 1
+
+# true holds every client: no new batch is admitted and no update starts,
+# while open batches keep watching what they already updated. Reloaded while
+# running.
+paused: false
+
+# Per client. Reloaded while running; a strategy change applies to the
+# client's next rollout.
+groups:
+  lighthouse:
+    # true holds lighthouse alone; empty strategy is `strategy`.
+    paused: false
+  geth:
+    paused: false
+    # Execution clients move one node at a time.
+    strategy: serial
 
 # Who may sign in and act.
 auth:

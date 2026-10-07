@@ -1,5 +1,6 @@
 // Package hooks runs the operator-supplied programs with the fixed contract:
-// JSON on stdin, exit 0 means yes, the first line of stdout is the reason.
+// JSON on stdin, exit 0 means yes, 1 no and 3 could not check, and the first
+// line of stdout is the reason.
 package hooks
 
 import (
@@ -17,7 +18,8 @@ import (
 	"github.com/ethpandaops/rolloor/internal/observability"
 )
 
-// Result is what one run produced.
+// Result is what one run produced. A run that never reported an exit status,
+// because it could not start, timed out or was killed, has ExitCode -1.
 type Result struct {
 	Program  string        `json:"program"`
 	ExitCode int           `json:"exitCode"`
@@ -27,6 +29,14 @@ type Result struct {
 	Duration time.Duration `json:"duration"`
 	TimedOut bool          `json:"timedOut"`
 	RanAt    time.Time     `json:"ranAt"`
+}
+
+const exitCouldNotCheck = 3
+
+// CouldNotCheck reports whether the run says nothing either way about what
+// it checks: the program exited 3, timed out or never reported an exit status.
+func (r *Result) CouldNotCheck() bool {
+	return r.ExitCode == exitCouldNotCheck || r.ExitCode < 0 || r.TimedOut
 }
 
 // maxCapture bounds how much of a hook's stdout and stderr is kept. The
@@ -122,17 +132,17 @@ func (r *Runner) Exists(program string) bool {
 	return err == nil && !info.IsDir() && info.Mode()&0o111 != 0
 }
 
-// Run executes program with input encoded as JSON on stdin. hook and targetID
-// are exposed to the program as environment variables. A non-zero exit is not
-// an error; an error means the program could not be run at all.
+// Run supplies JSON on stdin and hook/target identity in the environment.
+// Nonzero exits are reported in Result; errors mean execution could not
+// complete and Result.CouldNotCheck is true.
 func (r *Runner) Run(ctx context.Context, program, hook, targetID string, input any) (Result, error) {
 	if program == "" || strings.ContainsAny(program, `/\`) {
-		return Result{}, fmt.Errorf("hooks: %q is not a bare program name", program)
+		return Result{Program: program, ExitCode: -1}, fmt.Errorf("hooks: %q is not a bare program name", program)
 	}
 
 	stdin, err := json.Marshal(input)
 	if err != nil {
-		return Result{}, fmt.Errorf("hooks: encode input for %s: %w", program, err)
+		return Result{Program: program, ExitCode: -1}, fmt.Errorf("hooks: encode input for %s: %w", program, err)
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, r.timeout)
@@ -157,7 +167,7 @@ func (r *Runner) Run(ctx context.Context, program, hook, targetID string, input 
 
 	start := time.Now()
 	runErr := cmd.Run()
-	res := Result{Program: program, Duration: time.Since(start), RanAt: start, Stdout: stdout.String()}
+	res := Result{Program: program, ExitCode: -1, Duration: time.Since(start), RanAt: start, Stdout: stdout.String()}
 	res.Reason = firstLine(res.Stdout)
 
 	log := r.log.WithContext(ctx).WithFields(map[string]any{"hook": hook, "program": program, "target": targetID, "duration": res.Duration})
@@ -172,7 +182,6 @@ func (r *Runner) Run(ctx context.Context, program, hook, targetID string, input 
 		res.ExitCode = 0
 	case errors.Is(ctx.Err(), context.DeadlineExceeded):
 		res.TimedOut = true
-		res.ExitCode = -1
 		res.Reason = fmt.Sprintf("timed out after %s", r.timeout)
 	default:
 		var exit *exec.ExitError
@@ -183,6 +192,10 @@ func (r *Runner) Run(ctx context.Context, program, hook, targetID string, input 
 		res.ExitCode = exit.ExitCode()
 		if res.Reason == "" {
 			res.Reason = firstLine(stderr.String())
+		}
+
+		if res.Reason == "" && res.ExitCode < 0 {
+			res.Reason = exit.String()
 		}
 
 		if res.Reason == "" {

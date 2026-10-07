@@ -33,9 +33,14 @@ type job struct {
 
 // soakInput is what the soak hook receives on stdin.
 type soakInput struct {
-	Updated   []targets.Target `json:"updated"`
+	Updated   []soakTarget     `json:"updated"`
 	Remaining []targets.Target `json:"remaining"`
 	Rollout   soakRollout      `json:"rollout"`
+}
+
+type soakTarget struct {
+	targets.Target
+	UpdatedAt time.Time `json:"updatedAt"`
 }
 
 type soakRollout struct {
@@ -85,8 +90,7 @@ func (c *Controller) planRollouts(ctx context.Context, now time.Time) []job {
 	return jobs
 }
 
-// planRollout is only called for active rollouts; WaitingForSync, Paused and
-// Halted have nothing to do until a person acts.
+// planRollout advances an active operation from observed state.
 func (c *Controller) planRollout(ctx context.Context, now time.Time, r *Rollout, set *targets.Set) []job {
 	switch r.State {
 	case Soaking:
@@ -111,6 +115,7 @@ func (c *Controller) planRollout(ctx context.Context, now time.Time, r *Rollout,
 func (c *Controller) planBatch(ctx context.Context, now time.Time, r *Rollout, set *targets.Set) []job {
 	b := r.CurrentBatch()
 	st := c.strategy(r.Strategy)
+	paused := c.groupPaused(r.Group)
 
 	var jobs []job
 
@@ -134,40 +139,25 @@ func (c *Controller) planBatch(ctx context.Context, now time.Time, r *Rollout, s
 			allReady = false
 			changed = true
 
-			rt.Phase, rt.Reason = PhaseUpdating, "update running"
-			if rt.UpdatedAt.IsZero() {
-				rt.UpdatedAt = now
+			if c.pendingUpdate(now, r, rt, r.Desired[t.Image], &st, paused) {
+				jobs = append(jobs, c.updateJob(r, rt))
 			}
-
-			// An already-observed digest needs verification, not another update
-			// that could collide with one still finishing.
-			if live, known := c.liveKnown(id); known && live == r.Desired[t.Image] {
-				rt.UpdateDone, rt.Reason = true, "already on the new build, waiting for inspect to confirm"
-
-				continue
-			}
-
-			if why := updateDeadlineReason(now, rt, &st, r.Desired[t.Image]); why != "" {
-				c.withdraw(jobs)
-				c.halt(ctx, now, r, id, why)
-
-				return nil
-			}
-
-			if rt.UpdateAttempts >= max(st.Retry.Limit, 1) {
-				c.withdraw(jobs)
-				c.halt(ctx, now, r, id, "update retry limit reached after an interrupted update")
-
-				return nil
-			}
-
-			jobs = append(jobs, c.updateJob(now, r, rt))
 		case PhaseUpdating:
 			live, known := c.liveKnown(id)
-			if known && live == r.Desired[t.Image] && rt.UpdateDone {
+			if known && live == r.Desired[t.Image] {
+				if !rt.UpdateDone {
+					changed = true
+					rt.UpdateDone, rt.UpdateError, rt.RetryAt = true, "", time.Time{}
+				}
+
 				if !rt.Updated {
 					changed = true
 					rt.Updated, rt.DigestSeenAt = true, c.live[id].DigestSince
+
+					if rt.UpdatedAt.IsZero() {
+						rt.UpdatedAt = rt.DigestSeenAt
+					}
+
 					rt.Reason = "on the new build, waiting for readiness"
 				}
 
@@ -177,7 +167,7 @@ func (c *Controller) planBatch(ctx context.Context, now time.Time, r *Rollout, s
 
 					continue
 				}
-			} else if rt.Updated {
+			} else if known && rt.Updated {
 				changed = true
 				rt.Updated = false
 				rt.DigestSeenAt = time.Time{}
@@ -186,10 +176,31 @@ func (c *Controller) planBatch(ctx context.Context, now time.Time, r *Rollout, s
 			allReady = false
 
 			if why := updateDeadlineReason(now, rt, &st, r.Desired[t.Image]); why != "" {
+				changed = true
+
+				if !rt.Updated {
+					c.leave(now, r, rt, PhaseSkipped, "update skipped: "+why)
+
+					continue
+				}
+
+				if c.readinessCheckMissing(rt) {
+					rt.Reason = "readiness could not be checked; waiting for observations to recover"
+
+					continue
+				}
+
 				c.withdraw(jobs)
 				c.halt(ctx, now, r, id, why)
 
 				return nil
+			}
+
+			if paused && !rt.UpdateDone {
+				changed = true
+				rt.Reason = c.configPauseReason(r.Group)
+
+				continue
 			}
 
 			if !rt.RetryAt.IsZero() {
@@ -198,7 +209,7 @@ func (c *Controller) planBatch(ctx context.Context, now time.Time, r *Rollout, s
 				if now.Before(rt.RetryAt) {
 					rt.Reason = fmt.Sprintf("%s; retrying in %s", updateFailure(rt, &st), rt.RetryAt.Sub(now).Round(time.Second))
 				} else {
-					jobs = append(jobs, c.updateJob(now, r, rt))
+					jobs = append(jobs, c.updateJob(r, rt))
 				}
 
 				continue
@@ -224,6 +235,49 @@ func (c *Controller) planBatch(ctx context.Context, now time.Time, r *Rollout, s
 	}
 
 	return jobs
+}
+
+// pendingUpdate prepares an unstarted or interrupted target for dispatch.
+func (c *Controller) pendingUpdate(now time.Time, r *Rollout, rt *RolloutTarget, desired string, st *config.Strategy, paused bool) bool {
+	if paused && rt.UpdateAttempts == 0 {
+		rt.Reason = c.configPauseReason(r.Group)
+
+		return false
+	}
+
+	rt.Phase, rt.Reason = PhaseUpdating, "update running"
+
+	// An already-observed digest needs verification, not another update
+	// that could collide with one still finishing.
+	if live, known := c.liveKnown(rt.ID); known && live == desired {
+		if rt.UpdatedAt.IsZero() {
+			rt.UpdatedAt = c.live[rt.ID].DigestSince
+		}
+
+		rt.UpdateDone, rt.Reason = true, "already on the new build, waiting for inspect to confirm"
+
+		return false
+	}
+
+	if why := updateDeadlineReason(now, rt, st, desired); why != "" {
+		c.leave(now, r, rt, PhaseSkipped, "update skipped: "+why)
+
+		return false
+	}
+
+	if rt.UpdateAttempts >= max(st.Retry.Limit, 1) {
+		c.leave(now, r, rt, PhaseSkipped, "update skipped: retry limit reached after an interrupted update")
+
+		return false
+	}
+
+	if paused {
+		rt.Phase, rt.Reason = PhasePending, c.configPauseReason(r.Group)
+
+		return false
+	}
+
+	return true
 }
 
 // skipReason says why a rollout target can no longer be worked on, if so.
@@ -323,7 +377,7 @@ func (c *Controller) planSoak(ctx context.Context, now time.Time, r *Rollout, se
 		return nil
 	}
 
-	byProgram := map[string][]targets.Target{}
+	byProgram := map[string][]soakTarget{}
 	byProgramIDs := map[string][]string{}
 	skipped := false
 
@@ -347,7 +401,7 @@ func (c *Controller) planSoak(ctx context.Context, now time.Time, r *Rollout, se
 			continue
 		}
 
-		byProgram[prog] = append(byProgram[prog], t)
+		byProgram[prog] = append(byProgram[prog], soakTarget{Target: t, UpdatedAt: rt.DigestSeenAt})
 		byProgramIDs[prog] = append(byProgramIDs[prog], id)
 	}
 
@@ -429,11 +483,9 @@ func (c *Controller) passBatch(ctx context.Context, now time.Time, r *Rollout, w
 	c.event(ctx, now, &Event{Actor: ControllerActor, Action: "batch.passed", Group: r.Group, Rollout: r.ID,
 		Reason: fmt.Sprintf("batch %d: %s", b.Number, why)})
 
-	st := c.strategy(r.Strategy)
-
-	if r.PausePending || (st.PauseAfterFirstBatch && b.Number == 1 && c.hasRemaining(r)) {
+	if r.PausePending {
 		r.PausePending = false
-		c.setState(ctx, now, r, Paused, fmt.Sprintf("Paused after batch %d. Run promote to continue.", b.Number))
+		c.setState(ctx, now, r, Paused, pauseReason(r))
 
 		return
 	}
@@ -446,16 +498,6 @@ func cloneSoak(s *SoakProgress) *SoakProgress {
 	cp.Checks = append([]SoakCheck(nil), s.Checks...)
 
 	return &cp
-}
-
-func (c *Controller) hasRemaining(r *Rollout) bool {
-	for i := range r.Targets {
-		if rt := &r.Targets[i]; rt.Batch == 0 && rt.Phase == PhasePending {
-			return true
-		}
-	}
-
-	return false
 }
 
 // halt stops the rollout at the open batch and quarantines its targets.
@@ -545,10 +587,14 @@ func (c *Controller) dispatch(ctx context.Context, j *job) bool {
 		rt := r.target(j.target)
 		t, _ := set.Get(j.target)
 
+		if rt.UpdateAttempts == 0 {
+			rt.UpdatedAt = c.clock.Now()
+		}
+
 		rt.UpdateAttempts++
 
 		if c.saveRollout(ctx, r) == nil {
-			j.program, j.input = c.programFor(&t, config.HookUpdate), c.hookInput(set, &t)
+			j.program, j.input = c.programFor(&t, config.HookUpdate), c.hookInput(&t)
 
 			return true
 		}
@@ -570,6 +616,10 @@ func (c *Controller) staleUpdate(set *targets.Set, j *job) string {
 	r := c.rollouts[j.rollout]
 	if r.State != Running {
 		return "update withdrawn: the rollout stopped running"
+	}
+
+	if c.groupPaused(r.Group) {
+		return "update withdrawn: " + c.configPauseReason(r.Group)
 	}
 
 	// Only the attempt the plan made may run, and only while its batch is open.
@@ -760,13 +810,8 @@ func (c *Controller) applySoak(ctx context.Context, now time.Time, r *Rollout, o
 
 	if errored >= 0 {
 		last := r.Soak.Checks[errored]
-		why := fmt.Sprintf("soak %s could not run: %s; %d consecutive errors of %d allowed", last.Program, last.Reason, r.Soak.ConsecutiveErrors, st.Soak.ConsecutiveErrorLimit)
-
-		if r.Soak.ConsecutiveErrors > st.Soak.ConsecutiveErrorLimit {
-			c.halt(ctx, now, r, "", why)
-		} else {
-			c.setState(ctx, now, r, Soaking, why)
-		}
+		why := fmt.Sprintf("soak %s could not check: %s; waiting for checks to recover (%d consecutive errors)", last.Program, last.Reason, r.Soak.ConsecutiveErrors)
+		c.setState(ctx, now, r, Soaking, why)
 
 		return
 	}
@@ -791,7 +836,7 @@ func (c *Controller) recordSoak(ctx context.Context, now time.Time, r *Rollout, 
 
 	for i := range outs {
 		o := &outs[i]
-		check := SoakCheck{At: now, Program: o.program, OK: o.res.OK, Error: o.err != nil || o.res.TimedOut || o.res.ExitCode < 0, Reason: o.res.Reason}
+		check := SoakCheck{At: now, Program: o.program, OK: o.res.OK, Error: o.err != nil || o.res.CouldNotCheck(), Reason: o.res.Reason}
 		check.Updated, check.Remaining, check.Unit = parseSoakNumbers(o.res.Stdout)
 		r.Soak.Checks = append(r.Soak.Checks, check)
 

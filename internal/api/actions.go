@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
 	"time"
 
@@ -23,6 +24,8 @@ type selectorBody struct {
 type rolloutBody struct {
 	Rollout string `json:"rollout"`
 	Reason  string `json:"reason"`
+	// Pause only. A duration; empty or nonpositive takes the controller's default.
+	ExpiresIn string `json:"expiresIn"`
 }
 
 func parseSelectorBody(w http.ResponseWriter, r *http.Request) (selectorBody, targets.Selector, bool) {
@@ -131,13 +134,13 @@ func (s *Server) actionResume(w http.ResponseWriter, r *http.Request, id *Identi
 	writeJSON(w, http.StatusOK, map[string]int{"lifted": n})
 }
 
-func (s *Server) rolloutAction(w http.ResponseWriter, r *http.Request, id *Identity, act func(actor, rollout, reason string) error) {
+func (s *Server) rolloutAction(w http.ResponseWriter, r *http.Request, id *Identity, act func(actor string, body *rolloutBody) error) {
 	var body rolloutBody
 	if !readJSON(w, r, &body) || !s.authorizeRollout(w, id, body.Rollout) {
 		return
 	}
 
-	if err := act(id.Name, body.Rollout, body.Reason); err != nil {
+	if err := act(id.Name, &body); err != nil {
 		writeActionError(w, err)
 
 		return
@@ -148,17 +151,32 @@ func (s *Server) rolloutAction(w http.ResponseWriter, r *http.Request, id *Ident
 }
 
 func (s *Server) actionPause(w http.ResponseWriter, r *http.Request, id *Identity) {
-	s.rolloutAction(w, r, id, func(actor, rollout, _ string) error { return s.c.Pause(r.Context(), actor, rollout) })
+	s.rolloutAction(w, r, id, func(actor string, body *rolloutBody) error {
+		var expires time.Duration
+
+		if body.ExpiresIn != "" {
+			d, err := time.ParseDuration(body.ExpiresIn)
+			if err != nil {
+				return fmt.Errorf("expiresIn: %w", err)
+			}
+
+			expires = d
+		}
+
+		return s.c.Pause(r.Context(), reconcile.PauseRequest{Actor: actor, Rollout: body.Rollout, Expires: expires})
+	})
 }
 
 func (s *Server) actionPromote(w http.ResponseWriter, r *http.Request, id *Identity) {
-	s.rolloutAction(w, r, id, func(actor, rollout, _ string) error { return s.c.Promote(r.Context(), actor, rollout) })
+	s.rolloutAction(w, r, id, func(actor string, body *rolloutBody) error { return s.c.Promote(r.Context(), actor, body.Rollout) })
 }
 
 func (s *Server) actionAbort(w http.ResponseWriter, r *http.Request, id *Identity) {
-	s.rolloutAction(w, r, id, func(actor, rollout, _ string) error { return s.c.Abort(r.Context(), actor, rollout) })
+	s.rolloutAction(w, r, id, func(actor string, body *rolloutBody) error { return s.c.Abort(r.Context(), actor, body.Rollout) })
 }
 
 func (s *Server) actionRetry(w http.ResponseWriter, r *http.Request, id *Identity) {
-	s.rolloutAction(w, r, id, func(actor, rollout, reason string) error { return s.c.Retry(r.Context(), actor, rollout, reason) })
+	s.rolloutAction(w, r, id, func(actor string, body *rolloutBody) error {
+		return s.c.Retry(r.Context(), actor, body.Rollout, body.Reason)
+	})
 }

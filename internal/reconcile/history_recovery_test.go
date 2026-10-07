@@ -178,6 +178,33 @@ func TestOwedHistoryStopsFurtherDecisionsInTheSameTick(t *testing.T) {
 				}
 			},
 		},
+		{
+			action: "pause.expired",
+			prepare: func(t *testing.T, h *harness) {
+				t.Helper()
+				release(h, d2)
+				h.tick()
+
+				for _, rollout := range h.c.Rollouts() {
+					require.NoError(t, h.pause(rollout.ID, time.Minute))
+				}
+			},
+			check: func(t *testing.T, h *harness) {
+				t.Helper()
+
+				expired := 0
+
+				for _, rollout := range h.c.Rollouts() {
+					require.True(t, rollout.State.Active())
+
+					if rollout.PauseExpiresAt.IsZero() {
+						expired++
+					}
+				}
+
+				require.Equal(t, 1, expired)
+			},
+		},
 	} {
 		t.Run(tc.action, func(t *testing.T) {
 			h := newHarness(t, testConfig, testTargets)

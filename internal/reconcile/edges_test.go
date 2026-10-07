@@ -22,10 +22,10 @@ func TestSyncWithSpeedCreatesRolloutAtThatSpeed(t *testing.T) {
 	require.Equal(t, speedAll, h.rollout(ids[0]).Strategy)
 }
 
-func TestNoWavePolicyFlattensWavesAtCreation(t *testing.T) {
+func TestNoWaveStrategyFlattensWavesAtCreation(t *testing.T) {
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
-	require.NoError(t, h.c.SetPolicy(h.ctx, actor, "a", Policy{Mode: ModeAutomated, Strategy: speedAll}))
+	h.declare(false, map[string]config.Group{"a": {Strategy: speedAll}})
 	h.release(imgA, d2)
 
 	r := h.active("a")
@@ -79,16 +79,6 @@ func TestMixedSoakProgramsInOneBatch(t *testing.T) {
 	require.False(t, ran)
 }
 
-func TestCarefulWithNothingLeftDoesNotPause(t *testing.T) {
-	h := newHarness(t, testConfig, testTargets)
-	h.prime()
-	require.NoError(t, h.c.SetPolicy(h.ctx, actor, "side", Policy{Mode: ModeAutomated, Strategy: careful}))
-	h.release(imgS, d2)
-
-	r := h.active("side")
-	require.Equal(t, Complete, h.drive(r.ID, 10, 0).State)
-}
-
 func TestHaltSkipsRemovedTargetInBatch(t *testing.T) {
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
@@ -113,16 +103,50 @@ func TestHaltSkipsRemovedTargetInBatch(t *testing.T) {
 	require.Equal(t, PhaseFailed, h.phases(got)[tA1])
 }
 
-func TestFirstUpdateFailureHaltsBeforeSecondResultLands(t *testing.T) {
-	h := newHarness(t, testConfig, testTargets)
+func TestAnUpdateResultAfterItsBatchMovedOnChangesNothing(t *testing.T) {
+	h := newHarness(t, testConfig, retryFleet)
 	h.prime()
-	h.world.set(func(w *world) { w.updateFail[tA1] = refused })
-	h.release(imgA, d2)
-	h.tick()
+	h.world.set(func(w *world) { w.registry[imgA] = d2 })
+	h.clock.Advance(h.cfg.Registry.Poll)
 
-	r := h.active("a")
-	require.Equal(t, Halted, r.State)
-	require.Equal(t, PhaseFailed, h.phases(r)[tA2], "the second result arrives after the halt and changes nothing")
+	entered, release := h.world.gate("update:" + tN1A)
+	done := make(chan error, 1)
+
+	go func() { done <- h.c.Tick(h.ctx) }()
+
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the update did not start")
+	}
+
+	// The build lands and is seen ready while the updater still runs; another
+	// tick takes that evidence and starts the soak.
+	id := h.active("a").ID
+	h.world.set(func(w *world) { w.running[tN1A] = d2 })
+	h.clock.Advance(time.Second)
+	h.c.InspectAll(h.ctx)
+	h.clock.Advance(time.Nanosecond)
+	h.c.ProbeAll(h.ctx)
+	require.NoError(t, h.c.Tick(h.ctx))
+	require.Equal(t, Soaking, h.rollout(id).State)
+
+	// The updater's late failure belongs to a batch that has moved on.
+	h.world.set(func(w *world) { w.updateFail[tN1A] = boom })
+	release()
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("the update tick did not finish")
+	}
+
+	r := h.rollout(id)
+	require.Equal(t, Soaking, r.State)
+	require.Equal(t, PhaseReady, r.target(tN1A).Phase)
+	require.True(t, r.target(tN1A).RetryAt.IsZero())
+	require.Len(t, h.world.callsFor("update:"+tN1A), 1)
 }
 
 func TestApplyIgnoresStaleResults(t *testing.T) {
@@ -338,8 +362,11 @@ func TestUndurableRolloutWithdrawsDueSoak(t *testing.T) {
 func TestRestartClearsQuarantineFromEndedRollout(t *testing.T) {
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
-	h.world.set(func(w *world) { w.updateFail[tA1] = refused })
+	h.world.set(func(w *world) { w.soakFail[soakA] = true })
 	h.release(imgA, d2)
+	h.ticks(5, 0)
+	h.clock.Advance(20 * time.Second)
+	h.tick()
 	r := h.active("a")
 	require.Equal(t, Halted, r.State)
 

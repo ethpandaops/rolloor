@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
 	"sync"
@@ -73,7 +74,8 @@ type Controller struct {
 	desired     map[string]Desired
 	live        map[string]Live
 	degraded    map[string]string
-	policies    map[string]Policy
+	paused      bool
+	groups      map[string]config.Group
 	suspensions map[string]Suspension
 	rollouts    map[string]*Rollout
 	aborted     map[string]string
@@ -119,7 +121,8 @@ func New(ctx context.Context, opts *Options) (*Controller, error) {
 		desired:       map[string]Desired{},
 		live:          map[string]Live{},
 		degraded:      map[string]string{},
-		policies:      map[string]Policy{},
+		paused:        opts.Config.Paused,
+		groups:        maps.Clone(opts.Config.Groups),
 		suspensions:   map[string]Suspension{},
 		rollouts:      map[string]*Rollout{},
 		aborted:       map[string]string{},
@@ -152,6 +155,7 @@ func New(ctx context.Context, opts *Options) (*Controller, error) {
 	}
 
 	c.restore(snap)
+	c.flush(ctx)
 
 	var removed []string
 
@@ -175,10 +179,6 @@ func New(ctx context.Context, opts *Options) (*Controller, error) {
 func (c *Controller) restore(snap *Snapshot) {
 	for _, r := range snap.Rollouts {
 		c.rollouts[r.ID] = r
-	}
-
-	for g, p := range snap.Policies {
-		c.policies[g] = p
 	}
 
 	for _, s := range snap.Suspensions {
@@ -209,6 +209,7 @@ func (c *Controller) restore(snap *Snapshot) {
 	for _, r := range c.rollouts {
 		if _, aborted := c.aborted[r.Group]; aborted && r.State.Active() {
 			c.end(c.clock.Now(), r, Aborted, "Aborted before the last restart.")
+			c.dirty = true
 		}
 	}
 
@@ -286,6 +287,7 @@ func (c *Controller) Tick(ctx context.Context) error {
 	// made or any program runs on their behalf.
 	if c.flush(ctx) {
 		c.expireSuspensions(ctx, now)
+		c.expirePauses(ctx, now)
 		c.supersedeChangedRollouts(ctx, now)
 		c.openRollouts(ctx, now)
 		jobs = c.planRollouts(ctx, now)
@@ -638,12 +640,11 @@ func (c *Controller) observeTargets(ctx context.Context, ts []targets.Target, ho
 		defer c.probeMu.Unlock()
 	}
 
-	set := c.targets()
 	c.mu.RLock()
 
 	inputs := make([]HookInput, len(ts))
 	for i := range ts {
-		inputs[i] = c.hookInput(set, &ts[i])
+		inputs[i] = c.hookInput(&ts[i])
 	}
 
 	c.mu.RUnlock()
@@ -678,6 +679,10 @@ func (c *Controller) observeTargets(ctx context.Context, ts []targets.Target, ho
 
 			if err != nil {
 				res = hooks.Result{Program: c.programFor(t, hook), Reason: err.Error(), ExitCode: -1, RanAt: c.clock.Now()}
+			}
+
+			if res.CouldNotCheck() {
+				res.Reason = "could not check: " + res.Reason
 			}
 
 			c.mu.Lock()
@@ -809,10 +814,10 @@ type HookInput struct {
 	DesiredRef string `json:"desiredRef,omitempty"`
 }
 
-func (c *Controller) hookInput(set *targets.Set, t *targets.Target) HookInput {
+func (c *Controller) hookInput(t *targets.Target) HookInput {
 	in := HookInput{Target: *t}
 
-	if d, ok := c.desiredFor(set.Group(t), t); ok && d.Digest != "" {
+	if d, ok := c.desiredFor(t); ok && d.Digest != "" {
 		in.Desired = d.Digest
 		in.DesiredRef = DesiredRef(t.Image, d.Digest)
 	}
@@ -861,14 +866,8 @@ func (c *Controller) liveKnown(id string) (string, bool) {
 	return l.Digest, true
 }
 
-// desiredFor is the digest a target should run: a pin, else the tag's head.
-func (c *Controller) desiredFor(group string, t *targets.Target) (Desired, bool) {
-	if p, ok := c.policies[group]; ok {
-		if pin, pinned := p.Pins[t.Image]; pinned {
-			return Desired{Digest: pin}, true
-		}
-	}
-
+// desiredFor is the current head digest of a target's image tag.
+func (c *Controller) desiredFor(t *targets.Target) (Desired, bool) {
 	d, ok := c.desired[t.Image]
 
 	return d, ok
@@ -886,14 +885,6 @@ func (c *Controller) suspensionFor(t *targets.Target) *Suspension {
 	}
 
 	return found
-}
-
-func (c *Controller) policyFor(group string) Policy {
-	if p, ok := c.policies[group]; ok {
-		return p
-	}
-
-	return Policy{Mode: c.cfg.DefaultPolicy.Mode, Strategy: c.cfg.DefaultPolicy.Strategy}
 }
 
 // strategy is a named strategy, or the default when the name is empty or no

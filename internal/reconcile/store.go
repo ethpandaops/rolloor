@@ -10,7 +10,6 @@ import (
 // Snapshot is everything the controller needs back after a restart.
 type Snapshot struct {
 	Rollouts    []*Rollout
-	Policies    map[string]Policy
 	Suspensions []Suspension
 	Live        map[string]Live
 	Degraded    map[string]string
@@ -25,7 +24,6 @@ type Snapshot struct {
 type Store interface {
 	Load(ctx context.Context) (*Snapshot, error)
 	SaveRollout(ctx context.Context, r *Rollout) error
-	SavePolicy(ctx context.Context, group string, p Policy) error
 	SaveSuspension(ctx context.Context, s *Suspension) error
 	DeleteSuspension(ctx context.Context, id string) error
 	SaveLive(ctx context.Context, id string, l *Live) error
@@ -66,7 +64,6 @@ type Notifier interface {
 type MemoryStore struct {
 	mu          sync.Mutex
 	rollouts    map[string]*Rollout
-	policies    map[string]Policy
 	suspensions map[string]Suspension
 	live        map[string]Live
 	degraded    map[string]string
@@ -84,7 +81,6 @@ type MemoryStore struct {
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
 		rollouts:    map[string]*Rollout{},
-		policies:    map[string]Policy{},
 		suspensions: map[string]Suspension{},
 		live:        map[string]Live{},
 		degraded:    map[string]string{},
@@ -106,7 +102,6 @@ func (m *MemoryStore) Load(context.Context) (*Snapshot, error) {
 	}
 
 	s := &Snapshot{
-		Policies:    map[string]Policy{},
 		Live:        map[string]Live{},
 		Degraded:    map[string]string{},
 		Desired:     map[string]Desired{},
@@ -124,10 +119,6 @@ func (m *MemoryStore) Load(context.Context) (*Snapshot, error) {
 	}
 
 	sort.Slice(s.Rollouts, func(i, j int) bool { return s.Rollouts[i].ID < s.Rollouts[j].ID })
-
-	for k, v := range m.policies {
-		s.Policies[k] = v
-	}
 
 	for _, v := range m.suspensions {
 		s.Suspensions = append(s.Suspensions, v)
@@ -190,20 +181,6 @@ func (m *MemoryStore) SaveRollout(_ context.Context, r *Rollout) error {
 	}
 
 	m.rollouts[r.ID] = cloneRollout(r)
-
-	return nil
-}
-
-// SavePolicy stores a policy.
-func (m *MemoryStore) SavePolicy(_ context.Context, group string, p Policy) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if m.Fail != nil {
-		return m.Fail
-	}
-
-	m.policies[group] = p
 
 	return nil
 }

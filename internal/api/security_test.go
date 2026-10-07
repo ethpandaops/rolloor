@@ -3,7 +3,6 @@ package api
 import (
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -56,43 +55,6 @@ func TestSameOrigin(t *testing.T) {
 			}
 
 			require.Equal(t, tc.want, SameOrigin(r))
-		})
-	}
-}
-
-func TestPolicyMutationsRequireOriginAndJSONForSessions(t *testing.T) {
-	for _, tc := range []struct {
-		name        string
-		session     bool
-		origin      string
-		contentType string
-		status      int
-	}{
-		{name: "session from a sibling", session: true, origin: "https://app.rolloor.example", contentType: mediaJSON, status: http.StatusForbidden},
-		{name: "session sending text", session: true, origin: ownHTTP, contentType: mediaText, status: http.StatusUnsupportedMediaType},
-		{name: "session sending JSON", session: true, origin: ownHTTP, contentType: mediaJSON, status: http.StatusOK},
-		{name: "verified token from anywhere", origin: foreignOrigin, contentType: mediaText, status: http.StatusOK},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			f := newFixture(t)
-			f.auth.id.Session = tc.session
-
-			req := httptest.NewRequest(http.MethodPut, ownHTTP+"/api/v1/policies/a", strings.NewReader(`{"mode":"automated","strategy":"fast"}`))
-			req.Header.Set(headerOrigin, tc.origin)
-			req.Header.Set(headerContentType, tc.contentType)
-
-			recorder := httptest.NewRecorder()
-			f.srv.Config.Handler.ServeHTTP(recorder, req)
-			require.Equal(t, tc.status, recorder.Code)
-
-			group, _, ok := f.c.Group("a")
-			require.True(t, ok)
-
-			if tc.status == http.StatusOK {
-				require.Equal(t, "fast", group.Policy.Strategy)
-			} else {
-				require.Empty(t, group.Policy.Strategy)
-			}
 		})
 	}
 }

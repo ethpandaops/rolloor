@@ -133,6 +133,20 @@ func (c *Controller) readyOnBuild(rt *RolloutTarget) bool {
 	return rt.Updated && !rt.DigestSeenAt.IsZero() && r.Ready && r.LastSuccessAt.After(rt.DigestSeenAt)
 }
 
+// A missing or indeterminate observation is not evidence of a bad build.
+func (c *Controller) readinessCheckMissing(rt *RolloutTarget) bool {
+	l := c.live[rt.ID]
+	r := l.Readiness
+
+	if l.Failures > 0 || r.Ready || r.Failures == 0 || !r.ObservedAt.After(rt.DigestSeenAt) {
+		return true
+	}
+
+	probe := c.hookRuns[rt.ID][config.HookReady].Result
+
+	return probe.CouldNotCheck()
+}
+
 // heldReady reports whether a target is seen ready on its rollout's build at
 // the node and image it was admitted with, after its update was planned.
 func (c *Controller) heldReady(r *Rollout, rt *RolloutTarget) bool {

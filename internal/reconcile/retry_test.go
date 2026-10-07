@@ -15,6 +15,41 @@ const retryFleet = `
 - {id: n1/a, node: n1, weight: 100, image: org/a:t, labels: {client: a, owner: a}, hooks: {soak: soak-a}}
 `
 
+func TestAObservedBuildLostBeforeReadinessMustBeSeenAgain(t *testing.T) {
+	h := newHarness(t, testConfig, retryFleet)
+	h.prime()
+	h.world.set(func(w *world) { w.breakOnUpdate[tN1A] = true })
+	h.release(imgA, d2)
+	id := h.active("a").ID
+	h.tick()
+
+	first := h.rolloutTarget(id, tN1A)
+	require.True(t, first.Updated)
+	require.Equal(t, 1, h.rollout(id).OnNewBuild)
+
+	h.world.set(func(w *world) {
+		w.running[tN1A] = d1
+		delete(w.breakOnUpdate, tN1A)
+		delete(w.notReady, tN1A)
+	})
+	h.ticks(2, 0)
+
+	lost := h.rolloutTarget(id, tN1A)
+	require.Equal(t, PhaseUpdating, lost.Phase, "readiness on the old build cannot pass it")
+	require.False(t, lost.Updated)
+	require.True(t, lost.DigestSeenAt.IsZero())
+	require.Equal(t, 0, h.rollout(id).OnNewBuild)
+
+	h.world.set(func(w *world) { w.running[tN1A] = d2 })
+	h.tick()
+
+	again := h.rolloutTarget(id, tN1A)
+	require.Equal(t, PhaseReady, again.Phase)
+	require.True(t, again.DigestSeenAt.After(first.DigestSeenAt))
+	require.Equal(t, Complete, h.drive(id, 20, 20*time.Second).State)
+	require.Len(t, h.world.callsFor("update:"+tN1A), 1)
+}
+
 func TestUpdateProgressDeadlineSurvivesRestartAndStopsRetries(t *testing.T) {
 	cfg := replaceLine(testConfig, "retry: {limit: 1}", "retry: {limit: 5}")
 	cfg = replaceLine(cfg, "progressDeadline: 50s", "progressDeadline: 15s")
@@ -29,9 +64,10 @@ func TestUpdateProgressDeadlineSurvivesRestartAndStopsRetries(t *testing.T) {
 	h.c = h.newController()
 	h.clock.Advance(5 * time.Second)
 	h.tick()
-	r := h.rollout(id)
-	require.Equal(t, Halted, r.State)
-	require.Contains(t, r.Reason, "update failed (attempt 2 of 5): fake; progress deadline exceeded after 15s")
+	rt := h.rolloutTarget(id, tN1A)
+	require.NotEqual(t, Halted, h.rollout(id).State)
+	require.Equal(t, PhaseSkipped, rt.Phase, rt.Reason)
+	require.False(t, rt.HoldUntil.IsZero())
 	require.Len(t, h.world.callsFor("update:"+tN1A), 2)
 }
 
@@ -70,9 +106,11 @@ func TestUpdateFailureAtTheProgressDeadlineDoesNotScheduleAnotherAttempt(t *test
 	}
 
 	r := h.active("a")
-	require.Equal(t, Halted, r.State)
-	require.Contains(t, r.Reason, "update failed (attempt 1 of 5): boom; progress deadline exceeded after 50s")
-	require.True(t, r.Targets[0].RetryAt.IsZero())
+	rt := r.target(tN1A)
+	require.NotEqual(t, Halted, r.State)
+	require.Equal(t, PhaseSkipped, rt.Phase, rt.Reason)
+	require.True(t, rt.RetryAt.IsZero())
+	require.False(t, rt.HoldUntil.IsZero())
 	require.Len(t, h.world.callsFor("update:"+tN1A), 1)
 }
 
@@ -82,10 +120,12 @@ func TestZeroRetryLimitAllowsOnlyTheInitialUpdateAttempt(t *testing.T) {
 	h.world.set(func(w *world) { w.updateFail[tN1A] = boom })
 	h.release(imgA, d2)
 	r := h.active("a")
-	require.Equal(t, Halted, r.State)
-	require.Contains(t, r.Reason, "update failed (attempt 1 of 1): boom; retry limit reached")
+	rt := r.target(tN1A)
+	require.Equal(t, PhaseSkipped, rt.Phase, rt.Reason)
+	require.Equal(t, 1, rt.UpdateAttempts)
 	h.ticks(3, 20*time.Second)
-	require.Len(t, h.world.callsFor("update:"+tN1A), 1)
+	require.Equal(t, 1, h.rolloutTarget(r.ID, tN1A).UpdateAttempts, "the rollout never tries again")
+	require.NotEqual(t, Halted, h.rollout(r.ID).State)
 }
 
 func TestUpdateBackoffCapsWithoutOverflow(t *testing.T) {
@@ -150,12 +190,21 @@ func TestManualRetryStartsANewUpdateAttemptWindow(t *testing.T) {
 	h.world.set(func(w *world) { w.updateFail[tN1A] = boom })
 	h.release(imgA, d2)
 	id := h.active("a").ID
-	h.clock.Advance(10 * time.Second)
-	h.tick()
+
+	// The second attempt lands a build that never becomes ready.
+	h.world.set(func(w *world) {
+		delete(w.updateFail, tN1A)
+		w.breakOnUpdate[tN1A] = true
+	})
+
+	for i := 0; i < 20 && h.rollout(id).State != Halted; i++ {
+		h.ticks(1, 10*time.Second)
+	}
+
 	require.Equal(t, Halted, h.rollout(id).State)
 	require.Equal(t, 2, h.rolloutTarget(id, tN1A).UpdateAttempts)
-	h.world.set(func(w *world) { delete(w.updateFail, tN1A) })
-	require.NoError(t, h.c.Retry(h.ctx, actor, id, "updater recovered"))
+	h.revert(tN1A)
+	require.NoError(t, h.c.Retry(h.ctx, actor, id, "readiness fixed"))
 	require.Equal(t, Complete, h.drive(id, 20, 20*time.Second).State)
 	require.Equal(t, 1, h.rolloutTarget(id, tN1A).UpdateAttempts)
 	require.Nil(t, h.view(tN1A).Quarantine)
@@ -180,14 +229,11 @@ func TestInterruptedUpdateCannotBypassItsLimitOrDeadline(t *testing.T) {
 
 			h.tick()
 			r := h.rollout(id)
-			require.Equal(t, Halted, r.State)
+			rt := r.target(tN1A)
+			require.NotEqual(t, Halted, r.State)
+			require.Equal(t, PhaseSkipped, rt.Phase, rt.Reason)
+			require.False(t, rt.HoldUntil.IsZero(), "the interrupted update may still land")
 			require.Len(t, h.world.callsFor("update:"+tN1A), 1)
-
-			if expired {
-				require.Contains(t, r.Reason, "within 50s")
-			} else {
-				require.Contains(t, r.Reason, "retry limit reached after an interrupted update")
-			}
 		})
 	}
 }
@@ -225,7 +271,7 @@ func TestSoakExecutionErrorsAreNeutralAndResetAfterAnExecutedCheck(t *testing.T)
 	require.True(t, h.rollout(id).Batches[0].Passed)
 }
 
-func TestSoakTimeoutAndKilledProgramsAreErrorsButNonzeroExitIsFailure(t *testing.T) {
+func TestSoakIndeterminateResultsAreErrorsAndNegativeExitsFail(t *testing.T) {
 	cases := []struct {
 		name   string
 		result hooks.Result
@@ -233,24 +279,26 @@ func TestSoakTimeoutAndKilledProgramsAreErrorsButNonzeroExitIsFailure(t *testing
 	}{
 		{name: "timeout", result: hooks.Result{TimedOut: true, ExitCode: -1, Reason: "timed out"}, error: true},
 		{name: "killed", result: hooks.Result{ExitCode: -1, Reason: "killed"}, error: true},
+		{name: "could not check", result: hooks.Result{ExitCode: 3, Reason: "no baseline"}, error: true},
 		{name: "exit", result: hooks.Result{ExitCode: 1, Reason: "outside tolerance"}},
+		{name: "unexpected exit", result: hooks.Result{ExitCode: 2, Reason: "bad usage"}},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			h := newHarness(t, replaceLine(testConfig, "failureLimit: 1", "failureLimit: 0, consecutiveErrorLimit: 0"), retryFleet)
+			h := newHarness(t, replaceLine(testConfig, "failureLimit: 1", "failureLimit: 0"), retryFleet)
 			h.prime()
 			h.world.set(func(w *world) { w.runResult[soakA] = tc.result })
 			h.release(imgA, d2)
 			r := h.drive(h.active("a").ID, 4, 0)
-			require.Equal(t, Halted, r.State)
 			require.Equal(t, tc.error, r.Soak.Checks[0].Error)
 
 			if tc.error {
+				require.Equal(t, Soaking, r.State, "an indeterminate check never halts")
 				require.Equal(t, 0, r.Soak.Failures)
 				require.Equal(t, 1, r.Soak.ConsecutiveErrors)
-				require.Contains(t, r.Reason, "could not run")
 			} else {
+				require.Equal(t, Halted, r.State)
 				require.Equal(t, 1, r.Soak.Failures)
 				require.Equal(t, 0, r.Soak.ConsecutiveErrors)
 				require.Contains(t, r.Reason, "failed 1 times")

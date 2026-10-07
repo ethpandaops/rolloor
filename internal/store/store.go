@@ -25,7 +25,6 @@ CREATE TABLE IF NOT EXISTS rollouts (
 	data BLOB NOT NULL
 );
 CREATE INDEX IF NOT EXISTS rollouts_group ON rollouts(group_name, created_at);
-CREATE TABLE IF NOT EXISTS policies (group_name TEXT PRIMARY KEY, data BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS suspensions (id TEXT PRIMARY KEY, data BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS live (target_id TEXT PRIMARY KEY, data BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS degraded (target_id TEXT PRIMARY KEY, reason TEXT NOT NULL);
@@ -101,7 +100,6 @@ func (s *SQLite) Close() error {
 // Load reads everything back.
 func (s *SQLite) Load(ctx context.Context) (*reconcile.Snapshot, error) {
 	snap := &reconcile.Snapshot{
-		Policies: map[string]reconcile.Policy{},
 		Live:     map[string]reconcile.Live{},
 		Degraded: map[string]string{},
 		Desired:  map[string]reconcile.Desired{},
@@ -137,19 +135,6 @@ func (s *SQLite) Load(ctx context.Context) (*reconcile.Snapshot, error) {
 		return nil
 	}); err != nil {
 		return nil, fmt.Errorf("store: load rollouts: %w", err)
-	}
-
-	if err := s.loadKeyed(ctx, `SELECT group_name, data FROM policies`, func(key string, raw []byte) error {
-		var p reconcile.Policy
-		if err := json.Unmarshal(raw, &p); err != nil {
-			return err
-		}
-
-		snap.Policies[key] = p
-
-		return nil
-	}); err != nil {
-		return nil, fmt.Errorf("store: load policies: %w", err)
 	}
 
 	if err := s.loadJSON(ctx, `SELECT data FROM suspensions ORDER BY id`, func(raw []byte) error {
@@ -275,20 +260,6 @@ func (s *SQLite) SaveRollout(ctx context.Context, r *reconcile.Rollout) error {
 		r.ID, r.Group, string(r.State), r.CreatedAt.UTC().Format(time.RFC3339Nano), raw)
 	if err != nil {
 		return fmt.Errorf("store: save rollout %s: %w", r.ID, err)
-	}
-
-	return nil
-}
-
-// SavePolicy upserts a group's policy.
-func (s *SQLite) SavePolicy(ctx context.Context, group string, p reconcile.Policy) error {
-	raw, err := json.Marshal(p)
-	if err != nil {
-		return fmt.Errorf("store: encode policy: %w", err)
-	}
-
-	if err := s.exec(ctx, `INSERT INTO policies (group_name, data) VALUES (?, ?) ON CONFLICT(group_name) DO UPDATE SET data = excluded.data`, group, raw); err != nil {
-		return fmt.Errorf("store: save policy %s: %w", group, err)
 	}
 
 	return nil

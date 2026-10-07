@@ -51,7 +51,7 @@ h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: v
 
 .badge { display: inline-block; font-size: 12px; font-weight: 600; padding: 1px 8px; border-radius: 999px; background: var(--line); }
 .badge.sync-synced, .badge.health-healthy, .badge.state-complete { background: var(--ok-bg); color: var(--ok); }
-.badge.sync-outofsync, .badge.state-paused, .badge.state-waitingforbudget, .badge.state-waitingforsync { background: var(--warn-bg); color: var(--warn); }
+.badge.sync-outofsync, .badge.state-paused, .badge.state-waitingforbudget, .badge.paused { background: var(--warn-bg); color: var(--warn); }
 .badge.sync-unknown, .badge.health-unknown, .badge.health-suspended, .badge.state-aborted, .badge.state-superseded { background: var(--line); color: var(--muted); }
 .badge.health-progressing, .badge.state-running, .badge.state-soaking { background: var(--info-bg); color: var(--info); }
 .badge.health-degraded, .badge.state-halted { background: var(--bad-bg); color: var(--bad); }
@@ -66,6 +66,7 @@ h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: v
 .card .big { font-size: 20px; font-weight: 600; margin: 4px 0; }
 .card p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
 
+.held { background: var(--warn-bg); color: var(--warn); border-radius: 8px; padding: 8px 12px; margin: 0 0 16px; }
 .halt { background: var(--bad-bg); border: 1px solid var(--bad); border-radius: 8px; padding: 12px 14px; margin-bottom: 16px; }
 .halt h2 { margin: 0 0 6px; font-size: 16px; }
 .quarantine { background: var(--surface); border-radius: 6px; padding: 10px 12px; margin: 10px 0; }
@@ -106,7 +107,7 @@ form.inline { display: inline; }
 details.dialog { position: relative; }
 details.dialog summary { list-style: none; cursor: pointer; padding: 6px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
 details.dialog form { position: absolute; right: 0; top: 40px; z-index: 5; min-width: 300px; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 12px; display: grid; gap: 8px; box-shadow: 0 8px 24px rgba(0,0,0,.12); }
-details.policy form { position: static; box-shadow: none; grid-template-columns: auto auto auto; align-items: end; margin-bottom: 16px; }
+details.dialog p { margin: 0; font-size: 13px; }
 details.dialog label { display: grid; gap: 2px; font-size: 13px; color: var(--muted); }
 details.dialog label.check { grid-template-columns: auto 1fr; align-items: center; }
 details.dialog input, details.dialog select { font: inherit; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink); }

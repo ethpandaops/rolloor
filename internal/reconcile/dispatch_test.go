@@ -6,6 +6,8 @@ import (
 
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
+
+	"github.com/ethpandaops/rolloor/internal/config"
 )
 
 // queuedFleet is one group's two weighted targets on separate nodes, both
@@ -185,6 +187,26 @@ func TestAQueuedUpdateIsCheckedAgainBeforeItRuns(t *testing.T) {
 			},
 		},
 		{
+			name: "another tick saw its build land first",
+			change: func(t *testing.T, h *harness, _ string) {
+				t.Helper()
+				h.clock.Advance(time.Second)
+				h.world.set(func(w *world) { w.running[tN2A] = d2 })
+				h.c.InspectAll(h.ctx)
+				require.NoError(t, h.c.Tick(h.ctx))
+			},
+			phase: PhaseUpdating,
+			after: func(t *testing.T, h *harness, rollout string) {
+				t.Helper()
+
+				rt := h.rolloutTarget(rollout, tN2A)
+				require.True(t, rt.UpdateDone)
+				require.False(t, rt.DigestSeenAt.IsZero())
+				require.Equal(t, rt.DigestSeenAt, rt.UpdatedAt, "its deadline starts when the build is seen")
+				require.Equal(t, Complete, h.drive(rollout, 5, 0).State)
+			},
+		},
+		{
 			name: "another tick already skipped the target",
 			change: func(t *testing.T, h *harness, _ string) {
 				t.Helper()
@@ -194,12 +216,28 @@ func TestAQueuedUpdateIsCheckedAgainBeforeItRuns(t *testing.T) {
 			phase: PhaseSkipped,
 		},
 		{
+			name: "the group was paused by config",
+			change: func(t *testing.T, h *harness, _ string) {
+				t.Helper()
+				h.declare(false, map[string]config.Group{"a": {Paused: true}})
+			},
+			phase: PhasePending,
+			after: func(t *testing.T, h *harness, rollout string) {
+				t.Helper()
+				h.ticks(2, 0)
+				require.Empty(t, h.world.callsFor("update:"+tN2A))
+				require.True(t, h.rolloutTarget(rollout, tN2A).UpdatedAt.IsZero())
+				h.declare(false, nil)
+				updatedLater(t, h, rollout)
+			},
+		},
+		{
 			name: "an earlier decision is still owed to the store",
 			change: func(t *testing.T, h *harness, rollout string) {
 				t.Helper()
 
 				h.store.FailRollouts = errFake
-				require.ErrorIs(t, h.c.Pause(h.ctx, actor, rollout), errFake)
+				require.ErrorIs(t, h.pause(rollout, 0), errFake)
 				h.store.FailRollouts = nil
 			},
 			phase: PhasePending, after: updatedLater,
@@ -361,6 +399,27 @@ func TestAQueuedUpdateRunsTheTargetAsItIsWhenDispatched(t *testing.T) {
 
 	require.Equal(t, []string{"update:n2/a:fresh"}, h.world.callsFor("update:"+tN2A))
 	require.Equal(t, 1, h.rolloutTarget(id, tN2A).UpdateAttempts)
+}
+
+func TestAQueuedUpdateStartsItsClockWhenItIsDispatched(t *testing.T) {
+	h, id, finish := queueUpdates(t, queuedFleet)
+	planned := h.clock.Now()
+	require.True(t, h.rolloutTarget(id, tN2A).UpdatedAt.IsZero(), "a queued update has not started its deadline")
+
+	// The queued update waits for a worker for longer than the deadline.
+	h.clock.Advance(h.cfg.Strategy.ProgressDeadline + time.Second)
+	require.NoError(t, h.c.Tick(h.ctx))
+	require.Equal(t, PhaseUpdating, h.rolloutTarget(id, tN2A).Phase, "an unstarted update cannot time out in the queue")
+	finish()
+
+	rt := h.rolloutTarget(id, tN2A)
+	require.Equal(t, PhaseUpdating, rt.Phase, rt.Reason)
+	require.Equal(t, 1, rt.UpdateAttempts)
+	require.Len(t, h.world.callsFor("update:"+tN2A), 1)
+	require.True(t, rt.UpdatedAt.After(planned.Add(h.cfg.Strategy.ProgressDeadline)), "the clock starts at dispatch")
+
+	require.Equal(t, Complete, h.drive(id, 5, 0).State)
+	require.Equal(t, PhasePassed, h.rolloutTarget(id, tN2A).Phase)
 }
 
 func TestARestartCountsAnUpdateStoredAsDispatched(t *testing.T) {

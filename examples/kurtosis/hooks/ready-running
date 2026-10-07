@@ -2,14 +2,12 @@
 # Ready when the container is running. For containers with no API of their
 # own, such as validator clients.
 set -euo pipefail
-source "$(dirname "$0")/lib.sh"
+source "$(dirname "$0")/lib.sh" || exit 3
 
 target=$(cat)
 name=$(jq -r .extra.container <<<"$target")
 
-details=$(updater_get "/v1/containers/details?name=${name}") || { echo "updater unreachable"; exit 1; }
-running=$(container_field "$details" running)
-
-[ "$running" = true ] || { echo "$name is not running"; exit 1; }
+state=$(container_state) || answer 3 "the updater gives no clear answer"
+[ "$state" = running ] || answer 1 "$name is $state"
 
 echo "$name running"

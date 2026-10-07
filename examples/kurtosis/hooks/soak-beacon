@@ -1,54 +1,88 @@
 #!/usr/bin/env bash
-# Passes when the updated beacon nodes are no further behind the head than
-# the remaining ones (or 2 slots, whichever is more) and keep at least half
-# the remaining ones' median peer count. A remaining node that does not
-# answer is left out; an updated one that does not answer fails.
+# Passes when updated beacon nodes trail the head no more than remaining ones
+# (or 2 slots) with half the remaining median peers. Stopped or offline nodes
+# fail when updated and sit out when remaining; an unknown node means unknown.
 set -euo pipefail
+source "$(dirname "$0")/lib.sh" || exit 3
 
 doc=$(cat)
+updated=$(jq -c '.updated[]?' <<<"$doc")
+remaining=$(jq -c '.remaining[]?' <<<"$doc")
+[ -n "$updated" ] || answer 3 "the soak document lists no updated nodes"
 
-# probe URL: prints "<slots behind> <peers>", or fails.
-probe() {
-  local s p
-  s=$(curl -fsS --max-time 10 "$1/eth/v1/node/syncing") || return 1
-  p=$(curl -fsS --max-time 10 "$1/eth/v1/node/peer_count") || return 1
-  [ "$(jq -r .data.el_offline <<<"$s")" = false ] || return 1
-  echo "$(jq -r .data.sync_distance <<<"$s") $(jq -r .data.connected <<<"$p")"
+# measure TARGET: sets verdict 0 with lag and peers when the beacon node
+# answers, 1 when it is stopped, missing or has its execution client offline,
+# or 3 when that cannot be told, with why for the last two.
+measure() {
+  local url s p offline state
+  target=$1
+  url=$(jq -r .extra.beacon <<<"$target")
+  verdict=0 why=
+
+  if s=$(curl -fsS --max-time 10 "$url/eth/v1/node/syncing") && p=$(curl -fsS --max-time 10 "$url/eth/v1/node/peer_count"); then
+    lag=$(jq -r .data.sync_distance <<<"$s")
+    peers=$(jq -r .data.connected <<<"$p")
+    offline=$(jq -r .data.el_offline <<<"$s")
+
+    if [ "$offline" = true ]; then
+      verdict=1 why="$url has its execution client offline"
+    elif [ "$offline" != false ] || ! [[ $lag =~ ^[0-9]+$ && $peers =~ ^[0-9]+$ ]]; then
+      verdict=3 why="$url gave incomplete sync or peer state"
+    fi
+
+    return
+  fi
+
+  if ! state=$(container_state); then
+    verdict=3 why="$url does not answer and the updater gives no clear answer"
+  elif [ "$state" = running ]; then
+    verdict=3 why="$url does not answer while its container runs"
+  else
+    verdict=1 why="$url does not answer; its container is $state"
+  fi
 }
 
 u_lag=0 u_peers=
-for url in $(jq -r '.updated[].extra.beacon' <<<"$doc"); do
-  read -r lag peers < <(probe "$url") || { echo "updated node $url does not answer"; exit 1; }
-  [ "$lag" -gt "$u_lag" ] && u_lag=$lag
+while read -r node; do
+  measure "$node"
+  [ "$verdict" -eq 0 ] || answer "$verdict" "updated node $why"
+  [ "$lag" -le "$u_lag" ] || u_lag=$lag
   if [ -z "$u_peers" ] || [ "$peers" -lt "$u_peers" ]; then u_peers=$peers; fi
-done
+done <<<"$updated"
 
-r_lag=0 r_peers=()
-for url in $(jq -r '.remaining[].extra.beacon' <<<"$doc"); do
-  read -r lag peers < <(probe "$url") || continue
-  [ "$lag" -gt "$r_lag" ] && r_lag=$lag
-  r_peers+=("$peers")
-done
+r_lag=0 r_peers=() left_out=0
+while read -r node; do
+  [ -n "$node" ] || continue
+  measure "$node"
+
+  case $verdict in
+    0)
+      [ "$lag" -le "$r_lag" ] || r_lag=$lag
+      r_peers+=("$peers")
+      ;;
+    1) left_out=$((left_out + 1)) ;;
+    *) answer 3 "remaining node $why" ;;
+  esac
+done <<<"$remaining"
 
 numbers="updated=${u_lag} remaining=${r_lag} unit=slots"
 allowed=$(( r_lag > 2 ? r_lag : 2 ))
+note=
+[ "$left_out" -eq 0 ] || note="; ${left_out} remaining left out, stopped or offline"
 
 if [ "$u_lag" -gt "$allowed" ]; then
-  printf 'updated nodes are %s slots behind; remaining at most %s\n%s\n' "$u_lag" "$r_lag" "$numbers"
-  exit 1
+  answer 1 "updated nodes are ${u_lag} slots behind; remaining at most ${r_lag}${note}" "$numbers"
 fi
 
 if [ "${#r_peers[@]}" -eq 0 ]; then
-  [ "$u_peers" -gt 0 ] || { printf 'an updated node has no peers\n%s\n' "$numbers"; exit 1; }
-  printf 'updated at most %s slots behind with at least %s peers; nothing left to compare against\n%s\n' "$u_lag" "$u_peers" "$numbers"
-  exit 0
+  [ "$u_peers" -gt 0 ] || answer 1 "an updated node has no peers${note}" "$numbers"
+  answer 0 "updated at most ${u_lag} slots behind with at least ${u_peers} peers; nothing left to compare against${note}" "$numbers"
 fi
 
 median=$(printf '%s\n' "${r_peers[@]}" | sort -n | awk '{a[NR]=$1} END {print a[int(NR/2)+1]}')
 
 if [ $(( u_peers * 2 )) -lt "$median" ]; then
-  printf 'an updated node has %s peers; the remaining median is %s\n%s\n' "$u_peers" "$median" "$numbers"
-  exit 1
+  answer 1 "an updated node has ${u_peers} peers; the remaining median is ${median}${note}" "$numbers"
 fi
 
-printf 'updated at most %s slots behind with at least %s peers; remaining at most %s, median %s peers\n%s\n' "$u_lag" "$u_peers" "$r_lag" "$median" "$numbers"
+answer 0 "updated at most ${u_lag} slots behind with at least ${u_peers} peers; remaining at most ${r_lag}, median ${median} peers${note}" "$numbers"

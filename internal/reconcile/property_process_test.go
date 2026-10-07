@@ -89,14 +89,6 @@ func (p *process) SaveRollout(ctx context.Context, r *Rollout) error {
 	return nil
 }
 
-func (p *process) SavePolicy(ctx context.Context, group string, pol Policy) error {
-	if !p.lands() {
-		return nil
-	}
-
-	return p.MemoryStore.SavePolicy(ctx, group, pol)
-}
-
 func (p *process) SaveSuspension(ctx context.Context, s *Suspension) error {
 	if !p.lands() {
 		return nil

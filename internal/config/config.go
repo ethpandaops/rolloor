@@ -38,15 +38,17 @@ type Config struct {
 	Hooks            Hooks            `yaml:"hooks"`
 	Inspect          Inspect          `yaml:"inspect"`
 	ReadinessProbe   ReadinessProbe   `yaml:"readinessProbe"`
-	// Strategy is how every group rolls out unless its policy names one of
+	// Strategy is how every group rolls out unless Groups names one of
 	// Strategies. A named strategy starts from Strategy and overrides only
 	// the fields it sets.
 	Strategy   Strategy            `yaml:"strategy"`
 	Strategies map[string]Strategy `yaml:"-"`
-	// DefaultPolicy applies to every group without a stored policy.
-	DefaultPolicy Policy `yaml:"defaultPolicy"`
-	Auth          Auth   `yaml:"auth"`
-	Log           Log    `yaml:"log"`
+	// Paused holds every group: no batch is admitted and no update starts.
+	Paused bool `yaml:"paused"`
+	// Groups are per-group settings keyed by group label value.
+	Groups map[string]Group `yaml:"groups"`
+	Auth   Auth             `yaml:"auth"`
+	Log    Log              `yaml:"log"`
 
 	// RawStrategies holds the strategies section until each is decoded on
 	// top of Strategy.
@@ -112,8 +114,6 @@ type Strategy struct {
 	// share of the rollout's nodes. A batch takes every target the group has
 	// on each node it picks.
 	BatchSize Fraction `yaml:"batchSize"`
-	// PauseAfterFirstBatch waits for a promote once batch 1 has passed.
-	PauseAfterFirstBatch bool `yaml:"pauseAfterFirstBatch"`
 	// Waves nil means true: batches follow the wave label.
 	Waves            *bool         `yaml:"waves"`
 	ProgressDeadline time.Duration `yaml:"progressDeadline" default:"10m"`
@@ -154,15 +154,15 @@ type Soak struct {
 	Duration time.Duration `yaml:"duration" default:"10m"`
 	Interval time.Duration `yaml:"interval" default:"1m"`
 	// FailureLimit is how many checks may fail before the rollout halts.
-	FailureLimit          int `yaml:"failureLimit" default:"1"`
-	ConsecutiveErrorLimit int `yaml:"consecutiveErrorLimit" default:"4"`
+	FailureLimit int `yaml:"failureLimit" default:"1"`
 }
 
-// Policy is a group's stored policy; here it is the default.
-type Policy struct {
-	Mode string `yaml:"mode" default:"automated"`
+// Group is one group's declared settings.
+type Group struct {
+	// Paused holds the group: no batch is admitted and no update starts.
+	Paused bool `yaml:"paused" json:"paused"`
 	// Strategy names one of the configured strategies; empty is the default.
-	Strategy string `yaml:"strategy"`
+	Strategy string `yaml:"strategy" json:"strategy,omitempty"`
 }
 
 // Auth configures sign-in.
@@ -346,12 +346,8 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	if _, ok := c.StrategyNamed(c.DefaultPolicy.Strategy); !ok {
-		return fmt.Errorf("config: defaultPolicy.strategy %q is not a strategy (have %v)", c.DefaultPolicy.Strategy, c.StrategyNames())
-	}
-
-	if c.DefaultPolicy.Mode != "automated" && c.DefaultPolicy.Mode != "manual" {
-		return fmt.Errorf("config: defaultPolicy.mode must be automated or manual")
+	if err := c.ValidateGroups(c.Groups); err != nil {
+		return err
 	}
 
 	switch c.Auth.Mode {
@@ -368,6 +364,21 @@ func (c *Config) Validate() error {
 		}
 	default:
 		return fmt.Errorf("config: auth.mode must be none or oidc")
+	}
+
+	return nil
+}
+
+// ValidateGroups checks group settings against the configured strategies.
+func (c *Config) ValidateGroups(groups map[string]Group) error {
+	for name, g := range groups {
+		if name == "" {
+			return fmt.Errorf("config: groups need a name")
+		}
+
+		if _, ok := c.StrategyNamed(g.Strategy); !ok {
+			return fmt.Errorf("config: groups.%s.strategy %q is not a strategy (have %v)", name, g.Strategy, c.StrategyNames())
+		}
 	}
 
 	return nil
@@ -412,10 +423,6 @@ func (s *Strategy) validate(field string) error {
 
 	if s.Soak.FailureLimit < 0 {
 		return fmt.Errorf("config: %s.soak.failureLimit must not be negative", field)
-	}
-
-	if s.Soak.ConsecutiveErrorLimit < 0 {
-		return fmt.Errorf("config: %s.soak.consecutiveErrorLimit must not be negative", field)
 	}
 
 	return nil

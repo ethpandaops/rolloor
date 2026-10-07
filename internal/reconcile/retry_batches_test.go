@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/ethpandaops/rolloor/internal/config"
 )
 
 const (
@@ -17,18 +19,18 @@ const (
 )
 
 // alphaRetried are alpha's targets on node-1 and node-2: its first batch.
-var alphaRetried = []string{"node-1/agent", "node-1/server", "node-2/agent", "node-2/server"}
+var alphaRetried = []string{"node-1/agent", "node-1/server", tNode2Agent, tNode2Server}
 
-// retryConfig is the usage environment with a strategy whose updates give up
-// after one failed attempt, and a budget.
+// retryConfig is the usage environment with a strategy and a budget.
 func retryConfig(strategy, budget string) string {
-	cfg := replaceLine(usageConfig, "firstBatch: 1, batchSize: 2", strategy+", retry: {limit: 1}")
+	cfg := replaceLine(usageConfig, "firstBatch: 1, batchSize: 2", strategy)
 
 	return replaceLine(cfg, "maxUnavailable: 25%", "maxUnavailable: "+budget)
 }
 
-// haltAlpha ships alpha a build whose updates fail on node-1 and node-2 until
-// the rollout halts there; then the updater recovers.
+// haltAlpha ships alpha a build that never becomes ready on node-1 and
+// node-2, so the rollout halts there; then those targets are put back on
+// their old build by hand and seen so.
 func haltAlpha(t *testing.T, cfg string) (*harness, RolloutView) {
 	t.Helper()
 
@@ -37,14 +39,17 @@ func haltAlpha(t *testing.T, cfg string) (*harness, RolloutView) {
 		w.running[tObs1Server] = d2
 
 		for _, id := range alphaRetried {
-			w.updateFail[id] = boom
+			w.breakOnUpdate[id] = true
 		}
 	})
 	h.release(imgAlpha, d2)
 
-	r := h.until(h.active(clientAlpha).ID, Halted, 20)
+	r := h.until(h.active(clientAlpha).ID, Halted, 30)
 	require.Equal(t, [][]string{{retryNodeOne, retryNodeTwo}}, batchNodes(&r))
-	h.world.set(func(w *world) { clear(w.updateFail) })
+	h.revert(alphaRetried...)
+	h.c.InspectAll(h.ctx)
+	h.clock.Advance(time.Nanosecond)
+	h.c.ProbeAll(h.ctx)
 
 	return h, r
 }
@@ -219,17 +224,21 @@ func TestRetryVerifiesLandedTargetsBeforeLiftingTheirQuarantine(t *testing.T) {
 func TestRetryBatchIgnoresWavesItsHaltedBatchSpanned(t *testing.T) {
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
-	require.NoError(t, h.c.SetPolicy(h.ctx, actor, "a", Policy{Mode: ModeManual, Strategy: wavesStrategy}))
-	h.world.set(func(w *world) { w.updateFail[tA3] = boom })
+	h.declare(false, map[string]config.Group{"a": {Paused: true, Strategy: wavesStrategy}})
+	h.world.set(func(w *world) { w.breakOnUpdate[tA3] = true })
 	h.release(imgA, d2)
 
 	r := h.active("a")
-	require.Equal(t, WaitingForSync, r.State)
+	require.Empty(t, r.Batches)
 
 	// Synced without waves, one batch takes waves 0 and 1 and halts.
 	_, err := h.c.Sync(h.ctx, SyncRequest{Actor: actor, Selector: mustSel("client=a"), Strategy: speedAll})
 	require.NoError(t, err)
-	h.tick()
+	h.declare(false, map[string]config.Group{"a": {Strategy: wavesStrategy}})
+
+	for i := 0; i < 20 && h.rollout(r.ID).State != Halted; i++ {
+		h.ticks(1, 20*time.Second)
+	}
 
 	r = h.rollout(r.ID)
 	require.Equal(t, Halted, r.State, r.Reason)
@@ -242,9 +251,9 @@ func TestRetryBatchIgnoresWavesItsHaltedBatchSpanned(t *testing.T) {
 	_, err = h.c.Sync(h.ctx, SyncRequest{Actor: actor, Selector: mustSel("client=a"), Strategy: wavesStrategy})
 	require.NoError(t, err)
 	require.Equal(t, Halted, h.rollout(r.ID).State)
-	h.world.set(func(w *world) { clear(w.updateFail) })
+	h.revert(tA3)
 	h.clock.Advance(h.cfg.Strategy.ProgressDeadline + time.Second)
-	require.NoError(t, h.c.Retry(h.ctx, actor, r.ID, "updater recovered"))
+	require.NoError(t, h.c.Retry(h.ctx, actor, r.ID, "readiness fixed"))
 	h.tick()
 
 	r = h.rollout(r.ID)

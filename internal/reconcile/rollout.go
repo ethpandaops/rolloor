@@ -63,6 +63,7 @@ func (c *Controller) end(now time.Time, r *Rollout, state RolloutState, reason s
 	r.Reason = reason
 	r.UpdatedAt = now
 	r.EndedAt = now
+	r.PausePending, r.PauseExpiresAt = false, time.Time{}
 
 	for i := range r.Targets {
 		rt := &r.Targets[i]
@@ -119,18 +120,13 @@ func (c *Controller) openRollouts(ctx context.Context, now time.Time) {
 			continue
 		}
 
-		policy := c.policyFor(group)
-		r := c.newRollout(now, group, policy, eligible, desired, from, set)
-
-		if policy.Mode == ModeManual {
-			r.State = WaitingForSync
-			r.Reason = fmt.Sprintf("Manual policy. Build %s is waiting for a sync.", r.DigestShort())
-		}
+		strategy := c.groups[group].Strategy
+		r := c.newRollout(now, group, strategy, eligible, desired, from, set)
 
 		c.rollouts[r.ID] = r
 		_ = c.saveRollout(ctx, r)
 		c.event(ctx, now, &Event{Actor: ControllerActor, Action: eventRolloutCreated, Group: group, Rollout: r.ID,
-			Reason: fmt.Sprintf("%d targets to %s (%s)", len(eligible), r.DigestShort(), strategyLabel(policy.Strategy))})
+			Reason: fmt.Sprintf("%d targets to %s (%s)", len(eligible), r.DigestShort(), strategyLabel(strategy))})
 	}
 }
 
@@ -145,7 +141,7 @@ func (c *Controller) groupDesiredKey(group string, set *targets.Set) string {
 			continue
 		}
 
-		if d, ok := c.desiredFor(group, t); ok && d.Digest != "" {
+		if d, ok := c.desiredFor(t); ok && d.Digest != "" {
 			desired[t.Image] = d.Digest
 		}
 	}
@@ -164,7 +160,7 @@ func (c *Controller) outOfSync(group string, set *targets.Set) (eligible []*targ
 			continue
 		}
 
-		d, ok := c.desiredFor(group, t)
+		d, ok := c.desiredFor(t)
 		if !ok || d.Digest == "" {
 			continue
 		}
@@ -202,12 +198,12 @@ func (c *Controller) outOfSync(group string, set *targets.Set) (eligible []*targ
 	return eligible, desired, from
 }
 
-// newRollout sorts targets not ready at creation first, then wave, node and id.
-func (c *Controller) newRollout(now time.Time, group string, policy Policy, eligible []*targets.Target, desired, from map[string]string, set *targets.Set) *Rollout {
+// newRollout fixes observation-based priority when an operation begins.
+func (c *Controller) newRollout(now time.Time, group, strategy string, eligible []*targets.Target, desired, from map[string]string, set *targets.Set) *Rollout {
 	r := &Rollout{
 		ID:              c.newID(),
 		Group:           group,
-		Strategy:        policy.Strategy,
+		Strategy:        strategy,
 		Desired:         desired,
 		GroupDesiredKey: c.groupDesiredKey(group, set),
 		Revisions:       map[string]string{},
@@ -224,7 +220,7 @@ func (c *Controller) newRollout(now time.Time, group string, policy Policy, elig
 		}
 	}
 
-	st := c.strategy(policy.Strategy)
+	st := c.strategy(strategy)
 
 	for _, t := range eligible {
 		wave := set.Wave(t)
@@ -328,6 +324,12 @@ func (c *Controller) startBatch(ctx context.Context, now time.Time, r *Rollout, 
 	remaining := c.remaining(r, set, now)
 	if len(remaining) == 0 {
 		c.finish(ctx, now, r, Complete, completeReason(r))
+
+		return
+	}
+
+	if c.groupPaused(r.Group) {
+		c.setState(ctx, now, r, Running, c.configPauseReason(r.Group))
 
 		return
 	}

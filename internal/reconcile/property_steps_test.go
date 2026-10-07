@@ -35,10 +35,10 @@ var propActions = []propAction{
 	{2, (*sim).abort},
 	{3, (*sim).pause},
 	{3, (*sim).promote},
+	{4, (*sim).configure},
 	{3, (*sim).sync},
 	{2, (*sim).suspend},
 	{2, (*sim).resume},
-	{2, (*sim).policy},
 	{2, (*sim).edit},
 	{2, (*sim).restart},
 	{1, (*sim).crash},
@@ -195,7 +195,7 @@ func (s *sim) pick(states ...RolloutState) (RolloutView, bool) {
 	return found[s.rng.IntN(len(found))], true
 }
 
-var activeStates = []RolloutState{WaitingForSync, Running, Soaking, Paused, WaitingForBudget, Halted}
+var activeStates = []RolloutState{Running, Soaking, Paused, WaitingForBudget, Halted}
 
 func (s *sim) retry() string {
 	if s.down {
@@ -233,7 +233,10 @@ func (s *sim) pause() string {
 		return "pause: nothing active"
 	}
 
-	return fmt.Sprintf("pause %s: %v", r.ID, s.h.c.Pause(s.h.ctx, actor, r.ID))
+	expires := []time.Duration{0, 2 * time.Minute, time.Hour}[s.rng.IntN(3)]
+	err := s.h.c.Pause(s.h.ctx, PauseRequest{Actor: actor, Rollout: r.ID, Expires: expires})
+
+	return fmt.Sprintf("pause %s for %s: %v", r.ID, expires, err)
 }
 
 func (s *sim) promote() string {
@@ -310,24 +313,68 @@ func (s *sim) lift(sel targets.Selector) {
 	s.suspended = slices.DeleteFunc(s.suspended, func(sp propSuspension) bool { return sp.sel.String() == sel.String() })
 }
 
-func (s *sim) policy() string {
+// configure is the config file changing a pause or a group's strategy; an
+// active pause is lifted half the time, so pauses come and go.
+func (s *sim) configure() string {
+	paused, groups := s.h.cfg.Paused, map[string]config.Group{}
+
+	for g, gc := range s.h.cfg.Groups {
+		groups[g] = gc
+	}
+
+	var held []string
+
+	for _, g := range propGroups {
+		if groups[g].Paused {
+			held = append(held, g)
+		}
+	}
+
+	var what string
+
+	switch {
+	case (paused || len(held) > 0) && s.rng.IntN(2) == 0:
+		if paused {
+			paused, what = false, "paused=false"
+		} else {
+			g := held[s.rng.IntN(len(held))]
+			gc := groups[g]
+			gc.Paused = false
+			groups[g], what = gc, g+".paused=false"
+		}
+	case s.rng.IntN(4) == 0:
+		paused, what = true, "paused=true"
+	default:
+		g := s.randomGroup()
+		gc := groups[g]
+
+		if s.rng.IntN(2) == 0 {
+			gc.Paused, what = true, g+".paused=true"
+		} else {
+			gc.Strategy = []string{"", careful, "flat"}[s.rng.IntN(3)]
+			what = fmt.Sprintf("%s.strategy=%q", g, gc.Strategy)
+		}
+
+		groups[g] = gc
+	}
+
+	return "config " + what + s.declare(paused, groups)
+}
+
+// declare writes pause and group settings to the config file; a running
+// process picks them up as its watcher would.
+func (s *sim) declare(paused bool, groups map[string]config.Group) string {
+	s.h.cfg.Paused, s.h.cfg.Groups = paused, groups
+
 	if s.down {
-		return "policy (no process)"
+		return " (no process)"
 	}
 
-	g := s.randomGroup()
-	p := Policy{Mode: []string{ModeAutomated, ModeManual}[s.rng.IntN(2)]}
-
-	if builds := s.builds[g]; len(builds) > 0 && s.rng.IntN(3) == 0 {
-		p.Pins = map[string]string{propImage(g): builds[s.rng.IntN(len(builds))]}
+	if err := s.h.c.ConfigureGroups(s.h.ctx, paused, groups); err != nil {
+		s.violation("the controller refused a valid config: %v", err)
 	}
 
-	err := s.h.c.SetPolicy(s.h.ctx, actor, g, p)
-	if err == nil {
-		s.modes[g], s.pins[g] = p.Mode, p.Pins
-	}
-
-	return fmt.Sprintf("policy %s mode=%s pins=%v: %v", g, p.Mode, p.Pins, err)
+	return ""
 }
 
 func (s *sim) edit() string {

@@ -38,7 +38,6 @@ type RolloutState string
 // Rollout states. Terminal ones are Complete, Halted-then-Superseded, Aborted
 // and Superseded; Halted itself waits for a retry or a new digest.
 const (
-	WaitingForSync   RolloutState = "WaitingForSync"
 	Running          RolloutState = "Running"
 	Soaking          RolloutState = "Soaking"
 	Paused           RolloutState = "Paused"
@@ -52,28 +51,13 @@ const (
 // Active reports whether the controller still has work to do on this state.
 func (s RolloutState) Active() bool {
 	switch s {
-	case WaitingForSync, Running, Soaking, Paused, WaitingForBudget, Halted:
+	case Running, Soaking, Paused, WaitingForBudget, Halted:
 		return true
 	case Aborted, Superseded, Complete:
 		return false
 	}
 
 	return false
-}
-
-// Policy modes.
-const (
-	ModeAutomated = "automated"
-	ModeManual    = "manual"
-)
-
-// Policy is what a group has chosen.
-type Policy struct {
-	Mode string `json:"mode"`
-	// Strategy names a configured strategy; empty is the default.
-	Strategy string `json:"strategy,omitempty"`
-	// Pins hold an image at a digest regardless of the tag.
-	Pins map[string]string `json:"pins,omitempty"`
 }
 
 // Suspension keeps matching targets out of every rollout until it expires.
@@ -231,7 +215,8 @@ type Rollout struct {
 	Human bool `json:"human"`
 	Force bool `json:"force"`
 
-	PausePending bool `json:"pausePending,omitempty"`
+	PausePending   bool      `json:"pausePending,omitempty"`
+	PauseExpiresAt time.Time `json:"pauseExpiresAt,omitzero"`
 
 	Targets []RolloutTarget `json:"targets"`
 	Batches []Batch         `json:"batches"`

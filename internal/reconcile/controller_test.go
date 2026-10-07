@@ -56,7 +56,6 @@ func TestNewValidatesOptionsAndRestores(t *testing.T) {
 	h.release(imgA, d2)
 	_, err = h.c.Suspend(h.ctx, SuspendRequest{Actor: actor, Selector: mustSel("node=b-1"), Reason: "r"})
 	require.NoError(t, err)
-	require.NoError(t, h.c.SetPolicy(h.ctx, actor, "b", Policy{Mode: ModeManual}))
 	h.tick()
 
 	restarted := h.newController()
@@ -64,7 +63,6 @@ func TestNewValidatesOptionsAndRestores(t *testing.T) {
 	require.Len(t, r, 1)
 	require.Equal(t, Soaking, r[0].State)
 	require.Len(t, restarted.Suspensions(), 1)
-	require.Equal(t, ModeManual, restarted.Fleet().Groups[1].Policy.Mode)
 	require.Equal(t, Healthy, mustView(t, restarted, tA1).Health)
 	require.Equal(t, h.view(tA1).Readiness, mustView(t, restarted, tA1).Readiness)
 
@@ -198,7 +196,7 @@ func TestViewsCoverEveryShape(t *testing.T) {
 	require.Equal(t, "abc", shortDigest("abc"))
 	require.Equal(t, "none", shortDigest(""))
 	require.Equal(t, "0%", pct(1, 0))
-	require.Equal(t, "waitingforsync", lower(WaitingForSync))
+	require.Equal(t, "waitingforbudget", lower(WaitingForBudget))
 	require.Equal(t, Unknown, worseSync(OutOfSync, Unknown))
 	require.Equal(t, OutOfSync, worseSync(OutOfSync, Synced))
 	require.Equal(t, Degraded, worseHealth(Progressing, Degraded))
@@ -259,7 +257,6 @@ func TestMemoryStoreEventsFilterAndFail(t *testing.T) {
 
 	m.Fail = errFake
 	require.ErrorIs(t, m.SaveRollout(ctx, &Rollout{}), errFake)
-	require.ErrorIs(t, m.SavePolicy(ctx, "g", Policy{}), errFake)
 	require.ErrorIs(t, m.SaveSuspension(ctx, &Suspension{}), errFake)
 	require.ErrorIs(t, m.DeleteSuspension(ctx, "x"), errFake)
 	require.ErrorIs(t, m.SaveLive(ctx, "x", &Live{}), errFake)

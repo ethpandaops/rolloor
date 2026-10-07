@@ -13,16 +13,18 @@ rolloor rolls container builds across a fleet in health-gated batches under a di
 
 ## Hooks
 
-Programs in `hooks.dir` read JSON; exit 0 means yes, stdout's first line gives the reason. Targets may override defaults.
+Programs in `hooks.dir` read JSON. Exit 0 means yes, exit 1 means no, and exit 3 means **could not check**; stdout's first line gives the reason. Exec failures, timeouts and killed programs are indeterminate like exit 3. Targets may override defaults.
 
-| hook | stdin | exit 0 means |
-|---|---|---|
-| `inspect` | target | prints the running digest or `none` |
-| `update` | target with `desired`, `desiredRef` | an update to exactly that digest started |
-| `ready` | target | the container is available now |
-| `soak` | `{updated, remaining, rollout}` | updated targets are no worse than the rest |
+| hook | stdin | exit 0 | exit 1 | exit 3 or runner error |
+|---|---|---|---|---|
+| `inspect` | target | prints the running digest or `none` | failed observation | failed observation, reason says could not check |
+| `update` | target with `desired`, `desiredRef` | update accepted | failed attempt, retried | failed attempt, retried |
+| `ready` | target | target is available now | negative readiness observation | failed readiness observation, reason says could not check |
+| `soak` | `{updated, remaining, rollout}` | updated targets are no worse than the rest | negative comparison, counts toward `failureLimit` | neutral error; wait and retry, never halt on its own |
 
 `ready` ignores desired digests and runs outside rollouts too. Hooks must be idempotent: interrupted updates may repeat, observed landed updates do not.
+
+Each `updated` soak entry includes `updatedAt` in RFC 3339, when inspect first observed its new digest. Programs can exclude warm-up using that time; `remaining` entries are unchanged. The diagnostic `rolloor hook soak` command has no rollout observation and uses its invocation time instead.
 
 ## Guarantees
 
@@ -33,26 +35,38 @@ Programs in `hooks.dir` read JSON; exit 0 means yes, stdout's first line gives t
 - [`TestGuaranteeHaltStopsOpenBatch`](internal/reconcile/guarantees_test.go): a halt stops the open batch and the rest until a newer build or a retry.
 - [`TestGuaranteeSuspendedTargetsNeverUpdate`](internal/reconcile/guarantees_test.go): no update is dispatched to a suspended target; an already-dispatched update may still land and keeps its budget reservation.
 - [`TestGuaranteeObservedHealth`](internal/reconcile/guarantees_test.go): health follows observed readiness, including recovery outside rollouts.
-- [`TestGuaranteeTransientFailuresRecover`](internal/reconcile/guarantees_test.go): failed update attempts and unexecuted soak checks do not halt progress within configured limits.
+- [`TestGuaranteeTransientFailuresRecover`](internal/reconcile/guarantees_test.go): failed update attempts retry with backoff; indeterminate observations are not evidence of a bad build.
+- [`TestGuaranteeUpdaterExhaustionSkips`](internal/reconcile/guarantees_test.go): exhausted updater retries or a digest that never arrives skip that target, retaining its dispatched reservation for the progress deadline; the rest proceeds and a later automatic rollout retries drift.
+- [`TestGuaranteeSoakErrorsRecover`](internal/reconcile/guarantees_test.go): indeterminate soak checks never halt or pass a batch; fresh successful checks resume it automatically, however long the outage lasted.
+- [`TestGuaranteeConfigPause`](internal/reconcile/guarantees_test.go): top-level and group config pauses block every admission and update, including forced sync, without stopping observation or releasing open reservations; clearing config resumes automatically.
 - [`TestGuaranteeAutonomousConvergence`](internal/reconcile/guarantees_test.go): once failures heal, every target converges unattended, except as below.
 
 ## When a person is needed
 
-| state | cause | resolved by |
-|---|---|---|
-| `Paused` | `pauseAfterFirstBatch` or a person | Promote |
-| `WaitingForSync` | manual policy | Sync |
-| `Halted` | failed batch, no newer build | newer build or Retry |
-| `Aborted` | a person stopped; the group holds that build | newer build or Sync |
-| suspended target | a person | expiry or Resume |
+Only a bad build or an explicitly chosen hold can need intervention. Operator pauses and suspensions expire after 24 hours by default, even across restarts.
+
+| state | cause | resolved by | guarantee |
+|---|---|---|---|
+| `Halted` | conclusive bad readiness on the new build after the progress deadline, or negative soak comparisons; no newer build | newer build automatically, or Retry | `TestGuaranteeHaltStopsOpenBatch` |
+| `Aborted` | a person stopped the operation; the group holds that build | newer build automatically, or Sync | `TestGuaranteeAbortKeepsBuild` |
+| `Paused` | a person explicitly paused the operation | expiry automatically, or Promote | `TestGuaranteeOperatorPauseExpires` |
+| suspended target | a person explicitly suspended it | expiry automatically, or Resume | `TestGuaranteeSuspensionExpires` |
 
 Retry keeps the failed batch in history and admits its failed targets before untried targets, as many at a time as the budget permits.
+
+`pause` and `suspend` accept an optional `expiresIn` duration, such as `"2h"`; absent or nonpositive values use 24 hours. Pause expiry starts when requested, not after its current batch finishes. Promote only clears an operator pause; it never overrides config.
+
+An expired operator pause does not release a bad-build halt. Ended operations cancel pending pauses, so expiry cannot reopen a completed, aborted or superseded rollout.
+
+There is no manual policy, first-batch pause, digest pin or runtime policy store. `GET` and `PUT /api/v1/policies/{group}` have been removed; nothing is deployed, and panda's CLI and proxy never call them. The `pause`, `promote`, `abort`, `retry`, `suspend`, `resume`, `sync` and `refresh` actions remain compatible.
 
 ## Config
 
 ```yaml
 # UI name, passed to hooks.
 environment: production
+# Observe-only first stage or fleet kill switch.
+paused: false
 # Labels rolloor reads.
 labels:
   # One rollout per value.
@@ -90,13 +104,18 @@ strategy:
     duration: 10m
     # Failed comparisons tolerated.
     failureLimit: 1
-# Policy for groups without an override.
-defaultPolicy:
-  # automated, or manual to require Sync.
-  mode: automated
+# Optional group overrides; strategy is a name from strategies.
+groups:
+  frontend:
+    paused: false
+    strategy: ""
 ```
 
 More settings: [`examples/generic/config.yaml`](examples/generic/config.yaml).
+
+`paused` and `groups` are reloaded from the config file every five seconds; invalid changes keep the previous settings. All other settings require a restart. An active rollout keeps its selected strategy unless Sync explicitly changes it; a group strategy change applies to later rollouts. A config pause prevents new batches and queued updates, while open reservations remain charged, observations continue and an already-soaking batch can finish.
+
+The progress deadline starts at the first durable update dispatch, not while waiting for a worker. A queued target whose build lands another way starts that clock from the first observation of the new digest.
 
 ## Run
 
@@ -122,6 +141,7 @@ Behind a TLS-terminating proxy, preserve `Host` and set `X-Forwarded-Proto: http
 | `rolloor_last_inspect_timestamp_seconds` | last completed inspect pass, or 0 before the first |
 | `rolloor_last_probe_timestamp_seconds` | last completed readiness probe pass, or 0 before the first |
 | `rolloor_registry_resolve_failed{image}` | 1 for images whose most recent registry resolution failed |
+| `rolloor_soak_check_blocked{group}` | 1 while an active soak cannot check; 0 after checks recover, absent without an active rollout |
 | `rolloor_last_tick_timestamp_seconds` | last completed reconcile pass, or 0 before the first |
 | `rolloor_target_info`, `rolloor_target_sync`, `rolloor_target_health` | target digests and observed status |
 | `rolloor_rollout_state` | active rollout states |

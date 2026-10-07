@@ -74,11 +74,10 @@ func (s *Server) Routes() http.Handler {
 
 	mux.HandleFunc("GET /healthz", s.healthz)
 	mux.HandleFunc("GET /api/v1/me", s.me)
-	mux.HandleFunc("PUT /api/v1/policies/{group}", s.acting(s.policyPut))
 
 	for path, h := range map[string]http.HandlerFunc{
 		"/fleet": s.fleet, "/groups/{label}/{value}": s.group, "/nodes/{node}": s.node, "/targets": s.targetsList,
-		"/rollouts": s.rollouts, "/rollouts/{id}": s.rollout, "/history": s.history, "/policies/{group}": s.policyGet,
+		"/rollouts": s.rollouts, "/rollouts/{id}": s.rollout, "/history": s.history,
 		"/suspensions": s.suspensions, "/events": s.stream,
 	} {
 		mux.HandleFunc("GET /api/v1"+path, s.readable(h))
@@ -328,38 +327,6 @@ func (s *Server) history(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, events)
-}
-
-func (s *Server) policyGet(w http.ResponseWriter, r *http.Request) {
-	g, _, ok := s.c.Group(r.PathValue("group"))
-	if !ok {
-		writeError(w, http.StatusNotFound, "no such group")
-
-		return
-	}
-
-	writeJSON(w, http.StatusOK, g.Policy)
-}
-
-func (s *Server) policyPut(w http.ResponseWriter, r *http.Request, id *Identity) {
-	group := r.PathValue("group")
-
-	if !s.authorizeGroup(w, id, group) {
-		return
-	}
-
-	var p reconcile.Policy
-	if !readJSON(w, r, &p) {
-		return
-	}
-
-	if err := s.c.SetPolicy(r.Context(), id.Name, group, p); err != nil {
-		writeActionError(w, err)
-
-		return
-	}
-
-	writeJSON(w, http.StatusOK, p)
 }
 
 func (s *Server) suspensions(w http.ResponseWriter, _ *http.Request) {

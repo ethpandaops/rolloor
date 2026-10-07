@@ -166,7 +166,7 @@ inspect: {interval: 30s, concurrency: 4, failureThreshold: 2}
 labels: {group: client, owner: owner}
 strategy: {batchSize: %s, soak: {duration: %s, interval: 20s, failureLimit: %d}}
 strategies:
-  careful: {firstBatch: 1, pauseAfterFirstBatch: true}
+  careful: {firstBatch: 1}
   flat:    {batchSize: 100%%, waves: false, soak: {duration: 0s}}
 `, budget, batch, soak, rng.IntN(2))
 }

@@ -24,8 +24,8 @@ type SyncRequest struct {
 	Strategy string
 }
 
-// Sync asks for the selected groups to converge now. Tags are re-resolved
-// first; a manual rollout waiting for a sync starts, or a new one is created.
+// Sync re-resolves tags and asks the selected groups to converge now.
+// Declarative pauses and the disruption budget still apply.
 func (c *Controller) Sync(ctx context.Context, req SyncRequest) ([]string, error) {
 	set := c.targets()
 
@@ -84,12 +84,12 @@ func (c *Controller) Sync(ctx context.Context, req SyncRequest) ([]string, error
 				continue
 			}
 
-			policy := c.policyFor(group)
+			strategy := c.groups[group].Strategy
 			if req.Strategy != "" {
-				policy.Strategy = req.Strategy
+				strategy = req.Strategy
 			}
 
-			r = c.newRollout(now, group, policy, eligible, desired, from, set)
+			r = c.newRollout(now, group, strategy, eligible, desired, from, set)
 		}
 
 		// Nothing reaches controller memory before the store has it.
@@ -99,10 +99,6 @@ func (c *Controller) Sync(ctx context.Context, req SyncRequest) ([]string, error
 
 			if req.Strategy != "" {
 				r.Strategy = req.Strategy
-			}
-
-			if r.State == WaitingForSync {
-				r.State, r.Reason, r.UpdatedAt = Running, "Started by "+req.Actor, now
 			}
 		})
 		if err != nil {
@@ -232,22 +228,32 @@ func (c *Controller) Resume(ctx context.Context, actor string, sel targets.Selec
 	return n, nil
 }
 
-// Pause stops a rollout from starting another batch. The batch in flight
-// finishes its soak.
-func (c *Controller) Pause(ctx context.Context, actor, rolloutID string) error {
+// PauseRequest controls how long an operator's pause remains in effect.
+type PauseRequest struct {
+	Actor   string
+	Rollout string
+	Expires time.Duration
+}
+
+// Pause allows the open batch to finish, then stops admission until expiry.
+func (c *Controller) Pause(ctx context.Context, req PauseRequest) error {
 	now := c.clock.Now()
+
+	if req.Expires <= 0 {
+		req.Expires = 24 * time.Hour
+	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	r, ok := c.rollouts[rolloutID]
+	r, ok := c.rollouts[req.Rollout]
 	if !ok {
-		return fmt.Errorf("rollout %s: %w", rolloutID, ErrNotFound)
+		return fmt.Errorf("rollout %s: %w", req.Rollout, ErrNotFound)
 	}
 
 	switch r.State {
 	case Running, Soaking, WaitingForBudget:
-	case WaitingForSync, Paused, Halted, Aborted, Superseded, Complete:
+	case Paused, Halted, Aborted, Superseded, Complete:
 		return fmt.Errorf("rollout is %s: %w", r.State, ErrState)
 	}
 
@@ -257,17 +263,18 @@ func (c *Controller) Pause(ctx context.Context, actor, rolloutID string) error {
 
 	err := c.commit(ctx, r, func() {
 		r.PausePending = true
+		r.PauseExpiresAt = now.Add(req.Expires)
 
 		if r.CurrentBatch() == nil {
 			r.PausePending = false
-			r.State, r.Reason, r.UpdatedAt = Paused, "Paused by "+actor+". Run promote to continue.", now
+			r.State, r.Reason, r.UpdatedAt = Paused, pauseReason(r), now
 		}
 	})
 	if err != nil {
 		return err
 	}
 
-	c.event(ctx, now, &Event{Actor: actor, Action: "pause", Group: r.Group, Rollout: r.ID, Reason: r.Reason})
+	c.event(ctx, now, &Event{Actor: req.Actor, Action: "pause", Group: r.Group, Rollout: r.ID, Reason: pauseReason(r)})
 
 	return nil
 }
@@ -294,6 +301,7 @@ func (c *Controller) Promote(ctx context.Context, actor, rolloutID string) error
 
 	err := c.commit(ctx, r, func() {
 		r.PausePending = false
+		r.PauseExpiresAt = time.Time{}
 		r.Human = true
 
 		if r.State == Paused {
@@ -417,42 +425,6 @@ func (c *Controller) Retry(ctx context.Context, actor, rolloutID, reason string)
 	}
 
 	c.event(ctx, now, &Event{Actor: actor, Action: "retry", Group: r.Group, Rollout: r.ID, Reason: reason})
-	c.Nudge()
-
-	return nil
-}
-
-// SetPolicy replaces a group's policy.
-func (c *Controller) SetPolicy(ctx context.Context, actor, group string, p Policy) error {
-	if p.Mode != ModeAutomated && p.Mode != ModeManual {
-		return fmt.Errorf("mode must be %s or %s", ModeAutomated, ModeManual)
-	}
-
-	if _, ok := c.cfg.StrategyNamed(p.Strategy); !ok {
-		return fmt.Errorf("strategy %q is not configured", p.Strategy)
-	}
-
-	set := c.targets()
-	if len(set.InGroup(group)) == 0 {
-		return fmt.Errorf("group %s: %w", group, ErrNotFound)
-	}
-
-	now := c.clock.Now()
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if err := c.writeOwed(ctx); err != nil {
-		return err
-	}
-
-	if err := c.persist(ctx, c.store.SavePolicy(ctx, group, p)); err != nil {
-		return err
-	}
-
-	c.policies[group] = p
-	c.event(ctx, now, &Event{Actor: actor, Action: "policy", Group: group,
-		Reason: fmt.Sprintf("mode=%s strategy=%s pins=%d", p.Mode, strategyLabel(p.Strategy), len(p.Pins))})
 	c.Nudge()
 
 	return nil

@@ -2,12 +2,12 @@
 # Prints the registry digest the target's container runs, as the node's
 # updater reports it, or "none" when the node has no such container.
 set -euo pipefail
-source "$(dirname "$0")/lib.sh"
+source "$(dirname "$0")/lib.sh" || exit 3
 
 target=$(cat)
 name=$(jq -r .extra.container <<<"$target")
 
-list=$(updater_get "/v1/containers?name=${name}") || { echo "updater unreachable"; exit 1; }
+list=$(updater_get "/v1/containers?name=${name}") || answer 3 "updater unreachable"
 digest=$(container_field "$list" digest)
 
 echo "${digest:-none}"

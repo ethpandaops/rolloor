@@ -35,6 +35,7 @@ type Collector struct {
 	lastInspect       *prometheus.Desc
 	lastProbe         *prometheus.Desc
 	resolveFailures   *prometheus.Desc
+	soakBlocked       *prometheus.Desc
 }
 
 var _ prometheus.Collector = (*Collector)(nil)
@@ -55,13 +56,14 @@ func NewCollector(c *reconcile.Controller) *Collector {
 		lastInspect:       prometheus.NewDesc(namespace+"_last_inspect_timestamp_seconds", "When the last inspect pass completed, or 0 before the first pass.", nil, nil),
 		lastProbe:         prometheus.NewDesc(namespace+"_last_probe_timestamp_seconds", "When the last readiness probe pass completed, or 0 before the first pass.", nil, nil),
 		resolveFailures:   prometheus.NewDesc(namespace+"_registry_resolve_failed", "1 for each image whose most recent registry resolution failed.", []string{"image"}, nil),
+		soakBlocked:       prometheus.NewDesc(namespace+"_soak_check_blocked", "1 while an active rollout waits for indeterminate soak checks to recover.", []string{labelGroup}, nil),
 	}
 }
 
 // Describe sends every descriptor.
 func (m *Collector) Describe(ch chan<- *prometheus.Desc) {
 	for _, d := range []*prometheus.Desc{m.targetInfo, m.targetSync, m.targetHealth, m.rolloutState, m.budgetRatio, m.lastTick,
-		m.unavailableRatio, m.storeWritesOwed, m.targetsLoadFailed, m.lastInspect, m.lastProbe, m.resolveFailures} {
+		m.unavailableRatio, m.storeWritesOwed, m.targetsLoadFailed, m.lastInspect, m.lastProbe, m.resolveFailures, m.soakBlocked} {
 		ch <- d
 	}
 }
@@ -100,6 +102,9 @@ func (m *Collector) Collect(ch chan<- prometheus.Metric) {
 		r := &rollouts[i]
 		if r.State.Active() {
 			ch <- prometheus.MustNewConstMetric(m.rolloutState, prometheus.GaugeValue, 1, r.ID, r.Group, string(r.State))
+
+			blocked := r.State == reconcile.Soaking && r.Soak.ConsecutiveErrors > 0
+			ch <- prometheus.MustNewConstMetric(m.soakBlocked, prometheus.GaugeValue, boolValue(blocked), r.Group)
 		}
 	}
 
@@ -207,7 +212,7 @@ func (h *HookRunner) Run(ctx context.Context, program, hook, targetID string, in
 	outcome := "ok"
 
 	switch {
-	case err != nil:
+	case err != nil || res.CouldNotCheck():
 		outcome = "error"
 	case !res.OK:
 		outcome = "failed"

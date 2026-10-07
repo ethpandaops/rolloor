@@ -6,7 +6,6 @@ import (
 	"io"
 	"math/rand/v2"
 	"os"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,13 +14,14 @@ import (
 
 	"github.com/sirupsen/logrus"
 
+	"github.com/ethpandaops/rolloor/internal/config"
 	"github.com/ethpandaops/rolloor/internal/targets"
 )
 
 // The property test drives random fleets through random builds, program
-// failures, verbs, targets-file edits, restarts, crashes and store outages,
-// and checks after every step what must always hold. Once the steps run out
-// every failure is healed, and every target must end on its desired build.
+// failures, verbs, config pauses, file edits, restarts, crashes and store
+// outages, checking invariants after every step. Then every failure and config
+// pause is cleared, and every target must end on its desired build.
 //
 // Reproduce a failure with ROLLOOR_SIM_SEED=<seed>; run more seeds with
 // ROLLOOR_SIM_SEEDS=<n>.
@@ -67,12 +67,9 @@ type sim struct {
 
 	digests int
 	builds  map[string][]string
-	modes   map[string]string
-	pins    map[string]map[string]string
 
 	suspended []propSuspension
 	terminal  map[string]RolloutState
-	manual    map[string]bool
 	strategy  map[string]string
 	before    map[string]*RolloutView
 	trail     []string
@@ -93,8 +90,7 @@ func newSim(t *testing.T, rng *rand.Rand) (*sim, string) {
 
 	s := &sim{
 		h: newHarness(t, cfg, fleet.yaml()), rng: rng, fleet: fleet, log: log,
-		builds: map[string][]string{}, modes: map[string]string{}, pins: map[string]map[string]string{},
-		terminal: map[string]RolloutState{}, manual: map[string]bool{}, strategy: map[string]string{},
+		builds: map[string][]string{}, terminal: map[string]RolloutState{}, strategy: map[string]string{},
 	}
 
 	s.h.world.set(func(w *world) { w.registry[propImage("c")] = d1 })
@@ -131,18 +127,15 @@ func (s *sim) violation(format string, args ...any) {
 
 // want is the digest a target should end on.
 func (s *sim) want(t *targets.Target) string {
-	if pin, ok := s.pins[s.h.current().Group(t)][t.Image]; ok {
-		return pin
-	}
-
 	s.h.world.mu.Lock()
 	defer s.h.world.mu.Unlock()
 
 	return s.h.world.registry[t.Image]
 }
 
-// converge heals every failure, lets operate end only the holds kept for a
-// person, and requires every target to end on its desired build.
+// converge heals every failure, clears config pauses, lets operate end only
+// the holds kept for a person, and requires every target to end on its
+// desired build.
 func (s *sim) converge() error {
 	h := s.h
 
@@ -153,6 +146,7 @@ func (s *sim) converge() error {
 		clear(w.soakFail)
 		clear(w.inspectFail)
 		clear(w.runErr)
+		clear(w.breakOnUpdate)
 		clear(w.registryErr)
 	})
 
@@ -166,6 +160,17 @@ func (s *sim) converge() error {
 			return errors.New("no process starts on a healthy store")
 		}
 	}
+
+	// Config pauses are lifted by whoever owns the config file, not by an
+	// operator verb.
+	groups := map[string]config.Group{}
+
+	for g, gc := range h.cfg.Groups {
+		gc.Paused = false
+		groups[g] = gc
+	}
+
+	s.declare(false, groups)
 
 	var err error
 
@@ -188,9 +193,9 @@ func (s *sim) converge() error {
 	return err
 }
 
-// operate is the operator once failures heal: it lifts recorded suspensions
-// and ends only holds a person must end. Anything else, including a retry
-// waiting for the budget, drift or a superseded build, must resolve by itself.
+// operate is the operator once failures heal, ending only holds a person
+// owns: suspensions, operator pauses, halted bad builds and aborts. Everything
+// else, config pauses and skipped updates included, must resolve by itself.
 func (s *sim) operate() error {
 	h := s.h
 
@@ -234,9 +239,9 @@ func (s *sim) operate() error {
 	return nil
 }
 
-// endHold takes the verb for a hold kept for a person on the group's current
-// build, which the controller must accept for exactly that rollout; a retry
-// resumes it at once. A newer build or any moving state is left to the controller.
+// endHold takes Promote or Retry for a hold on the group's current build,
+// which the controller must accept for exactly that rollout; a retry resumes
+// it at once. A newer build or any moving state is left to the controller.
 func (s *sim) endHold(r *RolloutView) error {
 	h := s.h
 
@@ -251,13 +256,6 @@ func (s *sim) endHold(r *RolloutView) error {
 		err := h.c.Retry(h.ctx, actor, r.ID, "healed")
 		if now, _ := h.c.Rollout(r.ID); err == nil && now.State != Running {
 			err = fmt.Errorf("retry left it %s", now.State)
-		}
-
-		return err
-	case WaitingForSync:
-		started, err := h.c.Sync(h.ctx, SyncRequest{Actor: actor, Selector: targets.Selector{groupLabel: r.Group}})
-		if err == nil && !slices.Equal(started, []string{r.ID}) {
-			err = fmt.Errorf("sync started %v", started)
 		}
 
 		return err
@@ -282,7 +280,7 @@ func (s *sim) abortHeld(group string) bool {
 }
 
 // groupKey is the group's desired digests keyed as the controller keys a
-// rollout, from the sim's own record of builds and pins.
+// rollout, from the sim's own record of builds.
 func (s *sim) groupKey(group string) string {
 	set := s.h.current()
 	desired := map[string]string{}

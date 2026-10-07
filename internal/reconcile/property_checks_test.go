@@ -13,8 +13,8 @@ import (
 )
 
 // dispatched checks an update at the moment the process runs it: the batch
-// that admitted it is already on disk, the target is not suspended, and the
-// rollout was free to move when the step began.
+// that admitted it is already on disk, the target is not suspended, its group
+// is not paused by config, and the rollout was free to move when the step began.
 func (s *sim) dispatched(disk *MemoryStore, id, digest string) {
 	if !onDisk(disk, id, digest) {
 		s.violation("update %s to %s ran before its batch and dispatch reached the store", id, shortDigest(digest))
@@ -35,9 +35,18 @@ func (s *sim) dispatched(disk *MemoryStore, id, digest string) {
 		}
 	}
 
+	if s.configPaused(t.group) {
+		s.violation("update %s ran while group %s is paused by config", id, t.group)
+	}
+
 	s.mu.Lock()
-	s.dispatches = append(s.dispatches, propDispatch{id: id, group: t.group, digest: digest})
+	s.dispatches = append(s.dispatches, propDispatch{id: id, group: t.group, digest: digest, at: now})
 	s.mu.Unlock()
+}
+
+// configPaused reports whether the config file pauses a group.
+func (s *sim) configPaused(group string) bool {
+	return s.h.cfg.Paused || s.h.cfg.Groups[group].Paused
 }
 
 // admissionProblem checks a durable reservation before its hooks run, using
@@ -52,6 +61,10 @@ func (s *sim) admissionProblem(r, before *Rollout) error {
 	var prior *Batch
 	if before != nil {
 		prior = before.CurrentBatch()
+	}
+
+	if (prior == nil || prior.Number != b.Number) && s.configPaused(r.Group) {
+		return fmt.Errorf("rollout %s admitted batch %d while group %s is paused by config", r.ID, b.Number, r.Group)
 	}
 
 	var nodes map[string]bool
@@ -113,11 +126,12 @@ func (s *sim) admissionProblem(r, before *Rollout) error {
 // propDispatch is one update the process ran during a step.
 type propDispatch struct {
 	id, group, digest string
+	at                time.Time
 }
 
-// checkHeld asserts that a rollout held at the start of the step (paused,
-// halted, or waiting for a sync) and still its group's rollout at the end ran
-// no update.
+// checkHeld asserts that a rollout halted or paused by an operator at the
+// start of the step, and still its group's rollout at the end, ran no update
+// unless its pause had expired.
 func (s *sim) checkHeld(dispatches []propDispatch) error {
 	for _, d := range dispatches {
 		r, had := s.before[d.group]
@@ -125,7 +139,8 @@ func (s *sim) checkHeld(dispatches []propDispatch) error {
 			continue
 		}
 
-		if held := r.State == Paused || r.State == Halted || r.State == WaitingForSync; !held {
+		expired := r.State == Paused && !r.PauseExpiresAt.IsZero() && !d.at.Before(r.PauseExpiresAt)
+		if held := r.State == Paused || r.State == Halted; !held || expired {
 			continue
 		}
 
@@ -207,16 +222,8 @@ func (s *sim) check() error {
 }
 
 // checkRollout asserts the shape of one rollout: batch sizes, wave order,
-// retry isolation, manual policy and what completion means.
+// retry isolation and what completion means.
 func (s *sim) checkRollout(r *RolloutView) error {
-	if _, seen := s.manual[r.ID]; !seen {
-		s.manual[r.ID] = s.modes[r.Group] == ModeManual
-	}
-
-	if s.manual[r.ID] && !r.Human && len(r.Batches) > 0 {
-		return fmt.Errorf("rollout %s started a batch under a manual policy without a sync", r.ID)
-	}
-
 	total := len(rolloutNodes(&r.Rollout))
 
 	for i := range r.Batches {
@@ -409,7 +416,7 @@ func TestPropertyControllerInvariantsAdmissionBudget(t *testing.T) {
 				require.NoError(t, h.store.SaveRollout(h.ctx, before))
 			}
 
-			s := &sim{h: h, terminal: map[string]RolloutState{}, manual: map[string]bool{}, strategy: map[string]string{}}
+			s := &sim{h: h, terminal: map[string]RolloutState{}, strategy: map[string]string{}}
 			p := &process{MemoryStore: h.store, sim: s, writes: -1}
 			h.c.mu.Lock()
 			h.c.rollouts[r.ID] = r
@@ -478,7 +485,7 @@ func TestPropertyControllerInvariantsInspectionCanRestoreAnEndedHoldWithoutAdmis
 	require.Equal(t, float64(100), used)
 	require.Equal(t, float64(100), allowed)
 
-	s := &sim{h: h, terminal: map[string]RolloutState{}, manual: map[string]bool{}, strategy: map[string]string{}}
+	s := &sim{h: h, terminal: map[string]RolloutState{}, strategy: map[string]string{}}
 	s.snapshot()
 	h.world.set(func(w *world) { w.runErr["inspect"] = errFake })
 	h.c.InspectAll(h.ctx)

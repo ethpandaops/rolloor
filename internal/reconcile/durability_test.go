@@ -133,6 +133,51 @@ func TestAPauseTheStoreRefusesLeavesNothingBehind(t *testing.T) {
 	r := h.active("a")
 
 	h.store.FailRollouts = errFake
-	require.ErrorIs(t, h.c.Pause(h.ctx, actor, r.ID), errFake)
+	require.ErrorIs(t, h.pause(r.ID, time.Hour), errFake)
 	require.False(t, h.rollout(r.ID).PausePending)
+	require.True(t, h.rollout(r.ID).PauseExpiresAt.IsZero())
+}
+
+// refusingStore fails whole-state rewrites while refuse is set.
+type refusingStore struct {
+	*MemoryStore
+
+	refuse bool
+}
+
+func (s *refusingStore) ReplaceDecisions(ctx context.Context, snap *Snapshot) error {
+	if s.refuse {
+		return errFake
+	}
+
+	return s.MemoryStore.ReplaceDecisions(ctx, snap)
+}
+
+func TestARecoveredAbortIsStoredOnceTheStoreTakesIt(t *testing.T) {
+	h := newHarness(t, testConfig, testTargets)
+	h.prime()
+	h.release(imgA, d2)
+	r := h.active("a")
+	unsaved := storedRollout(h, r.ID)
+	require.NoError(t, h.c.Abort(h.ctx, actor, r.ID))
+	loseRolloutSave(h, unsaved)
+
+	disk := &refusingStore{MemoryStore: h.store, refuse: true}
+	c, err := New(h.ctx, &Options{
+		Config: h.cfg, Targets: h.current, Resolver: h.world, Runner: h.world, Store: disk,
+		Notifier: h.notes, Clock: h.clock, Log: logrus.New(), NewID: h.nextID,
+	})
+	require.NoError(t, err)
+
+	got, ok := c.Rollout(r.ID)
+	require.True(t, ok)
+	require.Equal(t, Aborted, got.State)
+	require.True(t, c.FleetStatus().StoreWritesOwed)
+	require.Equal(t, Running, durableState(h.store, r.ID))
+
+	disk.refuse = false
+
+	require.NoError(t, c.Tick(h.ctx))
+	require.False(t, c.FleetStatus().StoreWritesOwed)
+	require.Equal(t, Aborted, durableState(h.store, r.ID))
 }

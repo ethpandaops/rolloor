@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/ethpandaops/rolloor/internal/config"
 )
 
 func TestSteadyStateIsSynced(t *testing.T) {
@@ -202,7 +204,7 @@ func TestNewDigestSupersedesHaltAndDegradedGoFirst(t *testing.T) {
 	require.Equal(t, Healthy, h.view(tA1).Health)
 }
 
-func TestUpdateFailureAndReadyTimeoutHalt(t *testing.T) {
+func TestExhaustedOrUnlandedUpdatesSkipOnlyTheirTarget(t *testing.T) {
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
 	h.world.set(func(w *world) { w.updateFail[tA2] = "watcher said no" })
@@ -210,10 +212,13 @@ func TestUpdateFailureAndReadyTimeoutHalt(t *testing.T) {
 	h.tick()
 
 	r := h.active("a")
-	require.Equal(t, Halted, r.State)
+	require.Equal(t, Soaking, r.State, "the rest of the batch goes on")
+	require.Equal(t, PhaseReady, h.phases(r)[tA1])
+	require.Equal(t, PhaseSkipped, h.phases(r)[tA2])
 	require.Equal(t, 1, r.target(tA2).UpdateAttempts)
-	require.Equal(t, PhaseFailed, h.phases(r)[tA1])
-	require.Equal(t, "in the halted batch", h.view(tA1).Quarantine.Reason)
+	require.False(t, r.target(tA2).HoldUntil.IsZero())
+	require.Nil(t, h.view(tA1).Quarantine)
+	require.Nil(t, h.view(tA2).Quarantine)
 
 	// Digest convergence is bounded independently of one hook invocation.
 	h2 := newHarness(t, testConfig, testTargets)
@@ -227,8 +232,10 @@ func TestUpdateFailureAndReadyTimeoutHalt(t *testing.T) {
 	h2.tick()
 
 	r2 := h2.active("a")
-	require.Equal(t, Halted, r2.State)
-	require.Contains(t, r2.Reason, "did not reach 2222222 within 50s")
+	require.Equal(t, PhaseSkipped, h2.phases(r2)[tA1])
+	require.False(t, r2.Targets[0].HoldUntil.IsZero())
+	require.Equal(t, PhaseReady, h2.phases(r2)[tA2])
+	require.Equal(t, Complete, h2.drive(r2.ID, 100, 20*time.Second).State)
 }
 
 func TestNotReadyKeepsWaitingThenPasses(t *testing.T) {
@@ -250,7 +257,7 @@ func TestNotReadyKeepsWaitingThenPasses(t *testing.T) {
 	h2.ticks(3, 0)
 	h2.ticks(4, 20*time.Second)
 	require.Equal(t, Halted, h2.active("a").State)
-	require.Contains(t, h2.active("a").Reason, "a-1/cl not ready: still syncing within 50s")
+	require.Contains(t, h2.active("a").Reason, "still syncing")
 }
 
 func TestBudgetIsSharedAcrossGroupsAndNodesCountOnce(t *testing.T) {
@@ -320,18 +327,34 @@ func TestWaitingForBudgetSaysHowMuch(t *testing.T) {
 // weighted node at a time, never two.
 var budgetConfig = replaceLine(testConfig, "maxUnavailable: 50%", "maxUnavailable: 30%")
 
-// quarantine halts group b's rollout of d2 on n1/b after an update failure.
+// quarantine halts group b's rollout of d2 on n1/b with a build that never
+// becomes ready there, then puts n1/b back on its old build by hand.
 func (h *harness) quarantine() {
 	h.t.Helper()
-	h.world.set(func(w *world) { w.updateFail["n1/b"] = boom })
-	h.release(imgB, d2)
+	h.haltOnBadBuild("b", imgB, d2, "n1/b")
+	h.revert("n1/b")
+}
 
-	for i := 0; i < 4 && h.active("b").State != Halted; i++ {
-		h.tick()
+// haltOnBadBuild ships a build that never becomes ready on ids and ticks
+// until the group's rollout halts at the progress deadline.
+func (h *harness) haltOnBadBuild(group, image, digest string, ids ...string) RolloutView {
+	h.t.Helper()
+	h.world.set(func(w *world) {
+		for _, id := range ids {
+			w.breakOnUpdate[id] = true
+		}
+	})
+	h.release(image, digest)
+	id := h.active(group).ID
+
+	for i := 0; i < 20 && h.rollout(id).State != Halted; i++ {
+		h.ticks(1, 20*time.Second)
 	}
 
-	require.Equal(h.t, Halted, h.active("b").State)
-	h.world.set(func(w *world) { delete(w.updateFail, "n1/b") })
+	r := h.rollout(id)
+	require.Equal(h.t, Halted, r.State, r.Reason)
+
+	return r
 }
 
 func TestRetryStaysWithinBudget(t *testing.T) {
@@ -395,21 +418,17 @@ func TestQuarantineClearedOnSharedNodeStaysWithinBudget(t *testing.T) {
 	}
 }
 
-func TestManualPolicyWaitsForSyncAndSpeedOverride(t *testing.T) {
+func TestSyncStrategyAndForceWaitForAConfigPause(t *testing.T) {
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
-
-	require.NoError(t, h.c.SetPolicy(h.ctx, actor, "a", Policy{Mode: ModeManual}))
-	require.Error(t, h.c.SetPolicy(h.ctx, actor, "a", Policy{Mode: "sometimes"}))
-	require.Error(t, h.c.SetPolicy(h.ctx, actor, "a", Policy{Mode: ModeManual, Strategy: "warp"}))
-	require.ErrorIs(t, h.c.SetPolicy(h.ctx, actor, "zzz", Policy{Mode: ModeManual}), ErrNotFound)
+	h.declare(false, map[string]config.Group{"a": {Paused: true}})
 
 	h.release(imgA, d2)
 	r := h.active("a")
-	require.Equal(t, WaitingForSync, r.State)
-	require.Equal(t, "Manual policy. Build 2222222 is waiting for a sync.", r.Reason)
-	require.Equal(t, "Manual policy. Build 2222222 is waiting for a sync.", h.c.Fleet().Groups[0].Reason)
-	require.ErrorIs(t, h.c.Pause(h.ctx, actor, r.ID), ErrState)
+	require.Equal(t, Running, r.State)
+	require.Empty(t, r.Batches)
+	require.Contains(t, r.Reason, "config")
+	require.Equal(t, r.Reason, h.c.Fleet().Groups[0].Reason)
 
 	h.ticks(3, 0)
 	require.Empty(t, h.world.callsFor("update"))
@@ -424,12 +443,15 @@ func TestManualPolicyWaitsForSyncAndSpeedOverride(t *testing.T) {
 	require.Equal(t, []string{r.ID}, ids)
 
 	r = h.active("a")
-	require.Equal(t, Running, r.State)
 	require.Equal(t, speedAll, r.Strategy)
 	require.True(t, r.Force)
 	require.True(t, r.Human)
+	h.ticks(2, 0)
+	require.Empty(t, h.active("a").Batches, "a forced sync still waits for the pause")
 
-	// all: one batch, no waves, forced: ready and soak skipped, budget still applies.
+	// Cleared: all is one batch without waves; forced skips ready and soak,
+	// not the budget.
+	h.declare(false, nil)
 	h.tick()
 	r = h.active("a")
 	require.Len(t, r.Batches, 1)
@@ -490,69 +512,125 @@ func TestPauseAndPromote(t *testing.T) {
 	h.release(imgA, d2)
 	r := h.active("a")
 
-	require.ErrorIs(t, h.c.Pause(h.ctx, actor, "nope"), ErrNotFound)
+	require.ErrorIs(t, h.pause("nope", 0), ErrNotFound)
 	require.ErrorIs(t, h.c.Promote(h.ctx, actor, "nope"), ErrNotFound)
 	require.ErrorIs(t, h.c.Promote(h.ctx, actor, r.ID), ErrState)
 
 	// Pause mid-batch: the batch finishes its soak, then the rollout pauses.
-	require.NoError(t, h.c.Pause(h.ctx, actor, r.ID))
+	require.NoError(t, h.pause(r.ID, 0))
 	require.True(t, h.active("a").PausePending)
+	require.Equal(t, h.clock.Now().Add(24*time.Hour), h.active("a").PauseExpiresAt, "the default expiry")
 	h.ticks(4, 0)
 	require.Equal(t, Soaking, h.active("a").State)
 	h.ticks(4, 20*time.Second)
 	require.Equal(t, Paused, h.active("a").State)
-	require.Contains(t, h.active("a").Reason, "Paused after batch 1")
 
 	h.ticks(2, 0)
 	require.Len(t, h.active("a").Batches, 1, "nothing starts while paused")
 	require.Equal(t, Paused, h.active("a").State)
 
 	// Pausing again while paused is an error; promote continues.
-	require.ErrorIs(t, h.c.Pause(h.ctx, actor, r.ID), ErrState)
+	require.ErrorIs(t, h.pause(r.ID, 0), ErrState)
 	require.NoError(t, h.c.Promote(h.ctx, actor, r.ID))
 	require.Equal(t, Running, h.active("a").State)
+	require.True(t, h.active("a").PauseExpiresAt.IsZero())
 	h.tick()
 	require.Len(t, h.active("a").Batches, 2)
 
-	// Pause between batches takes effect immediately, promote while pending clears it.
+	// Promote while the pause is pending clears it.
 	h2 := newHarness(t, testConfig, testTargets)
 	h2.prime()
 	h2.release(imgA, d2)
 	r2 := h2.active("a")
-	require.NoError(t, h2.c.Pause(h2.ctx, actor, r2.ID))
+	require.NoError(t, h2.pause(r2.ID, time.Hour))
 	require.NoError(t, h2.c.Promote(h2.ctx, actor, r2.ID))
 	require.False(t, h2.active("a").PausePending)
+	require.True(t, h2.active("a").PauseExpiresAt.IsZero())
 	require.Equal(t, Running, h2.active("a").State)
 
-	// Pause once the batch is done but before the next starts.
+	// Pause once the batch is done but before the next starts takes effect at
+	// once; a nonpositive expiry takes the default.
 	h2.ticks(4, 0)
 	h2.ticks(4, 20*time.Second)
 	between := h2.active("a")
 	require.Equal(t, Running, between.State)
 	require.Nil(t, between.CurrentBatch())
-	require.NoError(t, h2.c.Pause(h2.ctx, actor, r2.ID))
+	require.NoError(t, h2.pause(r2.ID, -time.Minute))
 	require.Equal(t, Paused, h2.active("a").State)
-	require.Contains(t, h2.active("a").Reason, "Paused by sam")
+	require.Equal(t, h2.clock.Now().Add(24*time.Hour), h2.active("a").PauseExpiresAt)
 }
 
-func TestCarefulPresetPausesAfterFirstTarget(t *testing.T) {
+func TestAnEndedRolloutDropsItsPendingPause(t *testing.T) {
+	for _, end := range []string{"aborted", "superseded"} {
+		t.Run(end, func(t *testing.T) {
+			h := newHarness(t, testConfig, testTargets)
+			h.prime()
+			h.release(imgA, d2)
+			r := h.active("a")
+			require.NoError(t, h.pause(r.ID, time.Hour))
+
+			if end == "aborted" {
+				require.NoError(t, h.c.Abort(h.ctx, actor, r.ID))
+			} else {
+				h.release(imgA, d3)
+				require.False(t, h.active("a").PausePending, "the next build carries no pause")
+			}
+
+			ended := h.rollout(r.ID)
+			require.False(t, ended.State.Active())
+			require.False(t, ended.PausePending)
+			require.True(t, ended.PauseExpiresAt.IsZero())
+			require.ErrorIs(t, h.c.Promote(h.ctx, actor, r.ID), ErrState)
+		})
+	}
+}
+
+func TestGroupStrategyComesFromConfig(t *testing.T) {
 	h := newHarness(t, testConfig, testTargets)
+	h.cfg.Groups = map[string]config.Group{"a": {Strategy: careful}}
+	h.c = h.newController()
 	h.prime()
-	require.NoError(t, h.c.SetPolicy(h.ctx, actor, "a", Policy{Mode: ModeAutomated, Strategy: careful}))
 	h.release(imgA, d2)
 
 	r := h.active("a")
+	require.Equal(t, careful, r.Strategy)
 	require.Equal(t, []string{tA1}, r.Batches[0].Targets)
+
+	g, _, _ := h.c.Group("a")
+	require.Equal(t, careful, g.Strategy)
+	require.False(t, g.Paused)
+
 	h.ticks(4, 0)
-	require.Equal(t, Paused, h.active("a").State)
-	require.Equal(t, "Paused after batch 1. Run promote to continue.", h.active("a").Reason)
-	require.Equal(t, "Paused after batch 1. Run promote to continue.", h.c.Fleet().Groups[0].Reason)
-
-	require.NoError(t, h.c.Promote(h.ctx, actor, r.ID))
-	h.tick()
 	require.Len(t, h.active("a").Batches[1].Targets, 1, "50% of 6 is 3 but wave 0 has one left")
-
 	require.Equal(t, Complete, h.drive(r.ID, 40, 0).State)
+}
+
+func TestConfiguredStrategyAppliesToTheNextRollout(t *testing.T) {
+	h := newHarness(t, testConfig, testTargets)
+	h.prime()
+	h.release(imgA, d2)
+	first := h.active("a")
+	require.Empty(t, first.Strategy)
+
+	require.Error(t, h.c.ConfigureGroups(h.ctx, false, map[string]config.Group{"a": {Strategy: "warp"}}))
+	g, _, _ := h.c.Group("a")
+	require.Empty(t, g.Strategy, "a rejected declaration changes nothing")
+
+	h.declare(false, map[string]config.Group{"a": {Strategy: speedAll}})
+	g, _, _ = h.c.Group("a")
+	require.Equal(t, speedAll, g.Strategy)
+
+	changes := count(h.notes.actions(), "config.changed")
+	h.declare(false, map[string]config.Group{"a": {Strategy: speedAll}})
+	require.Equal(t, changes, count(h.notes.actions(), "config.changed"), "an unchanged declaration is no change")
+
+	h.tick()
+	require.Empty(t, h.rollout(first.ID).Strategy, "the rollout in progress keeps its strategy")
+
+	h.release(imgA, d3)
+	next := h.active("a")
+	require.Equal(t, speedAll, next.Strategy)
+	require.Len(t, next.Batches[0].Targets, 4)
 }
 
 func TestSuspendResumeAndExpiry(t *testing.T) {
@@ -739,29 +817,6 @@ func TestRegistryErrorsAndRefresh(t *testing.T) {
 	require.Equal(t, "registry: unknown image", h3.view("a-3/side").Reason)
 }
 
-func TestPinsHoldAnImage(t *testing.T) {
-	h := newHarness(t, testConfig, testTargets)
-	h.prime()
-
-	require.NoError(t, h.c.SetPolicy(h.ctx, actor, "a", Policy{Mode: ModeAutomated, Pins: map[string]string{imgA: d1}}))
-	h.release(imgA, d2)
-	require.Empty(t, h.c.Rollouts(), "pinned groups do not move")
-	require.Equal(t, Synced, h.view(tA1).Sync)
-
-	// Unpinning supersedes nothing but opens the rollout.
-	require.NoError(t, h.c.SetPolicy(h.ctx, actor, "a", Policy{Mode: ModeAutomated}))
-	h.tick()
-	require.Equal(t, "2222222", h.active("a").Digest)
-
-	// Pinning during a rollout supersedes it.
-	require.NoError(t, h.c.SetPolicy(h.ctx, actor, "a", Policy{Mode: ModeAutomated, Pins: map[string]string{imgA: d2}}))
-	h.tick()
-	require.Equal(t, "2222222", h.active("a").Digest, "pin equals desired: nothing changes")
-	require.NoError(t, h.c.SetPolicy(h.ctx, actor, "a", Policy{Mode: ModeAutomated, Pins: map[string]string{imgA: d3}}))
-	h.tick()
-	require.Equal(t, "3333333", h.active("a").Digest)
-}
-
 func TestNoSoakProgramPassesImmediately(t *testing.T) {
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
@@ -801,22 +856,49 @@ func TestSoakNumbersAndPerProgramGrouping(t *testing.T) {
 	require.Empty(t, unit)
 }
 
-func TestSoakHookErrorsHaveTheirOwnLimit(t *testing.T) {
+func TestSoakInputDatesUpdatedTargetsByTheirFirstObservedDigest(t *testing.T) {
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
-	h.world.set(func(w *world) { w.runErr[soakA] = errFake })
-	h.release(imgA, d2)
-	h.ticks(5, 0)
-	require.Equal(t, 0, h.active("a").Soak.Failures)
-	require.Equal(t, 1, h.active("a").Soak.ConsecutiveErrors)
 
-	for range h.cfg.Strategy.Soak.ConsecutiveErrorLimit {
-		h.clock.Advance(h.cfg.Strategy.Soak.Interval)
+	// a-2's build lands a while after its update was dispatched.
+	h.world.set(func(w *world) { w.updateStuck[tA2] = true })
+	h.release(imgA, d2)
+	h.clock.Advance(5 * time.Second)
+	h.world.set(func(w *world) {
+		w.running[tA2] = d2
+		delete(w.updateStuck, tA2)
+	})
+
+	for i := 0; i < 5 && h.active("a").State != Soaking; i++ {
 		h.tick()
 	}
 
-	require.Equal(t, Halted, h.active("a").State)
-	require.Contains(t, h.active("a").Reason, "could not run: fake")
+	h.tick()
+
+	r := h.active("a")
+	seen := h.lastSoakInput()
+	require.Len(t, seen.Updated, 2)
+
+	for _, u := range seen.Updated {
+		rt := r.target(u.ID)
+		at, err := time.Parse(time.RFC3339, u.UpdatedAt)
+		require.NoError(t, err)
+		require.True(t, at.Equal(rt.DigestSeenAt), "%s updatedAt %s, digest first seen %s", u.ID, u.UpdatedAt, rt.DigestSeenAt)
+
+		target, ok := h.current().Get(u.ID)
+		require.True(t, ok)
+		require.Equal(t, target.Node, u.Node)
+		require.Equal(t, target.Image, u.Image)
+	}
+
+	late := r.target(tA2)
+	require.True(t, late.DigestSeenAt.After(late.UpdatedAt), "dated by observation, not by the update")
+
+	require.Len(t, seen.Remaining, 4)
+
+	for _, rest := range seen.Remaining {
+		require.NotContains(t, rest, "updatedAt")
+	}
 }
 
 func TestSupersededMidBatchSkipsInFlightTargets(t *testing.T) {
@@ -896,16 +978,11 @@ func TestALiftedQuarantineCostsItsNodeAgain(t *testing.T) {
 `)
 	h.prime()
 
-	// A failed update's node is reserved while that update may still land.
+	// A bad build's node is reserved while it is not seen ready on the build.
 	// A superseding operation on the same node adds no unavailable weight.
-	h.world.set(func(w *world) { w.updateFail["n1/x"] = boom })
-	h.release(imgA, d2)
-	h.drive(h.active("a").ID, 20, 20*time.Second)
-	require.Equal(t, Halted, h.active("a").State)
-	h.world.set(func(w *world) {
-		delete(w.updateFail, "n1/x")
-		w.notReady["n1/x"] = true
-	})
+	h.haltOnBadBuild("a", imgA, d2, "n1/x")
+	h.world.set(func(w *world) { delete(w.breakOnUpdate, "n1/x") })
+	h.ticks(10, 20*time.Second)
 
 	for range h.cfg.ReadinessProbe.FailureThreshold {
 		h.c.ProbeAll(h.ctx)
@@ -940,10 +1017,7 @@ func TestRetryWaitsForTheBudgetWhenItsQuarantineWasLifted(t *testing.T) {
 	h.prime()
 	full := h.current()
 
-	h.world.set(func(w *world) { w.updateFail[tN1A] = boom })
-	h.release(imgA, d2)
-	ra := h.active("a")
-	require.Equal(t, Halted, ra.State)
+	ra := h.haltOnBadBuild("a", imgA, d2, tN1A)
 
 	// n1/a leaves the targets file and comes back, which drops its
 	// quarantine, and group b takes the whole budget meanwhile.
@@ -954,10 +1028,8 @@ func TestRetryWaitsForTheBudgetWhenItsQuarantineWasLifted(t *testing.T) {
 	h.c.Forget(h.ctx, []string{tN1A})
 	h.swap(full)
 
-	h.world.set(func(w *world) {
-		delete(w.updateFail, tN1A)
-		w.notReady["n2/b"] = true
-	})
+	h.revert(tN1A)
+	h.world.set(func(w *world) { w.notReady["n2/b"] = true })
 	h.release(imgB, d2)
 	rb := h.active("b")
 	require.Len(t, rb.Batches, 1)
@@ -1012,21 +1084,16 @@ func TestWeightlessOutageDoesNotBlockAHeavyNodeRetry(t *testing.T) {
 - {id: n1/a, node: n1, weight: 300, image: org/a:t, labels: {client: a, owner: a}}
 `)
 	h.prime()
-	h.world.set(func(w *world) { w.updateFail[tN1A] = boom })
-	h.release(imgA, d2)
-	r := h.active("a")
-	require.Equal(t, Halted, r.State)
+	r := h.haltOnBadBuild("a", imgA, d2, tN1A)
 	h.clock.Advance(h.cfg.Strategy.ProgressDeadline + time.Second)
-	h.world.set(func(w *world) {
-		delete(w.updateFail, tN1A)
-		w.notReady["n0/b"] = true
-	})
+	h.revert(tN1A)
+	h.world.set(func(w *world) { w.notReady["n0/b"] = true })
 
 	for range h.cfg.ReadinessProbe.FailureThreshold {
 		h.c.ProbeAll(h.ctx)
 	}
 
-	require.NoError(t, h.c.Retry(h.ctx, actor, r.ID, "updater recovered"))
+	require.NoError(t, h.c.Retry(h.ctx, actor, r.ID, "readiness fixed"))
 	require.Equal(t, Complete, h.drive(r.ID, 20, time.Second).State)
 }
 
@@ -1071,7 +1138,7 @@ func TestEndedUpdateHoldUsesTheRolloutStrategyDeadline(t *testing.T) {
 	cfg := replaceLine(testConfig, "careful: {firstBatch: 1,", "careful: {progressDeadline: 17s, firstBatch: 1,")
 	h := newHarness(t, cfg, retryFleet)
 	h.prime()
-	require.NoError(t, h.c.SetPolicy(h.ctx, actor, "a", Policy{Mode: ModeAutomated, Strategy: careful}))
+	h.declare(false, map[string]config.Group{"a": {Strategy: careful}})
 	h.world.set(func(w *world) { w.updateStuck[tN1A] = true })
 	h.release(imgA, d2)
 	r := h.active("a")

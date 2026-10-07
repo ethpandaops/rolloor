@@ -4,6 +4,7 @@ package ui
 
 import (
 	"bytes"
+	"context"
 	"embed"
 	"errors"
 	"fmt"
@@ -265,12 +266,13 @@ func (s *Server) group(w http.ResponseWriter, r *http.Request) {
 }
 
 type rolloutData struct {
-	Rollout    reconcile.RolloutView
-	Waves      []wave
-	Quarantine []reconcile.RolloutTarget
-	LastCheck  *reconcile.SoakCheck
-	GroupLabel string
-	Can        can
+	Rollout     reconcile.RolloutView
+	Waves       []wave
+	Quarantine  []reconcile.RolloutTarget
+	LastCheck   *reconcile.SoakCheck
+	GroupLabel  string
+	Can         can
+	GroupPaused bool
 }
 
 // wave is a rollout's targets in one wave, batched and not yet.
@@ -301,7 +303,7 @@ func (s *Server) rollout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data := rolloutData{Rollout: v, GroupLabel: s.cfg.Labels.Group, Can: s.canAct(&id, s.ownersOf(s.targets().InGroup(v.Group)))}
+	data := rolloutData{Rollout: v, GroupLabel: s.cfg.Labels.Group, Can: s.canAct(&id, s.ownersOf(s.targets().InGroup(v.Group))), GroupPaused: s.c.GroupPaused(v.Group)}
 	byID := map[string]reconcile.RolloutTarget{}
 	waves := map[int]*wave{}
 
@@ -515,6 +517,9 @@ var errForbidden = errors.New("not allowed")
 const (
 	checked  = "on"
 	verbSync = "sync"
+	// flashClock is how a flash names a time.
+	flashClock = "Mon 15:04 UTC"
+	keyExpires = "expiresIn"
 )
 
 func (s *Server) perform(r *http.Request, id *api.Identity) (string, error) {
@@ -548,15 +553,9 @@ func (s *Server) perform(r *http.Request, id *api.Identity) (string, error) {
 
 			return fmt.Sprintf("Syncing %s (%d rollouts).", sel, len(ids)), nil
 		case "suspend":
-			var expires time.Duration
-
-			if raw := f.Get("expiresIn"); raw != "" {
-				d, err := time.ParseDuration(raw)
-				if err != nil {
-					return "", fmt.Errorf("expiry: %w", err)
-				}
-
-				expires = d
+			expires, err := expiry(f.Get(keyExpires))
+			if err != nil {
+				return "", err
 			}
 
 			sp, err := s.c.Suspend(ctx, reconcile.SuspendRequest{Actor: id.Name, Selector: sel, Reason: f.Get("reason"), Expires: expires})
@@ -564,7 +563,7 @@ func (s *Server) perform(r *http.Request, id *api.Identity) (string, error) {
 				return "", err
 			}
 
-			return fmt.Sprintf("Suspended %s until %s.", sel, sp.ExpiresAt.UTC().Format("Mon 15:04 UTC")), nil
+			return fmt.Sprintf("Suspended %s until %s.", sel, sp.ExpiresAt.UTC().Format(flashClock)), nil
 		default:
 			n, err := s.c.Resume(ctx, id.Name, sel)
 			if err != nil {
@@ -589,7 +588,7 @@ func (s *Server) perform(r *http.Request, id *api.Identity) (string, error) {
 
 		switch verb {
 		case "pause":
-			err = s.c.Pause(ctx, id.Name, rid)
+			return s.pause(ctx, id.Name, rid, f.Get(keyExpires))
 		case "promote":
 			err = s.c.Promote(ctx, id.Name, rid)
 		case "abort":
@@ -606,6 +605,35 @@ func (s *Server) perform(r *http.Request, id *api.Identity) (string, error) {
 	}
 
 	return "", fmt.Errorf("unknown action %q", verb)
+}
+
+// expiry reads an optional duration field; empty leaves the controller's default.
+func expiry(raw string) (time.Duration, error) {
+	if raw == "" {
+		return 0, nil
+	}
+
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("expiry: %w", err)
+	}
+
+	return d, nil
+}
+
+func (s *Server) pause(ctx context.Context, actor, rid, raw string) (string, error) {
+	expires, err := expiry(raw)
+	if err != nil {
+		return "", err
+	}
+
+	if err := s.c.Pause(ctx, reconcile.PauseRequest{Actor: actor, Rollout: rid, Expires: expires}); err != nil {
+		return "", err
+	}
+
+	v, _ := s.c.Rollout(rid)
+
+	return "Pause sent. It lapses on its own at " + v.PauseExpiresAt.UTC().Format(flashClock) + "; Promote lifts it sooner.", nil
 }
 
 // funcs are the template helpers.
@@ -628,6 +656,7 @@ func (s *Server) funcs() template.FuncMap {
 		},
 		"dur":   humanDuration,
 		"clock": func(t time.Time) string { return t.UTC().Format("Mon 15:04:05") },
+		"until": func(t time.Time) string { return humanDuration(t.Sub(s.now())) },
 		"lower": strings.ToLower,
 		"itoa":  strconv.Itoa,
 		"join":  strings.Join,

@@ -2,6 +2,7 @@ package reconcile
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -67,7 +68,7 @@ labels: {group: client, owner: owner, section: role, hiddenGroups: [side]}
 strategy: {batchSize: 2, progressDeadline: 50s, retry: {limit: 1}, soak: {duration: 60s, interval: 20s, failureLimit: 1}}
 strategies:
   nosoak:  {batchSize: 50%, soak: {duration: 0s}}
-  careful: {firstBatch: 1, batchSize: 50%, soak: {duration: 0s}, pauseAfterFirstBatch: true}
+  careful: {firstBatch: 1, batchSize: 50%, soak: {duration: 0s}}
   all:     {batchSize: 100%, soak: {duration: 0s}, waves: false}
 `
 
@@ -101,15 +102,18 @@ type world struct {
 	updateStuck     map[string]bool
 	notReady        map[string]bool
 	recoverOnUpdate map[string]bool
-	soakFail        map[string]bool
-	soakStdout      string
-	runErr          map[string]error
-	runResult       map[string]hooks.Result
-	gates           map[string]chan struct{}
-	entered         chan struct{}
-	resolved        int
+	// breakOnUpdate targets stop being ready once a build lands on them.
+	breakOnUpdate map[string]bool
+	soakFail      map[string]bool
+	soakStdout    string
+	runErr        map[string]error
+	runResult     map[string]hooks.Result
+	gates         map[string]chan struct{}
+	entered       chan struct{}
+	resolved      int
 
-	calls []string
+	calls      []string
+	soakInputs []any
 }
 
 func newWorld() *world {
@@ -123,6 +127,7 @@ func newWorld() *world {
 		updateStuck:     map[string]bool{},
 		notReady:        map[string]bool{},
 		recoverOnUpdate: map[string]bool{},
+		breakOnUpdate:   map[string]bool{},
 		soakFail:        map[string]bool{},
 		runErr:          map[string]error{},
 		runResult:       map[string]hooks.Result{},
@@ -193,6 +198,10 @@ func (w *world) Run(_ context.Context, program, hook, targetID string, input any
 
 	w.calls = append(w.calls, hook+":"+targetID+":"+program)
 
+	if hook == config.HookSoak {
+		w.soakInputs = append(w.soakInputs, input)
+	}
+
 	if err, ok := w.runErr[program]; ok {
 		return hooks.Result{}, err
 	}
@@ -206,7 +215,7 @@ func (w *world) Run(_ context.Context, program, hook, targetID string, input any
 	switch hook {
 	case config.HookInspect:
 		if w.inspectFail[targetID] {
-			res.OK, res.Reason = false, "connection refused"
+			res.OK, res.ExitCode, res.Reason = false, 1, "connection refused"
 
 			return res, nil
 		}
@@ -215,7 +224,7 @@ func (w *world) Run(_ context.Context, program, hook, targetID string, input any
 		res.Stdout = res.Reason
 	case config.HookUpdate:
 		if why, ok := w.updateFail[targetID]; ok {
-			res.OK, res.Reason = false, why
+			res.OK, res.ExitCode, res.Reason = false, 1, why
 
 			return res, nil
 		}
@@ -232,18 +241,22 @@ func (w *world) Run(_ context.Context, program, hook, targetID string, input any
 			if w.recoverOnUpdate[targetID] {
 				delete(w.notReady, targetID)
 			}
+
+			if w.breakOnUpdate[targetID] {
+				w.notReady[targetID] = true
+			}
 		}
 
 		res.Reason = "update started"
 	case config.HookReady:
 		if w.notReady[targetID] {
-			res.OK, res.Reason = false, "still syncing"
+			res.OK, res.ExitCode, res.Reason = false, 1, "still syncing"
 		} else {
 			res.Reason = "following"
 		}
 	case config.HookSoak:
 		if w.soakFail[program] {
-			res.OK, res.Reason = false, "61% vs 98%"
+			res.OK, res.ExitCode, res.Reason = false, 1, "61% vs 98%"
 		} else {
 			res.Reason = "fine"
 		}
@@ -396,6 +409,49 @@ func (h *harness) newController() *Controller {
 	require.NoError(h.t, err)
 
 	return c
+}
+
+// declare changes the config file's pause and group settings and applies them
+// to the running controller as the config watcher would.
+func (h *harness) declare(paused bool, groups map[string]config.Group) {
+	h.t.Helper()
+	h.cfg.Paused, h.cfg.Groups = paused, groups
+	require.NoError(h.t, h.c.ConfigureGroups(h.ctx, paused, groups))
+}
+
+// pause is an operator pausing a rollout for a while; zero takes the default.
+func (h *harness) pause(rollout string, expires time.Duration) error {
+	return h.c.Pause(h.ctx, PauseRequest{Actor: actor, Rollout: rollout, Expires: expires})
+}
+
+// lastSoakInput decodes the last soak input as the soak program reads it.
+func (h *harness) lastSoakInput() soakSeen {
+	h.t.Helper()
+	h.world.mu.Lock()
+	inputs := append([]any(nil), h.world.soakInputs...)
+	h.world.mu.Unlock()
+	require.NotEmpty(h.t, inputs)
+
+	raw, err := json.Marshal(inputs[len(inputs)-1])
+	require.NoError(h.t, err)
+
+	var in soakSeen
+
+	require.NoError(h.t, json.Unmarshal(raw, &in))
+
+	return in
+}
+
+// soakSeen is the part of a soak input the tests read, with timestamps kept
+// as text to check their encoding.
+type soakSeen struct {
+	Updated []struct {
+		ID        string `json:"id"`
+		Node      string `json:"node"`
+		Image     string `json:"image"`
+		UpdatedAt string `json:"updatedAt"`
+	} `json:"updated"`
+	Remaining []map[string]any `json:"remaining"`
 }
 
 // nextID hands out rollout and suspension ids that stay unique across

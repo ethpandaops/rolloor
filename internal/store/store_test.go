@@ -57,9 +57,6 @@ func TestRoundTrip(t *testing.T) {
 	require.NoError(t, s.SaveRollout(ctx, r), "upsert")
 	require.NoError(t, s.SaveRollout(ctx, &reconcile.Rollout{ID: "r0", Group: "b", CreatedAt: now}))
 
-	require.NoError(t, s.SavePolicy(ctx, "a", reconcile.Policy{Mode: reconcile.ModeManual, Strategy: "careful"}))
-	require.NoError(t, s.SavePolicy(ctx, "a", reconcile.Policy{Mode: reconcile.ModeAutomated, Strategy: "fast"}))
-
 	sp := &reconcile.Suspension{ID: "s1", Selector: targets.Selector{"node": "n1"}, Reason: "x", Actor: "sam", CreatedAt: now, ExpiresAt: now.Add(time.Hour)}
 	require.NoError(t, s.SaveSuspension(ctx, sp))
 	require.NoError(t, s.SaveSuspension(ctx, &reconcile.Suspension{ID: "s2"}))
@@ -101,7 +98,6 @@ func TestRoundTrip(t *testing.T) {
 	require.Equal(t, "r0", snap.Rollouts[0].ID)
 	require.Equal(t, reconcile.Complete, snap.Rollouts[1].State)
 	require.Equal(t, t1, snap.Rollouts[1].Targets[0].ID)
-	require.Equal(t, "fast", snap.Policies["a"].Strategy)
 	require.Len(t, snap.Suspensions, 1)
 	require.Equal(t, "n1", snap.Suspensions[0].Selector["node"])
 	require.Equal(t, sha, snap.Live[t1].Digest)
@@ -187,7 +183,6 @@ func TestClosedStoreFailsEveryCall(t *testing.T) {
 	require.NoError(t, s.Close())
 
 	require.Error(t, s.SaveRollout(ctx, &reconcile.Rollout{ID: "x"}))
-	require.Error(t, s.SavePolicy(ctx, "g", reconcile.Policy{}))
 	require.Error(t, s.SaveSuspension(ctx, &reconcile.Suspension{ID: "x"}))
 	require.Error(t, s.DeleteSuspension(ctx, "x"))
 	require.Error(t, s.SaveLive(ctx, "x", &reconcile.Live{}))
@@ -216,13 +211,6 @@ func TestCorruptRowsAreErrors(t *testing.T) {
 	_, err = s.Load(ctx)
 	require.ErrorContains(t, err, "load rollouts")
 	_, err = s.db.ExecContext(ctx, `DELETE FROM rollouts`)
-	require.NoError(t, err)
-
-	_, err = s.db.ExecContext(ctx, `INSERT INTO policies (group_name, data) VALUES ('g', 'not json')`)
-	require.NoError(t, err)
-	_, err = s.Load(ctx)
-	require.ErrorContains(t, err, "load policies")
-	_, err = s.db.ExecContext(ctx, `DELETE FROM policies`)
 	require.NoError(t, err)
 
 	_, err = s.db.ExecContext(ctx, `INSERT INTO suspensions (id, data) VALUES ('s', 'not json')`)

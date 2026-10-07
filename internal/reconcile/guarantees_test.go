@@ -10,6 +10,9 @@ import (
 
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
+
+	"github.com/ethpandaops/rolloor/internal/config"
+	"github.com/ethpandaops/rolloor/internal/hooks"
 )
 
 const (
@@ -18,6 +21,7 @@ const (
 	guaranteeNodeFive   = "node-5"
 	guaranteeEchoTarget = "node-5/tool"
 	updaterUnavailable  = "updater unavailable"
+	resumeAction        = "resume"
 )
 
 func TestGuaranteeDisruptionBudget(t *testing.T) {
@@ -104,30 +108,36 @@ func TestGuaranteeDurableUpdates(t *testing.T) {
 func TestGuaranteeHaltStopsOpenBatch(t *testing.T) {
 	for _, resume := range []string{"manual retry", "newer build"} {
 		t.Run(resume, func(t *testing.T) {
-			cfg := replaceLine(usageConfig, "firstBatch: 1, batchSize: 2", "firstBatch: 2, batchSize: 2, retry: {limit: 1}")
+			cfg := replaceLine(usageConfig, "firstBatch: 1, batchSize: 2", "firstBatch: 2, batchSize: 2")
 			h := newFleet(t, cfg)
+			bad := []string{tNode4Server, tNode5Server}
+
 			h.world.set(func(w *world) {
-				w.running["obs-2/server"] = d2
-				w.updateFail["node-5/server"] = updaterUnavailable
-				w.updateFail["node-4/server"] = updaterUnavailable
+				w.running[tObs2Server] = d2
+
+				for _, id := range bad {
+					w.breakOnUpdate[id] = true
+				}
 			})
 			h.release(imgBravoServer, d2)
-			r := h.until(h.active(clientBravo).ID, Halted, 10)
-			require.Equal(t, []string{"node-4/server", "node-5/server"}, r.Batches[0].Targets)
+			r := h.until(h.active(clientBravo).ID, Halted, 30)
+			require.Equal(t, bad, r.Batches[0].Targets)
 
+			// The broken targets are put back by hand and the fault is fixed;
+			// that alone reopens nothing.
 			before := h.updates()
-			h.world.set(func(w *world) { clear(w.updateFail) })
+			h.revert(bad...)
 			h.c = h.newController()
 			h.ticks(10, time.Minute)
 			require.Equal(t, Halted, h.rollout(r.ID).State)
 			require.Equal(t, before, h.updates(), "healing alone cannot reopen a halted batch")
-			require.Equal(t, []string{"obs-2/server"}, h.on(d2))
+			require.Equal(t, []string{tObs2Server}, h.on(d2))
 			require.Len(t, h.rollout(r.ID).Batches, 1)
 
 			want := d2
 
 			if resume == "manual retry" {
-				require.NoError(t, h.c.Retry(h.ctx, actor, r.ID, "updater recovered"))
+				require.NoError(t, h.c.Retry(h.ctx, actor, r.ID, "readiness fixed"))
 			} else {
 				want = d3
 				h.release(imgBravoServer, want)
@@ -135,35 +145,75 @@ func TestGuaranteeHaltStopsOpenBatch(t *testing.T) {
 			}
 
 			h.settle(100)
-			require.Equal(t, []string{"node-4/server", "node-5/server", "node-6/server", "obs-2/server"}, h.on(want))
+			require.Equal(t, []string{tNode4Server, tNode5Server, "node-6/server", tObs2Server}, h.on(want))
 		})
 	}
 }
 
+// revert puts targets back on the first build by hand and fixes whatever
+// broke them, as a person recovering a bad deployment would.
+func (h *harness) revert(ids ...string) {
+	h.world.set(func(w *world) {
+		for _, id := range ids {
+			w.running[id] = d1
+			delete(w.notReady, id)
+			delete(w.breakOnUpdate, id)
+		}
+	})
+}
+
 func TestGuaranteeTransientFailuresRecover(t *testing.T) {
 	t.Run("failed update attempt", guaranteeUpdateRetries)
-	t.Run("soak execution error", func(t *testing.T) {
+	t.Run("readiness unknown past the deadline", func(t *testing.T) {
 		h := newFleet(t, usageConfig)
-		h.world.set(func(w *world) { w.runErr[soakServer] = errors.New("cannot start check") })
+		h.world.set(func(w *world) { w.runErr[config.HookReady] = errors.New("checker unreachable") })
 		h.release(imgAlpha, d2)
-		r := h.until(h.active(clientAlpha).ID, Soaking, 10)
+		r := h.active(clientAlpha)
 
-		for range 10 {
-			if h.rollout(r.ID).Soak.ConsecutiveErrors > 0 {
-				break
-			}
-
+		for range 3 * int(h.cfg.Strategy.ProgressDeadline/(30*time.Second)) {
 			h.step()
 		}
 
 		r = h.rollout(r.ID)
-		require.Equal(t, Soaking, r.State)
-		require.Equal(t, 1, r.Soak.ConsecutiveErrors)
-		require.Zero(t, r.Soak.Failures)
+		require.Equal(t, Running, r.State, r.Reason)
+		require.Equal(t, PhaseUpdating, r.target(tObs1Server).Phase)
+		require.Equal(t, []string{tObs1Server}, h.on(d2))
+		require.Nil(t, h.view(tObs1Server).Quarantine)
+
 		h.world.set(func(w *world) { clear(w.runErr) })
 		h.settle(100)
 		require.Equal(t, Complete, h.rollout(r.ID).State)
 		require.Equal(t, h.clientTargets(clientAlpha), h.on(d2))
+		require.NotContains(t, h.history(r.ID), "rollout.halted")
+	})
+
+	t.Run("inspection unknown past the deadline", func(t *testing.T) {
+		h := newFleet(t, usageConfig)
+		h.world.set(func(w *world) { w.breakOnUpdate[tObs1Server] = true })
+		h.release(imgAlpha, d2)
+		h.tick()
+		r := h.active(clientAlpha)
+
+		// Readiness says no, but what runs there can no longer be confirmed.
+		h.world.set(func(w *world) { w.inspectFail[tObs1Server] = true })
+
+		for range 3 * int(h.cfg.Strategy.ProgressDeadline/(30*time.Second)) {
+			h.step()
+		}
+
+		r = h.rollout(r.ID)
+		require.Equal(t, Running, r.State, r.Reason)
+		require.Nil(t, h.view(tObs1Server).Quarantine)
+
+		h.world.set(func(w *world) {
+			clear(w.inspectFail)
+			clear(w.notReady)
+			clear(w.breakOnUpdate)
+		})
+		h.settle(100)
+		require.Equal(t, Complete, h.rollout(r.ID).State)
+		require.Equal(t, h.clientTargets(clientAlpha), h.on(d2))
+		require.NotContains(t, h.history(r.ID), "rollout.halted")
 	})
 }
 
@@ -177,11 +227,11 @@ func TestGuaranteeAutonomousConvergence(t *testing.T) {
 			w.running[tObs1Server] = d2
 
 			for _, id := range alphaRetried {
-				w.updateFail[id] = updaterUnavailable
+				w.breakOnUpdate[id] = true
 			}
 		})
 		h.release(imgAlpha, d2)
-		r := h.until(h.active(clientAlpha).ID, Halted, 20)
+		r := h.until(h.active(clientAlpha).ID, Halted, 30)
 		require.Equal(t, [][]string{{guaranteeNodeOne, guaranteeNodeTwo}}, batchNodes(&r))
 		h.swap(h.fleetWith(func(doc string) string {
 			doc = strings.ReplaceAll(doc, "node: node-1, weight: 100", "node: node-1, weight: 200")
@@ -197,24 +247,25 @@ func TestGuaranteeAutonomousConvergence(t *testing.T) {
 	})
 }
 
+// guaranteeAllowedHolds reaches every state a person may end, beside failures
+// that must heal by themselves, and checks that converge needs nothing else.
 func guaranteeAllowedHolds(t *testing.T) {
 	t.Helper()
 
 	s := guaranteeFleetSimulation(t, usageConfig)
 	h := s.h
-	require.NoError(t, h.c.SetPolicy(h.ctx, actor, clientCharlie, Policy{Mode: ModeManual, Strategy: careful}))
-	require.NoError(t, h.c.SetPolicy(h.ctx, actor, clientBravo, Policy{Mode: ModeAutomated, Strategy: careful}))
+	s.declare(false, map[string]config.Group{clientCharlie: {Paused: true}})
+
 	sp, err := h.c.Suspend(h.ctx, SuspendRequest{Actor: actor, Selector: mustSel("node=node-2"), Reason: maintenanceReason, Expires: time.Hour})
 	require.NoError(t, err)
 
 	s.suspended = append(s.suspended, propSuspension{sel: sp.Selector, expires: sp.ExpiresAt})
-	s.modes[clientCharlie] = ModeManual
 
 	h.world.set(func(w *world) {
 		w.updateFail["obs-1/store"] = updaterUnavailable
 		w.inspectFail["node-3/server"] = true
 		w.notReady["node-8/store"] = true
-		w.updateFail[tObs1Server] = updaterUnavailable
+		w.breakOnUpdate[tObs1Server] = true
 		w.runErr["soak-store"] = errors.New("check unavailable")
 
 		for _, target := range h.current().Targets {
@@ -225,11 +276,15 @@ func guaranteeAllowedHolds(t *testing.T) {
 	h.tick()
 	aborted := h.active("echo")
 	require.NoError(t, h.c.Abort(h.ctx, actor, aborted.ID))
-	alpha := h.until(h.active(clientAlpha).ID, Halted, 20)
+	require.NoError(t, h.pause(h.active(clientBravo).ID, 0))
+	alpha := h.until(h.active(clientAlpha).ID, Halted, 30)
 	bravo := h.until(h.active(clientBravo).ID, Paused, 40)
-	require.Equal(t, WaitingForSync, h.active(clientCharlie).State)
+	charlie := h.active(clientCharlie)
+	require.Equal(t, Running, charlie.State)
+	require.Empty(t, charlie.Batches)
+	require.Contains(t, charlie.Reason, "config")
 	require.Equal(t, Aborted, h.rollout(aborted.ID).State)
-	require.Equal(t, Suspended, h.view("node-2/server").Health)
+	require.Equal(t, Suspended, h.view(tNode2Server).Health)
 	require.Equal(t, Halted, h.rollout(alpha.ID).State)
 	require.Equal(t, Paused, h.rollout(bravo.ID).State)
 
@@ -250,9 +305,8 @@ func guaranteeFleetSimulation(t *testing.T, cfg string) *sim {
 	log := logrus.New()
 	log.SetOutput(io.Discard)
 	s := &sim{
-		h: h, fleet: &propFleet{}, log: log,
-		builds: map[string][]string{}, modes: map[string]string{}, pins: map[string]map[string]string{},
-		terminal: map[string]RolloutState{}, manual: map[string]bool{}, strategy: map[string]string{},
+		h: h, fleet: &propFleet{}, log: log, builds: map[string][]string{},
+		terminal: map[string]RolloutState{}, strategy: map[string]string{},
 	}
 
 	for _, target := range h.current().Targets {
@@ -319,7 +373,7 @@ func TestGuaranteeOneRolloutPerGroup(t *testing.T) {
 	require.Len(t, rollouts, 2)
 	require.Equal(t, Superseded, rollouts[0].State)
 	require.Equal(t, Complete, rollouts[1].State)
-	require.Equal(t, [][]string{{"node-4"}, {"node-5", "node-6"}}, batchNodes(&rollouts[1]))
+	require.Equal(t, [][]string{{"node-4"}, {guaranteeNodeFive, "node-6"}}, batchNodes(&rollouts[1]))
 
 	for _, id := range h.clientTargets(clientBravo) {
 		require.Equal(t, 1, h.updates()[id], "%s updated once", id)
@@ -338,9 +392,9 @@ func TestGuaranteeSuspendedTargetsNeverUpdate(t *testing.T) {
 	h.settle(100)
 	h.release(imgAlpha, d3)
 	h.settle(100)
-	require.Equal(t, []string{"node-2/agent", "node-2/server"}, intersect(h.on(d1), h.clientTargets(clientAlpha)))
-	require.Zero(t, h.updates()["node-2/server"])
-	require.Zero(t, h.updates()["node-2/agent"])
+	require.Equal(t, []string{tNode2Agent, tNode2Server}, intersect(h.on(d1), h.clientTargets(clientAlpha)))
+	require.Zero(t, h.updates()[tNode2Server])
+	require.Zero(t, h.updates()[tNode2Agent])
 
 	// The suspension runs out: node-2 goes straight to the latest build in a
 	// rollout of its own.
@@ -351,7 +405,7 @@ func TestGuaranteeSuspendedTargetsNeverUpdate(t *testing.T) {
 	last := h.rolloutsOf(clientAlpha)[2]
 	require.Equal(t, Complete, last.State)
 	require.Len(t, last.Targets, 2)
-	require.Equal(t, 1, h.updates()["node-2/server"], "d2 was never deployed on node-2")
+	require.Equal(t, 1, h.updates()[tNode2Server], "d2 was never deployed on node-2")
 }
 func guaranteeUnrelatedOutage(t *testing.T) {
 	t.Helper()
@@ -538,5 +592,422 @@ func guaranteeLandedDuringRestart(t *testing.T) {
 
 	for _, id := range h.clientTargets(clientAlpha) {
 		require.Equal(t, 1, h.updates()[id], "%s update landed once", id)
+	}
+}
+
+func TestGuaranteeUpdaterExhaustionSkips(t *testing.T) {
+	const skipped = "node-4/agent"
+
+	agents := []string{skipped, "node-5/agent", "node-6/agent"}
+
+	for _, tc := range []struct {
+		name     string
+		fail     func(w *world)
+		attempts int
+	}{
+		{name: "retries run out", fail: func(w *world) { w.updateFail[skipped] = updaterUnavailable }, attempts: 5},
+		{name: "the digest never arrives", fail: func(w *world) { w.updateStuck[skipped] = true }, attempts: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newFleet(t, usageConfig)
+			h.world.set(tc.fail)
+			h.release(imgBravoAgent, d2)
+			first := h.until(h.active(clientBravo).ID, Complete, 60)
+
+			// The target is skipped, its node stays reserved while the update
+			// may still land, and the rest goes on without a person.
+			rt := first.target(skipped)
+			require.Equal(t, PhaseSkipped, rt.Phase, rt.Reason)
+			require.Equal(t, tc.attempts, rt.UpdateAttempts)
+			require.Equal(t, tc.attempts, h.updates()[skipped])
+			require.Equal(t, [][]string{{"node-4"}, {guaranteeNodeFive}, {"node-6"}}, batchNodes(&first),
+				"node-4's reservation leaves room for one more node at a time")
+			require.NotContains(t, h.history(first.ID), "rollout.halted")
+			require.Nil(t, h.view(skipped).Quarantine)
+			require.Equal(t, agents[1:], intersect(h.on(d2), agents))
+
+			// Once the updater works again a later rollout catches it up.
+			h.world.set(func(w *world) {
+				clear(w.updateFail)
+				clear(w.updateStuck)
+			})
+			h.settle(100)
+			require.Equal(t, agents, intersect(h.on(d2), agents))
+
+			for _, r := range h.rolloutsOf(clientBravo) {
+				require.NotContains(t, h.history(r.ID), "rollout.halted")
+			}
+		})
+	}
+}
+
+func TestGuaranteeSoakErrorsRecover(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		fail func(w *world)
+	}{
+		{name: "the check cannot start", fail: func(w *world) { w.runErr[soakServer] = errors.New("cannot start check") }},
+		{name: "the check could not compare", fail: func(w *world) {
+			w.runResult[soakServer] = hooks.Result{Program: soakServer, ExitCode: 3, Reason: "metrics unavailable"}
+		}},
+		{name: "the check timed out", fail: func(w *world) {
+			w.runResult[soakServer] = hooks.Result{Program: soakServer, ExitCode: -1, TimedOut: true, Reason: "timed out"}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newFleet(t, usageConfig)
+			h.world.set(tc.fail)
+			h.release(imgAlpha, d2)
+			r := h.until(h.active(clientAlpha).ID, Soaking, 10)
+
+			// Thirty intervals, six times the soak duration: neither a halt nor
+			// a pass.
+			for range 60 {
+				h.step()
+			}
+
+			r = h.rollout(r.ID)
+			require.Equal(t, Soaking, r.State, r.Reason)
+			require.Len(t, r.Batches, 1)
+			require.False(t, r.Batches[0].Passed)
+			require.GreaterOrEqual(t, r.Soak.ConsecutiveErrors, 25)
+			require.Len(t, r.Soak.Checks, r.Soak.ConsecutiveErrors)
+			require.Zero(t, r.Soak.Failures)
+			require.Zero(t, r.Soak.Streak)
+
+			for _, check := range r.Soak.Checks {
+				require.True(t, check.Error)
+				require.False(t, check.OK)
+			}
+
+			require.Equal(t, []string{tObs1Server}, h.on(d2))
+
+			h.world.set(func(w *world) {
+				clear(w.runErr)
+				clear(w.runResult)
+			})
+			h.settle(100)
+			require.Equal(t, Complete, h.rollout(r.ID).State)
+			require.Equal(t, h.clientTargets(clientAlpha), h.on(d2))
+			require.NotContains(t, h.history(r.ID), "rollout.halted")
+		})
+	}
+}
+
+func TestGuaranteeConfigPause(t *testing.T) {
+	t.Run("top level holds every group and keeps observing", func(t *testing.T) {
+		h := newFleet(t, usageConfig)
+		h.declare(true, nil)
+
+		for _, g := range h.c.Fleet().Groups {
+			require.True(t, g.Paused, g.Name)
+		}
+
+		resolves := h.world.resolves()
+		h.world.set(func(w *world) { w.registry[imgBravoServer] = d2 })
+		h.release(imgAlpha, d2)
+		alpha := h.active(clientAlpha)
+		_, err := h.c.Sync(h.ctx, SyncRequest{Actor: actor, Selector: mustSel("client=alpha"), Force: true})
+		require.NoError(t, err)
+
+		for range 30 {
+			h.step()
+		}
+
+		alpha = h.rollout(alpha.ID)
+		require.Equal(t, Running, alpha.State)
+		require.Empty(t, alpha.Batches)
+		require.Contains(t, alpha.Reason, "config")
+		require.Equal(t, Running, h.active(clientBravo).State)
+		require.Empty(t, h.world.callsFor("update"))
+		require.Greater(t, h.world.resolves(), resolves)
+		require.Equal(t, OutOfSync, h.view(tObs1Server).Sync)
+
+		// A newer build is still noticed.
+		h.release(imgAlpha, d3)
+		require.Equal(t, Superseded, h.rollout(alpha.ID).State)
+		require.Equal(t, "3333333", h.active(clientAlpha).Digest)
+		require.Empty(t, h.world.callsFor("update"))
+
+		// Clearing the declaration resumes without any verb.
+		h.declare(false, nil)
+		h.settle(200)
+		require.Equal(t, h.clientTargets(clientAlpha), h.on(d3))
+		require.Equal(t, []string{tNode4Server, tNode5Server, "node-6/server", tObs2Server}, h.on(d2))
+	})
+
+	t.Run("a group pause lets the open batch finish and admits nothing more", func(t *testing.T) {
+		h := newFleet(t, usageConfig)
+		h.release(imgAlpha, d2)
+		r := h.until(h.active(clientAlpha).ID, Soaking, 10)
+		h.declare(false, map[string]config.Group{clientAlpha: {Paused: true}})
+		h.world.set(func(w *world) { w.registry[imgKilo] = d2 })
+
+		for range 30 {
+			h.step()
+		}
+
+		r = h.rollout(r.ID)
+		require.Equal(t, Running, r.State)
+		require.Len(t, r.Batches, 1)
+		require.True(t, r.Batches[0].Passed, "the open batch soaked to its end")
+		require.Contains(t, r.Reason, "config")
+		require.Equal(t, []string{tObs1Server}, intersect(h.on(d2), h.clientTargets(clientAlpha)))
+		require.NotEmpty(t, intersect(h.on(d2), h.clientTargets(clientKilo)), "other groups carry on")
+
+		alpha, _, _ := h.c.Group(clientAlpha)
+		kilo, _, _ := h.c.Group(clientKilo)
+
+		require.True(t, alpha.Paused)
+		require.False(t, kilo.Paused)
+		require.True(t, h.c.GroupPaused(clientAlpha))
+		require.False(t, h.c.GroupPaused(clientKilo))
+
+		h.declare(false, nil)
+		h.settle(200)
+		require.Equal(t, Complete, h.rollout(r.ID).State)
+		require.Subset(t, h.on(d2), h.clientTargets(clientAlpha))
+	})
+
+	t.Run("an undispatched update waits without starting its clock", func(t *testing.T) {
+		h, id, finish := queueUpdates(t, queuedFleet)
+		h.declare(false, map[string]config.Group{"a": {Paused: true}})
+		finish()
+
+		// Forced or not, and for longer than the progress deadline: the
+		// dispatched update is still observed, the queued one never starts.
+		_, err := h.c.Sync(h.ctx, SyncRequest{Actor: actor, Selector: mustSel("client=a"), Force: true})
+		require.NoError(t, err)
+		h.ticks(4, h.cfg.Strategy.ProgressDeadline)
+
+		r := h.rollout(id)
+		require.Equal(t, Running, r.State)
+		require.Equal(t, PhaseReady, r.target(tN1A).Phase)
+
+		queued := r.target(tN2A)
+		require.Equal(t, PhasePending, queued.Phase)
+		require.Zero(t, queued.UpdateAttempts)
+		require.True(t, queued.UpdatedAt.IsZero())
+		require.Empty(t, h.world.callsFor("update:"+tN2A))
+
+		h.declare(false, nil)
+		h.tick()
+		require.Len(t, h.world.callsFor("update:"+tN2A), 1)
+		require.Equal(t, Complete, h.drive(id, 10, 0).State)
+	})
+
+	t.Run("an interrupted update waits until the pause clears", func(t *testing.T) {
+		h := newHarness(t, replaceLine(testConfig, "retry: {limit: 1}", "retry: {limit: 5}"), retryFleet)
+		h.prime()
+		h.world.set(func(w *world) { w.updateStuck[tN1A] = true })
+		h.release(imgA, d2)
+		id := h.active("a").ID
+
+		// The process stops while the update runs and comes back paused.
+		h.c.mu.Lock()
+		h.c.rollouts[id].Targets[0].UpdateDone = false
+		require.NoError(t, h.c.saveRollout(h.ctx, h.c.rollouts[id]))
+		h.c.mu.Unlock()
+		h.cfg.Paused = true
+		h.c = h.newController()
+		h.world.set(func(w *world) { delete(w.updateStuck, tN1A) })
+		h.ticks(3, 0)
+		require.Len(t, h.world.callsFor("update:"+tN1A), 1)
+		require.Equal(t, 1, h.rolloutTarget(id, tN1A).UpdateAttempts)
+
+		h.declare(false, nil)
+		h.tick()
+		require.Len(t, h.world.callsFor("update:"+tN1A), 2, "the interrupted update runs again")
+		require.Equal(t, Complete, h.drive(id, 20, 20*time.Second).State)
+	})
+
+	t.Run("a failed update waits to retry until the pause clears", func(t *testing.T) {
+		cfg := replaceLine(testConfig, "retry: {limit: 1}", "retry: {limit: 5}")
+		cfg = replaceLine(cfg, "progressDeadline: 50s", "progressDeadline: 1h")
+		h := newHarness(t, cfg, retryFleet)
+		h.prime()
+		h.world.set(func(w *world) { w.updateFail[tN1A] = boom })
+		h.release(imgA, d2)
+		id := h.active("a").ID
+		h.declare(true, nil)
+		h.world.set(func(w *world) { delete(w.updateFail, tN1A) })
+		h.ticks(5, time.Minute)
+		require.Len(t, h.world.callsFor("update:"+tN1A), 1)
+		require.Equal(t, 1, h.rolloutTarget(id, tN1A).UpdateAttempts)
+		require.InDelta(t, 100, h.c.FleetStatus().UnavailableWeight, 0, "the dispatched target keeps its reservation")
+
+		h.declare(false, nil)
+		require.Equal(t, Complete, h.drive(id, 20, 20*time.Second).State)
+		require.Len(t, h.world.callsFor("update:"+tN1A), 2)
+	})
+}
+
+func TestGuaranteeOperatorPauseExpires(t *testing.T) {
+	// betweenBatches pauses group a's rollout once its first batch passed.
+	betweenBatches := func(t *testing.T, expires time.Duration) (*harness, string) {
+		t.Helper()
+
+		h := newHarness(t, testConfig, testTargets)
+		h.prime()
+		h.release(imgA, d2)
+		id := h.active("a").ID
+		h.ticks(4, 0)
+		h.ticks(4, 20*time.Second)
+		r := h.rollout(id)
+		require.Nil(t, r.CurrentBatch())
+		require.NoError(t, h.pause(id, expires))
+		require.Equal(t, Paused, h.rollout(id).State)
+
+		return h, id
+	}
+
+	t.Run("expiry resumes it, across a restart", func(t *testing.T) {
+		h, id := betweenBatches(t, time.Hour)
+		require.Equal(t, h.clock.Now().Add(time.Hour), h.rollout(id).PauseExpiresAt)
+
+		h.c = h.newController()
+		h.ticks(5, 11*time.Minute)
+		require.Equal(t, Paused, h.rollout(id).State)
+		require.Len(t, h.rollout(id).Batches, 1)
+
+		h.clock.Advance(5 * time.Minute)
+		h.tick()
+
+		r := h.rollout(id)
+		require.Equal(t, Running, r.State)
+		require.True(t, r.PauseExpiresAt.IsZero())
+		require.Len(t, r.Batches, 2)
+		require.Contains(t, h.notes.actions(), "pause.expired")
+		require.Equal(t, Complete, h.drive(id, 60, 20*time.Second).State)
+	})
+
+	t.Run("a pending pause that expires before its batch ends never pauses", func(t *testing.T) {
+		h := newHarness(t, testConfig, testTargets)
+		h.prime()
+		h.release(imgA, d2)
+		id := h.active("a").ID
+		require.NoError(t, h.pause(id, 30*time.Second))
+		require.True(t, h.rollout(id).PausePending)
+
+		h.ticks(4, 0)
+		h.ticks(4, 20*time.Second)
+
+		r := h.rollout(id)
+		require.Equal(t, Running, r.State)
+		require.False(t, r.PausePending)
+		require.True(t, r.Batches[0].Passed)
+		require.NotContains(t, h.history(id), "rollout.paused")
+		require.Equal(t, Complete, h.drive(id, 60, 20*time.Second).State)
+	})
+
+	t.Run("promote resumes it before the expiry", func(t *testing.T) {
+		h, id := betweenBatches(t, 0)
+		require.Equal(t, h.clock.Now().Add(24*time.Hour), h.rollout(id).PauseExpiresAt)
+		require.NoError(t, h.c.Promote(h.ctx, actor, id))
+
+		r := h.rollout(id)
+		require.Equal(t, Running, r.State)
+		require.True(t, r.PauseExpiresAt.IsZero())
+		require.Equal(t, Complete, h.drive(id, 60, 20*time.Second).State)
+	})
+
+	t.Run("expiry never lifts a halt", func(t *testing.T) {
+		h := newHarness(t, testConfig, testTargets)
+		h.prime()
+		h.world.set(func(w *world) { w.soakFail[soakA] = true })
+		h.release(imgA, d2)
+		id := h.active("a").ID
+		require.NoError(t, h.pause(id, 2*time.Minute))
+		h.ticks(5, 0)
+		h.clock.Advance(20 * time.Second)
+		h.tick()
+		require.Equal(t, Halted, h.rollout(id).State)
+
+		h.clock.Advance(2 * time.Minute)
+		h.tick()
+
+		r := h.rollout(id)
+		require.Equal(t, Halted, r.State)
+		require.False(t, r.PausePending)
+		require.NoError(t, h.c.Retry(h.ctx, actor, id, "probe fixed"))
+	})
+
+	t.Run("promote does not override a config pause", func(t *testing.T) {
+		h, id := betweenBatches(t, time.Hour)
+		h.declare(false, map[string]config.Group{"a": {Paused: true}})
+		require.NoError(t, h.c.Promote(h.ctx, actor, id))
+		h.ticks(3, 0)
+
+		r := h.rollout(id)
+		require.Equal(t, Running, r.State)
+		require.Len(t, r.Batches, 1)
+		require.Contains(t, r.Reason, "config")
+
+		h.declare(false, nil)
+		require.Equal(t, Complete, h.drive(id, 60, 20*time.Second).State)
+	})
+}
+
+func TestGuaranteeAbortKeepsBuild(t *testing.T) {
+	h := newFleet(t, usageConfig)
+	d4 := "sha256:" + strings.Repeat("4", 64)
+
+	h.release(imgAlpha, d2)
+	r := h.active(clientAlpha)
+	h.step()
+	require.NoError(t, h.c.Abort(h.ctx, actor, r.ID))
+
+	// The group stays behind; nothing reopens on its own, across a restart.
+	for range 5 {
+		h.step()
+	}
+
+	h.c = h.newController()
+	h.step()
+	require.False(t, h.anyActive())
+
+	// A person syncs the same build: a new rollout finishes the job.
+	_, err := h.c.Sync(h.ctx, SyncRequest{Actor: actor, Selector: mustSel("client=alpha")})
+	require.NoError(t, err)
+	h.settle(100)
+	require.Equal(t, h.clientTargets(clientAlpha), intersect(h.on(d2), h.clientTargets(clientAlpha)))
+
+	// Aborted again on the next build; a newer build rolls without a sync.
+	h.release(imgAlpha, d3)
+	require.NoError(t, h.c.Abort(h.ctx, actor, h.active(clientAlpha).ID))
+	h.release(imgAlpha, d4)
+	h.settle(100)
+	require.Equal(t, h.clientTargets(clientAlpha), intersect(h.on(d4), h.clientTargets(clientAlpha)))
+}
+
+func TestGuaranteeSuspensionExpires(t *testing.T) {
+	for _, lift := range []string{"expiry", resumeAction} {
+		t.Run(lift, func(t *testing.T) {
+			h := newFleet(t, usageConfig)
+			sel := mustSel("node=node-2")
+			_, err := h.c.Suspend(h.ctx, SuspendRequest{Actor: actor, Selector: sel, Reason: maintenanceReason, Expires: 2 * time.Hour})
+			require.NoError(t, err)
+
+			h.release(imgAlpha, d2)
+			h.settle(100)
+			require.Equal(t, []string{tNode2Agent, tNode2Server}, intersect(h.on(d1), h.clientTargets(clientAlpha)))
+			require.Equal(t, Suspended, h.view(tNode2Server).Health)
+
+			if lift == resumeAction {
+				_, err = h.c.Resume(h.ctx, actor, sel)
+				require.NoError(t, err)
+			} else {
+				h.clock.Advance(2 * time.Hour)
+			}
+
+			// The lifted node catches up in a rollout of its own.
+			h.settle(100)
+			require.Empty(t, h.c.Suspensions())
+			require.Equal(t, h.clientTargets(clientAlpha), intersect(h.on(d2), h.clientTargets(clientAlpha)))
+
+			last := h.rolloutsOf(clientAlpha)[1]
+			require.Equal(t, Complete, last.State)
+			require.Len(t, last.Targets, 2)
+		})
 	}
 }

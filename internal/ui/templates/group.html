@@ -28,9 +28,12 @@
 <dl class="facts">
   <div><dt>Selector</dt><dd><code>{{.GroupLabel}}={{.Group.Name}}</code></dd></div>
   <div><dt>Targets</dt><dd>{{.Group.Targets}}, on {{.Group.Nodes}} nodes</dd></div>
-  <div><dt>Policy</dt><dd>{{.Group.Policy.Mode}}, {{if .Group.Policy.Strategy}}{{.Group.Policy.Strategy}}{{else}}default{{end}} strategy{{if .Group.Policy.Pins}}, pinned{{end}}</dd></div>
+  <div><dt>Paused</dt><dd>{{if .Group.Paused}}yes, by the config file{{else}}no{{end}}</dd></div>
+  <div><dt>Strategy</dt><dd>{{if .Group.Strategy}}{{.Group.Strategy}}{{else}}default{{end}}</dd></div>
   <div><dt>Owner</dt><dd>{{.Group.Owner}}</dd></div>
 </dl>
+
+{{if .Group.Paused}}{{template "config-pause" .Group.Name}}{{end}}
 
 <div class="cards">
   <div class="card"><h3>Sync status</h3><div class="big">{{template "sync-badge" .Group.Sync}}</div><p>{{.Group.OnDesired}} of {{.Group.Targets}} on {{short (first .Group.Desired)}}{{with first .Group.Revisions}} ({{.}}){{end}}.</p></div>

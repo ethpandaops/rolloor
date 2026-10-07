@@ -35,7 +35,7 @@ func TestReadinessThresholdsSurviveRestart(t *testing.T) {
 	failed := h.view(tA1)
 	require.Equal(t, Degraded, failed.Health)
 	require.True(t, failed.Readiness.Since.After(since))
-	require.Equal(t, errFake.Error(), failed.Readiness.Reason)
+	require.Contains(t, failed.Readiness.Reason, errFake.Error())
 	require.Equal(t, failed.Readiness.ProbedAt, h.clock.Now())
 
 	h.world.set(func(w *world) { delete(w.runErr, "ready") })
@@ -264,12 +264,10 @@ func TestRetryDoesNotReviveReleasedHoldForSuspendedTarget(t *testing.T) {
 - {id: n2/b, node: n2, weight: 100, image: org/b:t, labels: {client: b, owner: b}}
 `)
 	h.prime()
-	h.world.set(func(w *world) { w.updateFail[tN1A] = boom })
-	h.release(imgA, d2)
-	r := h.active("a")
-	require.Equal(t, Halted, r.State)
+	r := h.haltOnBadBuild("a", imgA, d2, tN1A)
 	h.world.set(func(w *world) {
-		w.running[tN1A] = d2
+		delete(w.breakOnUpdate, tN1A)
+		delete(w.notReady, tN1A)
 		w.notReady["n2/b"] = true
 	})
 	h.clock.Advance(time.Second)
@@ -346,16 +344,22 @@ func TestRetryUsesTargetsOwnDesiredDigest(t *testing.T) {
 	h.prime()
 	h.world.set(func(w *world) {
 		w.registry[imgA], w.registry[imgB] = d2, d3
-		w.updateFail["n1/b"] = boom
+		w.breakOnUpdate["n1/b"] = true
 	})
 	h.clock.Advance(h.cfg.Registry.Poll)
 	h.tick()
 	r := h.active("a")
-	require.Equal(t, Halted, r.State)
-	h.world.set(func(w *world) {
-		delete(w.updateFail, "n1/b")
-		w.running["n1/b"] = d2
-	})
+
+	for i := 0; i < 20 && h.rollout(r.ID).State != Halted; i++ {
+		h.ticks(1, 20*time.Second)
+	}
+
+	require.Equal(t, Halted, h.rollout(r.ID).State)
+
+	// n1/b is put on image a's digest by hand; the retry must still move it
+	// to its own image's digest.
+	h.revert("n1/b")
+	h.world.set(func(w *world) { w.running["n1/b"] = d2 })
 	h.c.InspectAll(h.ctx)
 	require.NoError(t, h.c.Retry(h.ctx, actor, r.ID, "recovered"))
 	require.Equal(t, Complete, h.drive(r.ID, 40, h.cfg.Strategy.Soak.Interval).State)

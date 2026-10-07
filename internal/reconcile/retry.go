@@ -47,13 +47,9 @@ func updateDeadlineReason(now time.Time, rt *RolloutTarget, st *config.Strategy,
 	return fmt.Sprintf("did not reach %s within %s", shortDigest(desired), st.ProgressDeadline)
 }
 
-// updateJob plans an update; dispatch counts the attempt once it is sure to run.
-func (c *Controller) updateJob(now time.Time, r *Rollout, rt *RolloutTarget) job {
+// updateJob plans an update; durable dispatch starts its clock and counts the attempt.
+func (c *Controller) updateJob(r *Rollout, rt *RolloutTarget) job {
 	j := job{rollout: r.ID, target: rt.ID, hook: config.HookUpdate, retryAt: rt.RetryAt, batch: rt.Batch, attempts: rt.UpdateAttempts}
-	if rt.UpdateAttempts == 0 {
-		rt.UpdatedAt = now
-	}
-
 	rt.RetryAt = time.Time{}
 	rt.Reason = "update running"
 
@@ -66,13 +62,13 @@ func (c *Controller) retryUpdate(ctx context.Context, now time.Time, r *Rollout,
 	reason := updateFailure(rt, &st)
 
 	if deadline := updateDeadlineReason(now, rt, &st, ""); deadline != "" {
-		c.halt(ctx, now, r, rt.ID, deadline)
+		c.leave(now, r, rt, PhaseSkipped, "update skipped: "+deadline)
 
 		return
 	}
 
 	if rt.UpdateAttempts >= max(st.Retry.Limit, 1) {
-		c.halt(ctx, now, r, rt.ID, reason+"; retry limit reached")
+		c.leave(now, r, rt, PhaseSkipped, reason+"; target skipped after retry limit")
 
 		return
 	}
