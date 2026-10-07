@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
-# Prints the digest the container is running, as the registry names it: the
-# container's image id, then that image's repository digest.
+# Prints the registry digest, or none once docker reports the container absent.
+# Docker not answering or an image without a repository digest cannot be checked.
 set -euo pipefail
+source "$(dirname "$0")/lib.sh" || exit 3
 
 target=$(cat)
-service=$(jq -r .extra.service <<<"$target")
+service=$(jq -r '.extra.service // empty' <<<"$target")
+[ -n "$service" ] || answer 3 "the target has no extra.service"
 container="rolloor-example-${service}-1"
 
-image=$(docker inspect --format '{{.Image}}' "$container" 2>/dev/null) || {
-  echo "container $container not found"
-  exit 1
-}
+state=$(container_state "$service") || answer 3 "docker does not answer"
+[ "$state" != absent ] || answer 0 "none"
 
-repo_digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$image" 2>/dev/null) || {
-  echo "image $image has no repository digest"
-  exit 1
-}
+image=$(docker inspect --format '{{.Image}}' "$container") || answer 3 "docker inspect of $container failed"
+digests=$(docker image inspect --format '{{json .RepoDigests}}' "$image") || answer 3 "docker image inspect of $image failed"
+repo_digest=$(jq -r '.[0] // empty' <<<"$digests")
+[ -n "$repo_digest" ] || answer 3 "image $image has no repository digest"
 
 echo "${repo_digest##*@}"

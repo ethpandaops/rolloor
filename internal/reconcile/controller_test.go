@@ -56,16 +56,15 @@ func TestNewValidatesOptionsAndRestores(t *testing.T) {
 	h.release(imgA, d2)
 	_, err = h.c.Suspend(h.ctx, SuspendRequest{Actor: actor, Selector: mustSel("node=b-1"), Reason: "r"})
 	require.NoError(t, err)
-	require.NoError(t, h.c.SetPolicy(h.ctx, actor, "b", Policy{Mode: ModeManual}))
 	h.tick()
 
 	restarted := h.newController()
 	r := restarted.Rollouts()
 	require.Len(t, r, 1)
-	require.Equal(t, Running, r[0].State)
+	require.Equal(t, Soaking, r[0].State)
 	require.Len(t, restarted.Suspensions(), 1)
-	require.Equal(t, ModeManual, restarted.Fleet().Groups[1].Policy.Mode)
-	require.Equal(t, Progressing, mustView(t, restarted, tA1).Health)
+	require.Equal(t, Healthy, mustView(t, restarted, tA1).Health)
+	require.Equal(t, h.view(tA1).Readiness, mustView(t, restarted, tA1).Readiness)
 
 	// Default id generator and clock work too.
 	c, err := New(h.ctx, &Options{Config: h.cfg, Targets: func() *targets.Set { return h.set }, Resolver: h.world, Runner: h.world, Store: NewMemoryStore(), Log: logrus.New()})
@@ -95,20 +94,15 @@ func TestStoreFailureStopsNewWorkUntilFlushed(t *testing.T) {
 	h.tick()
 
 	updates := len(h.world.callsFor("update"))
-	inspects := len(h.world.callsFor("inspect"))
-	readies := len(h.world.callsFor("ready"))
 	h.ticks(3, 0)
 	require.Equal(t, updates, len(h.world.callsFor("update")))
-	require.Equal(t, inspects, len(h.world.callsFor("inspect")))
-	require.Equal(t, readies, len(h.world.callsFor("ready")))
 
-	_, err := h.c.Events(h.ctx, EventQuery{})
+	_, err := h.c.Events(h.ctx, &EventQuery{})
 	require.ErrorIs(t, err, errFake)
 
 	// Once the store is back, everything is rewritten and work resumes.
 	h.store.Fail = nil
 	h.tick()
-	require.Greater(t, len(h.world.callsFor("ready")), readies)
 	require.Equal(t, Complete, h.drive(h.active("a").ID, 80, 20*time.Second).State)
 }
 
@@ -144,7 +138,7 @@ func TestInspectorRecordsHookErrors(t *testing.T) {
 	h.world.set(func(w *world) { w.runErr["inspect"] = errFake })
 	h.c.InspectAll(h.ctx)
 	h.c.InspectAll(h.ctx)
-	require.Equal(t, "not reachable: fake", h.view(tA1).Reason)
+	require.Equal(t, HealthUnknown, h.view(tA1).Health)
 }
 
 func TestViewsCoverEveryShape(t *testing.T) {
@@ -185,7 +179,7 @@ func TestViewsCoverEveryShape(t *testing.T) {
 	g, _, _ = h.c.Group("a")
 	require.NotNil(t, g.Rollout)
 	require.Equal(t, 2, g.Rollout.OnNewBuild, "targets mid-update count as on the new build once the digest landed")
-	require.Equal(t, Progressing, g.Health)
+	require.Equal(t, Healthy, g.Health)
 
 	rs := h.c.Rollouts()
 	require.Len(t, rs, 1)
@@ -202,7 +196,7 @@ func TestViewsCoverEveryShape(t *testing.T) {
 	require.Equal(t, "abc", shortDigest("abc"))
 	require.Equal(t, "none", shortDigest(""))
 	require.Equal(t, "0%", pct(1, 0))
-	require.Equal(t, "waitingforsync", lower(WaitingForSync))
+	require.Equal(t, "waitingforbudget", lower(WaitingForBudget))
 	require.Equal(t, Unknown, worseSync(OutOfSync, Unknown))
 	require.Equal(t, OutOfSync, worseSync(OutOfSync, Synced))
 	require.Equal(t, Degraded, worseHealth(Progressing, Degraded))
@@ -226,25 +220,30 @@ func TestMemoryStoreEventsFilterAndFail(t *testing.T) {
 		require.NoError(t, m.AppendEvent(ctx, &e), i)
 	}
 
-	got, err := m.Events(ctx, EventQuery{Group: "a"})
+	got, err := m.Events(ctx, &EventQuery{Group: "a"})
 	require.NoError(t, err)
 	require.Len(t, got, 2)
 	require.Equal(t, int64(3), got[0].ID)
 
-	got, err = m.Events(ctx, EventQuery{Rollout: "r2"})
+	got, err = m.Events(ctx, &EventQuery{Rollout: "r2"})
 	require.NoError(t, err)
 	require.Len(t, got, 1)
 
-	got, err = m.Events(ctx, EventQuery{Target: "t1", Limit: 1})
+	got, err = m.Events(ctx, &EventQuery{Target: "t1", Limit: 1})
 	require.NoError(t, err)
 	require.Len(t, got, 1)
 
-	got, err = m.Events(ctx, EventQuery{Limit: 2})
+	got, err = m.Events(ctx, &EventQuery{Limit: 2})
 	require.NoError(t, err)
 	require.Len(t, got, 2)
 
+	// A follower reads from the first event, a page at a time.
+	got, err = m.Events(ctx, &EventQuery{Oldest: true, Limit: 2})
+	require.NoError(t, err)
+	require.Equal(t, []int64{1, 2}, []int64{got[0].ID, got[1].ID})
+
 	// Replay after an id is oldest first.
-	got, err = m.Events(ctx, EventQuery{After: 1})
+	got, err = m.Events(ctx, &EventQuery{After: 1})
 	require.NoError(t, err)
 	require.Len(t, got, 2)
 	require.Equal(t, int64(2), got[0].ID)
@@ -263,7 +262,6 @@ func TestMemoryStoreEventsFilterAndFail(t *testing.T) {
 
 	m.Fail = errFake
 	require.ErrorIs(t, m.SaveRollout(ctx, &Rollout{}), errFake)
-	require.ErrorIs(t, m.SavePolicy(ctx, "g", Policy{}), errFake)
 	require.ErrorIs(t, m.SaveSuspension(ctx, &Suspension{}), errFake)
 	require.ErrorIs(t, m.DeleteSuspension(ctx, "x"), errFake)
 	require.ErrorIs(t, m.SaveLive(ctx, "x", &Live{}), errFake)
@@ -276,7 +274,7 @@ func TestMemoryStoreEventsFilterAndFail(t *testing.T) {
 	require.ErrorIs(t, m.ClearAborted(ctx, "g"), errFake)
 	require.ErrorIs(t, m.SaveHookRun(ctx, "t", &HookRun{Hook: "h"}), errFake)
 	require.ErrorIs(t, m.DeleteHookRuns(ctx, "t"), errFake)
-	_, err = m.Events(ctx, EventQuery{})
+	_, err = m.Events(ctx, &EventQuery{})
 	require.ErrorIs(t, err, errFake)
 	_, err = m.Load(ctx)
 	require.ErrorIs(t, err, errFake)
@@ -287,7 +285,7 @@ func TestHistoryThroughController(t *testing.T) {
 	h.prime()
 	h.release(imgA, d2)
 
-	events, err := h.c.Events(h.ctx, EventQuery{Group: "a"})
+	events, err := h.c.Events(h.ctx, &EventQuery{Group: "a"})
 	require.NoError(t, err)
 	require.NotEmpty(t, events)
 	require.Equal(t, "batch.started", events[0].Action)

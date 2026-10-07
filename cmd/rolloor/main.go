@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -160,7 +162,7 @@ func newHookCommand(configPath *string) *cobra.Command {
 	)
 
 	cmd := &cobra.Command{
-		Use:   "hook <inspect|update|ready|soak|environment>",
+		Use:   "hook <inspect|update|ready|soak>",
 		Short: "Run one hook against one target with the document the controller would send",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -191,51 +193,51 @@ func runHook(ctx context.Context, out interface{ Write([]byte) (int, error) }, c
 		return err
 	}
 
-	var input any = map[string]string{"environment": cfg.Environment}
+	if !slices.Contains(config.TargetHooks, hook) {
+		return fmt.Errorf("unknown hook %q", hook)
+	}
 
-	if hook != config.HookEnvironment {
-		t, ok := set.Get(targetID)
-		if !ok {
-			return fmt.Errorf("target %q is not in the targets files", targetID)
+	t, ok := set.Get(targetID)
+	if !ok {
+		return fmt.Errorf("target %q is not in the targets files", targetID)
+	}
+
+	in := reconcile.HookInput{Target: t}
+
+	if desired == "" && hook != config.HookSoak && hook != config.HookReady {
+		resolver, rerr := registry.NewResolver(registryOptions(cfg), log)
+		if rerr != nil {
+			return rerr
 		}
 
-		// Target hooks get the same document the controller sends, desired
-		// digest included, so an update program can be tried by hand without
-		// falling back to the tag. Soak gets this target as the whole batch.
-		in := reconcile.HookInput{Target: t}
-
-		if desired == "" && hook != config.HookSoak {
-			resolver, rerr := registry.NewResolver(registryOptions(cfg), log)
-			if rerr != nil {
-				return rerr
-			}
-
-			res, rerr := resolver.Resolve(ctx, t.Image)
-			if rerr != nil {
-				return fmt.Errorf("resolve %s (pass --desired to skip): %w", t.Image, rerr)
-			}
-
-			desired = res.Digest
+		res, rerr := resolver.Resolve(ctx, t.Image)
+		if rerr != nil {
+			return fmt.Errorf("resolve %s (pass --desired to skip): %w", t.Image, rerr)
 		}
 
-		if desired != "" {
-			in.Desired, in.DesiredRef = desired, reconcile.DesiredRef(t.Image, desired)
-		}
+		desired = res.Digest
+	}
 
-		input = in
-		if hook == config.HookSoak {
-			input = map[string]any{"updated": []targets.Target{t}, "remaining": []targets.Target{}, "rollout": map[string]any{"id": "manual", "group": set.Group(&t), "batch": 1, "wave": set.Wave(&t)}}
-		}
+	if desired != "" {
+		in.Desired, in.DesiredRef = desired, reconcile.DesiredRef(t.Image, desired)
+	}
 
-		if program == "" {
-			program = t.Hooks[hook]
-		}
+	var input any = in
 
-		if program == "" {
-			program = cfg.Hooks.Defaults[hook]
-		}
-	} else if program == "" {
-		program = cfg.Hooks.Environment.Program
+	if hook == config.HookSoak {
+		updated := []struct {
+			targets.Target
+			UpdatedAt time.Time `json:"updatedAt"`
+		}{{Target: t, UpdatedAt: time.Now().UTC()}}
+		input = map[string]any{"updated": updated, "remaining": []targets.Target{}, "rollout": map[string]any{"id": "manual", "group": set.Group(&t), "batch": 1, "wave": set.Wave(&t)}}
+	}
+
+	if program == "" {
+		program = t.Hooks[hook]
+	}
+
+	if program == "" {
+		program = cfg.Hooks.Defaults[hook]
 	}
 
 	if program == "" {
@@ -303,14 +305,23 @@ func serve(ctx context.Context, configPath string) error {
 
 	events := api.NewBroadcaster()
 
-	var controller *reconcile.Controller
+	var (
+		controller *reconcile.Controller
+		published  atomic.Pointer[targets.Set]
+	)
 
 	watcher, err := targets.NewWatcher(cfg.TargetsDir, rulesFor(cfg), watchEvery, log,
-		func(old, current *targets.Set) {
-			if controller != nil {
-				controller.ReportTargetsError(ctx, nil)
-				forgetRemoved(ctx, controller, old, current)
+		func(_ *targets.Set, current *targets.Set) {
+			if controller == nil {
+				published.Store(current)
+
+				return
 			}
+
+			controller.ReplaceTargets(ctx, func() (*targets.Set, *targets.Set) {
+				return published.Swap(current), current
+			})
+			controller.ReportTargetsError(ctx, nil)
 		},
 		func(err error) {
 			if controller != nil {
@@ -321,8 +332,10 @@ func serve(ctx context.Context, configPath string) error {
 		return err
 	}
 
+	published.Store(watcher.Current())
+
 	controller, err = reconcile.New(ctx, &reconcile.Options{
-		Config: cfg, Targets: watcher.Current, Resolver: resolver, Runner: metrics.NewHookRunner(runner, reg),
+		Config: cfg, Targets: published.Load, Resolver: resolver, Runner: metrics.NewHookRunner(runner, reg),
 		Store: db, Notifier: events, Log: log, Concurrency: cfg.Inspect.Concurrency,
 	})
 	if err != nil {
@@ -331,14 +344,14 @@ func serve(ctx context.Context, configPath string) error {
 
 	reg.MustRegister(metrics.NewCollector(controller))
 
-	server := api.New(cfg, controller, watcher.Current, authorizer, events, version, log)
+	server := api.New(cfg, controller, published.Load, authorizer, events, version, log)
 
 	var loginURL func(string) string
 	if cfg.Auth.Mode != "none" {
 		loginURL = auth.LoginURL
 	}
 
-	pages, err := ui.New(cfg, controller, watcher.Current, authorizer, loginURL, version, log)
+	pages, err := ui.New(cfg, controller, published.Load, authorizer, loginURL, version, log)
 	if err != nil {
 		return err
 	}
@@ -360,10 +373,14 @@ func serve(ctx context.Context, configPath string) error {
 	log.WithFields(logrus.Fields{"environment": cfg.Environment, "listen": cfg.Listen, "targets": watcher.Current().Len(), "version": version}).Info("rolloor starting")
 
 	g, gctx := errgroup.WithContext(ctx)
+	controller.InspectAll(gctx)
+	controller.ProbeAll(gctx)
 
 	g.Go(func() error { return controller.RunInspector(gctx) })
+	g.Go(func() error { return controller.RunProber(gctx) })
 	g.Go(func() error { return controller.Run(gctx, tickEvery) })
 	g.Go(func() error { return watcher.Run(gctx) })
+	g.Go(func() error { return watchAutomation(gctx, configPath, controller, log) })
 
 	if teams != nil {
 		g.Go(func() error { return teams.Run(gctx, watchEvery) })
@@ -390,6 +407,57 @@ func serve(ctx context.Context, configPath string) error {
 		log.Info("rolloor stopped")
 
 		return nil
+	}
+
+	return err
+}
+
+func watchAutomation(ctx context.Context, path string, c *reconcile.Controller, log observability.ContextualLogger) error {
+	ticker := time.NewTicker(watchEvery)
+	defer ticker.Stop()
+
+	reload := automationReload{}
+
+	for {
+		if err := reload.apply(ctx, path, c); err != nil {
+			log.WithContext(ctx).WithError(err).Warn("config reload failed; keeping previous pause and group settings")
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+type automationReload struct {
+	modified time.Time
+	size     int64
+	applied  bool
+	failed   bool
+}
+
+func (r *automationReload) apply(ctx context.Context, path string, c *reconcile.Controller) error {
+	info, err := os.Stat(path)
+	if err == nil && r.applied && !r.failed && info.ModTime().Equal(r.modified) && info.Size() == r.size {
+		return nil
+	}
+
+	if err == nil {
+		var cfg *config.Config
+
+		cfg, err = config.Load(path)
+		if err == nil {
+			err = c.ConfigureGroups(ctx, cfg.Paused, cfg.Groups)
+		}
+	}
+
+	r.failed = err != nil
+	c.ReportConfigError(err)
+
+	if err == nil {
+		r.modified, r.size, r.applied = info.ModTime(), info.Size(), true
 	}
 
 	return err
@@ -439,20 +507,4 @@ func buildAuthorizer(ctx context.Context, cfg *config.Config, log observability.
 
 func registryOptions(cfg *config.Config) *registry.Options {
 	return &registry.Options{AuthFile: cfg.Registry.AuthFile, PlainHTTP: cfg.Registry.PlainHTTP, CAFile: cfg.Registry.CAFile, Timeout: cfg.Registry.Timeout}
-}
-
-// forgetRemoved drops live state for targets that were in the old set and
-// are not in the new one.
-func forgetRemoved(ctx context.Context, c *reconcile.Controller, old, current *targets.Set) {
-	var gone []string
-
-	for i := range old.Targets {
-		if _, ok := current.Get(old.Targets[i].ID); !ok {
-			gone = append(gone, old.Targets[i].ID)
-		}
-	}
-
-	if len(gone) > 0 {
-		c.Forget(ctx, gone)
-	}
 }

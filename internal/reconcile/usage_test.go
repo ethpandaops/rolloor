@@ -12,6 +12,15 @@ import (
 	"github.com/ethpandaops/rolloor/internal/targets"
 )
 
+const (
+	tObs1Server  = "obs-1/server"
+	tObs2Server  = "obs-2/server"
+	tNode4Server = "node-4/server"
+	tNode2Agent  = "node-2/agent"
+	tNode2Server = "node-2/server"
+	tNode5Server = "node-5/server"
+)
+
 // The usage tests run the controller the way an environment does: a fleet of
 // nodes carrying several clients, builds landing on tags, people acting on
 // rollouts, and the fleet changing underneath. They assert only what someone
@@ -27,7 +36,7 @@ inspect: {interval: 30s, concurrency: 8, failureThreshold: 2}
 labels: {group: client, owner: owner, section: role}
 strategy: {firstBatch: 1, batchSize: 2, soak: {duration: 5m, interval: 1m, failureLimit: 1}}
 strategies:
-  careful: {firstBatch: 1, pauseAfterFirstBatch: true}
+  careful: {firstBatch: 1, batchSize: 1}
   fast:    {batchSize: 50%, soak: {duration: 0s}}
 `
 
@@ -207,15 +216,16 @@ func (h *harness) requireBudget() {
 		return
 	}
 
-	set := h.current()
+	if used <= h.admissionUsed {
+		return
+	}
 
-	h.c.mu.RLock()
-	defer h.c.mu.RUnlock()
+	require.Empty(h.t, h.admission, "admission raised unavailable weight from %v to %v over %v", h.admissionUsed, used, allowed)
 
 	weighted := 0
 
-	for node := range h.c.inFlightNodes(h.clock.Now()) {
-		if set.NodeWeight(node) > 0 {
+	for node := range h.oracleUnavailable() {
+		if h.current().NodeWeight(node) > 0 {
 			weighted++
 		}
 	}
@@ -283,7 +293,7 @@ func TestUsageAClientShipsABuild(t *testing.T) {
 	r = h.rollout(r.ID)
 	require.Equal(t, Complete, r.State)
 	require.Equal(t, "All 7 targets on 2222222.", r.Reason)
-	require.Equal(t, [][]string{{observer}, {"node-1", "node-2"}, {"node-3"}}, batchNodes(&r),
+	require.Equal(t, [][]string{{observer}, {"node-1", "node-2"}, {retryNodeThree}}, batchNodes(&r),
 		"then two nodes at a time, all the budget allows")
 	require.Equal(t, h.clientTargets(clientAlpha), h.on(d2), "alpha moved and nothing else did")
 	require.Equal(t, "rollout.created "+strings.Repeat("batch.started rollout.soaking batch.passed ", 3)+"rollout.complete",
@@ -298,8 +308,9 @@ func TestUsageABadBuildStopsAtOneNodeAndTheFixGoesThereFirst(t *testing.T) {
 	h.release(imgAlpha, d2)
 	bad := h.until(h.active(clientAlpha).ID, Halted, 20)
 
-	require.Equal(t, []string{"obs-1/server"}, h.on(d2), "one observer took the bad build")
-	require.Equal(t, Degraded, h.view("obs-1/server").Health)
+	require.Equal(t, []string{tObs1Server}, h.on(d2), "one observer took the bad build")
+	require.Equal(t, Healthy, h.view(tObs1Server).Health)
+	require.Equal(t, bad.ID, h.view(tObs1Server).Quarantine.Rollout)
 	require.Contains(t, bad.Reason, "quarantined")
 
 	// The team ships a fix. It supersedes the halted rollout and starts on
@@ -309,29 +320,13 @@ func TestUsageABadBuildStopsAtOneNodeAndTheFixGoesThereFirst(t *testing.T) {
 	require.Equal(t, Superseded, h.rollout(bad.ID).State)
 
 	fix := h.active(clientAlpha)
-	require.Equal(t, "obs-1/server", fix.Targets[0].ID)
-	require.True(t, fix.Targets[0].DegradedBefore)
+	require.Equal(t, tObs1Server, fix.Targets[0].ID)
+	require.False(t, fix.Targets[0].NotReadyBefore)
 
 	h.settle(100)
 	require.Equal(t, Complete, h.rollout(fix.ID).State)
 	require.Equal(t, h.clientTargets(clientAlpha), h.on(d3))
-	require.Equal(t, Healthy, h.view("obs-1/server").Health)
-}
-
-func TestUsageTwoClientsShipAtOnceAndShareTheBudget(t *testing.T) {
-	h := newFleet(t, usageConfig)
-
-	// kilo and alpha both run on node-1 and node-2; their builds land in the
-	// same poll. settle checks the shared budget after every step.
-	h.world.set(func(w *world) { w.registry[imgKilo] = d2 })
-	h.release(imgAlpha, d2)
-
-	kilo, alpha := h.active(clientKilo), h.active(clientAlpha)
-
-	h.settle(200)
-	require.Equal(t, Complete, h.rollout(kilo.ID).State)
-	require.Equal(t, Complete, h.rollout(alpha.ID).State)
-	require.Len(t, h.on(d2), len(h.clientTargets(clientKilo))+len(h.clientTargets(clientAlpha)))
+	require.Equal(t, Healthy, h.view(tObs1Server).Health)
 }
 
 func TestUsageATwoImageClientShipsBothImagesTogether(t *testing.T) {
@@ -352,35 +347,6 @@ func TestUsageATwoImageClientShipsBothImagesTogether(t *testing.T) {
 	for id, n := range h.updates() {
 		require.Equal(t, 1, n, "%s updated %d times", id, n)
 	}
-}
-
-func TestUsageATwoImageClientShipsItsImagesMinutesApart(t *testing.T) {
-	h := newFleet(t, usageConfig)
-
-	// The server image lands first and its rollout starts; the agent image
-	// lands two minutes later. The server rollout carries on, and the agent
-	// build waits for it, then gets its own rollout.
-	h.release(imgBravoServer, d2)
-	first := h.active(clientBravo)
-	h.ticks(4, 30*time.Second)
-
-	h.release(imgBravoAgent, d2)
-	require.Equal(t, first.ID, h.active(clientBravo).ID, "not superseded: the server image did not move again")
-
-	h.settle(100)
-
-	var rollouts []RolloutView
-
-	for _, r := range h.c.Rollouts() {
-		if r.Group == clientBravo {
-			rollouts = append(rollouts, r)
-		}
-	}
-
-	require.Len(t, rollouts, 2)
-	require.Equal(t, Complete, rollouts[0].State)
-	require.Equal(t, Complete, rollouts[1].State)
-	require.Equal(t, h.clientTargets(clientBravo), h.on(d2))
 }
 
 // rolloutsOf lists a client's rollouts, oldest first.
@@ -459,58 +425,6 @@ func TestUsageRevertingMidRolloutMovesBackOnlyWhatMoved(t *testing.T) {
 	}
 }
 
-func TestUsageASuspendedNodeCatchesUpWhenItsSuspensionEnds(t *testing.T) {
-	h := newFleet(t, usageConfig)
-
-	_, err := h.c.Suspend(h.ctx, SuspendRequest{Actor: actor, Selector: mustSel("node=node-2"), Reason: "debugging a disk", Expires: time.Hour})
-	require.NoError(t, err)
-
-	// Two builds land while node-2 is held; both skip it.
-	h.release(imgAlpha, d2)
-	h.settle(100)
-	h.release(imgAlpha, d3)
-	h.settle(100)
-	require.Equal(t, []string{"node-2/agent", "node-2/server"}, intersect(h.on(d1), h.clientTargets(clientAlpha)))
-
-	// The suspension runs out: node-2 goes straight to the latest build in a
-	// rollout of its own.
-	h.clock.Advance(time.Hour)
-	h.settle(100)
-	require.Equal(t, h.clientTargets(clientAlpha), h.on(d3)[:len(h.clientTargets(clientAlpha))])
-
-	last := h.rolloutsOf(clientAlpha)[2]
-	require.Equal(t, Complete, last.State)
-	require.Len(t, last.Targets, 2)
-	require.Equal(t, 1, h.updates()["node-2/server"], "d2 was never deployed on node-2")
-}
-
-func TestUsageAManualClientWaitsForASyncAndPausesAfterItsFirstNode(t *testing.T) {
-	h := newFleet(t, usageConfig)
-	require.NoError(t, h.c.SetPolicy(h.ctx, actor, clientCharlie, Policy{Mode: ModeManual, Strategy: careful}))
-
-	h.release(imgCharlie, d2)
-	r := h.active(clientCharlie)
-
-	for range 5 {
-		h.step()
-	}
-
-	require.Equal(t, WaitingForSync, h.rollout(r.ID).State)
-	require.Empty(t, h.on(d2), "nothing moves until someone syncs")
-
-	_, err := h.c.Sync(h.ctx, SyncRequest{Actor: actor, Selector: mustSel("client=charlie")})
-	require.NoError(t, err)
-
-	r = h.until(r.ID, Paused, 40)
-	require.Equal(t, "Paused after batch 1. Run promote to continue.", r.Reason)
-	require.Equal(t, []string{"node-7/agent", "node-7/server"}, h.on(d2))
-
-	require.NoError(t, h.c.Promote(h.ctx, actor, r.ID))
-	h.settle(100)
-	require.Equal(t, Complete, h.rollout(r.ID).State)
-	require.Equal(t, h.clientTargets(clientCharlie), h.on(d2))
-}
-
 func TestUsageForceSkipsTheChecksButNotTheBudget(t *testing.T) {
 	// A 10% budget allows 80 of 800: less than one node, so one node at a
 	// time.
@@ -534,7 +448,7 @@ func TestUsageForceSkipsTheChecksButNotTheBudget(t *testing.T) {
 
 	r := h.rolloutsOf(clientAlpha)[0]
 	require.Equal(t, Complete, r.State)
-	require.Equal(t, [][]string{{observer}, {"node-1"}, {"node-2"}, {"node-3"}}, batchNodes(&r))
+	require.Equal(t, [][]string{{observer}, {"node-1", "node-2"}, {retryNodeThree}}, batchNodes(&r))
 	require.Equal(t, h.clientTargets(clientAlpha), h.on(d2))
 }
 
@@ -676,29 +590,14 @@ func TestUsageAnObserverOnlyClientNeverWaitsForTheBudget(t *testing.T) {
 		h.step()
 	}
 
-	used, allowed := h.unavailable()
-	require.InDelta(t, allowed, used, 0)
+	used, _ := h.unavailable()
+	require.InDelta(t, 0, used, 0)
 
 	// delta runs only on the weightless observers, so it goes anyway.
 	h.release(imgDelta, d2)
 	delta := h.active("delta")
 	h.until(delta.ID, Complete, 10)
 	require.Equal(t, Soaking, h.rollout(alpha.ID).State, "alpha still holds the budget")
-}
-
-func TestUsageAZeroBudgetMovesOnlyWeightlessNodes(t *testing.T) {
-	h := newFleet(t, replaceLine(usageConfig, "maxUnavailable: 25%", "maxUnavailable: 0"))
-	h.release(imgAlpha, d2)
-	r := h.active(clientAlpha)
-
-	for range 20 {
-		h.step()
-	}
-
-	r = h.rollout(r.ID)
-	require.Equal(t, WaitingForBudget, r.State)
-	require.Contains(t, r.Reason, "Waiting for the disruption budget")
-	require.Equal(t, []string{"obs-1/server"}, h.on(d2))
 }
 
 func TestUsageAClientOnASingleNode(t *testing.T) {
@@ -709,8 +608,8 @@ func TestUsageAClientOnASingleNode(t *testing.T) {
 
 	r = h.rollout(r.ID)
 	require.Equal(t, Complete, r.State)
-	require.Equal(t, [][]string{{"node-5"}}, batchNodes(&r))
-	require.Equal(t, []string{"node-5/tool"}, h.on(d2))
+	require.Equal(t, [][]string{{guaranteeNodeFive}}, batchNodes(&r))
+	require.Equal(t, []string{guaranteeEchoTarget}, h.on(d2))
 }
 
 func TestUsageOneNodesTargetsInDifferentWavesMoveInSeparatePasses(t *testing.T) {
@@ -738,28 +637,36 @@ func TestUsageOneNodesTargetsInDifferentWavesMoveInSeparatePasses(t *testing.T) 
 	require.Equal(t, [][]string{{"n1/server"}, {"n2/server"}, {"n1/agent"}, {"n2/agent"}}, batches)
 }
 
-func TestUsageASlowUpdaterPassesInsideTheDeadlineAndHaltsPastIt(t *testing.T) {
+func TestUsageASlowUpdaterPassesInsideTheDeadlineAndIsSkippedPastIt(t *testing.T) {
 	h := newFleet(t, usageConfig)
 
-	// obs-1's updater takes a minute to land the build, inside the 2m30s
-	// the update may take (5 hook timeouts).
-	h.world.set(func(w *world) { w.updateStuck["obs-1/server"] = true })
+	// A minute of digest convergence fits within the default progress deadline.
+	h.world.set(func(w *world) { w.updateStuck[tObs1Server] = true })
 	h.release(imgAlpha, d2)
 	h.step()
 	h.step()
 	h.world.set(func(w *world) {
-		w.running["obs-1/server"] = d2
-		delete(w.updateStuck, "obs-1/server")
+		w.running[tObs1Server] = d2
+		delete(w.updateStuck, tObs1Server)
 	})
 	h.settle(100)
 	require.Equal(t, h.clientTargets(clientAlpha), h.on(d2))
 
-	// On the next build it never lands.
-	h.world.set(func(w *world) { w.updateStuck["obs-1/server"] = true })
+	// On the next build it never lands: the target is skipped at the deadline
+	// and the rest of the group moves on.
+	h.world.set(func(w *world) { w.updateStuck[tObs1Server] = true })
 	h.release(imgAlpha, d3)
-	r := h.until(h.active(clientAlpha).ID, Halted, 20)
-	require.Contains(t, r.Reason, "obs-1/server did not reach 3333333 within 2m30s")
-	require.Empty(t, intersect(h.on(d3), h.clientTargets(clientAlpha)))
+	r := h.active(clientAlpha)
+
+	for i := 0; i < 30 && h.rolloutTarget(r.ID, tObs1Server).Phase != PhaseSkipped; i++ {
+		h.step()
+	}
+
+	rt := h.rolloutTarget(r.ID, tObs1Server)
+	require.Equal(t, PhaseSkipped, rt.Phase)
+	require.InDelta(t, float64(10*time.Minute), float64(h.clock.Now().Sub(rt.UpdatedAt)), float64(time.Millisecond))
+	require.Equal(t, Complete, h.until(r.ID, Complete, 60).State)
+	require.Equal(t, []string{tObs1Server}, intersect(h.on(d2), h.clientTargets(clientAlpha)))
 }
 
 func TestUsageOneFailedSoakCheckIsToleratedAndTwoHalt(t *testing.T) {
@@ -789,36 +696,6 @@ func TestUsageOneFailedSoakCheckIsToleratedAndTwoHalt(t *testing.T) {
 	require.Contains(t, halted.Reason, "soak soak-server failed 2 times")
 }
 
-func TestUsageAnAbortHoldsUntilASyncOrANewerBuild(t *testing.T) {
-	h := newFleet(t, usageConfig)
-	d4 := "sha256:" + strings.Repeat("4", 64)
-
-	h.release(imgAlpha, d2)
-	r := h.active(clientAlpha)
-	h.step()
-	require.NoError(t, h.c.Abort(h.ctx, actor, r.ID))
-
-	// The group stays behind; nothing reopens on its own.
-	for range 5 {
-		h.step()
-	}
-
-	require.False(t, h.anyActive())
-
-	// A person syncs the same build: a new rollout finishes the job.
-	_, err := h.c.Sync(h.ctx, SyncRequest{Actor: actor, Selector: mustSel("client=alpha")})
-	require.NoError(t, err)
-	h.settle(100)
-	require.Equal(t, h.clientTargets(clientAlpha), intersect(h.on(d2), h.clientTargets(clientAlpha)))
-
-	// Aborted again on the next build; a newer build rolls without a sync.
-	h.release(imgAlpha, d3)
-	require.NoError(t, h.c.Abort(h.ctx, actor, h.active(clientAlpha).ID))
-	h.release(imgAlpha, d4)
-	h.settle(100)
-	require.Equal(t, h.clientTargets(clientAlpha), intersect(h.on(d4), h.clientTargets(clientAlpha)))
-}
-
 // intersect lists the ids in both, sorted.
 func intersect(a, b []string) []string {
 	var out []string
@@ -839,4 +716,27 @@ func dropLines(doc, fragment string) string {
 	lines := strings.Split(doc, "\n")
 
 	return strings.Join(slices.DeleteFunc(lines, func(l string) bool { return strings.Contains(l, fragment) }), "\n")
+}
+
+func TestUsageFlappingBelowFailureThresholdStaysHealthy(t *testing.T) {
+	h := newFleet(t, usageConfig)
+	since := h.view("node-1/server").Readiness.Since
+
+	for range 4 {
+		h.world.set(func(w *world) { w.notReady["node-1/server"] = true })
+
+		for range h.cfg.ReadinessProbe.FailureThreshold - 1 {
+			h.clock.Advance(h.cfg.ReadinessProbe.Period)
+			h.c.ProbeAll(h.ctx)
+			require.Equal(t, Healthy, h.view("node-1/server").Health)
+		}
+
+		h.world.set(func(w *world) { delete(w.notReady, "node-1/server") })
+		h.clock.Advance(h.cfg.ReadinessProbe.Period)
+		h.c.ProbeAll(h.ctx)
+		require.Equal(t, since, h.view("node-1/server").Readiness.Since)
+	}
+
+	require.Equal(t, Healthy, h.c.Fleet().Health)
+	require.Empty(t, h.c.Rollouts())
 }

@@ -29,6 +29,12 @@ const (
 	d2 = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
 )
 
+const (
+	foreignOrigin = "https://evil.example"
+	mediaText     = "text/plain"
+	keyPaused     = "paused"
+)
+
 var errFake = errors.New("fake")
 
 const admin = "sam"
@@ -122,6 +128,7 @@ func newFixture(t *testing.T) *fixture {
 	require.NoError(t, err)
 
 	f.c.InspectAll(f.ctx)
+	f.c.ProbeAll(f.ctx)
 	require.NoError(t, f.c.Tick(f.ctx))
 
 	s := New(cfg, f.c, func() *targets.Set { return f.set }, f.auth, f.bc, "test", logrus.New())
@@ -185,6 +192,7 @@ func TestReadRoutes(t *testing.T) {
 	code, body, _ = f.do(http.MethodGet, "/api/v1/groups/client/a", "")
 	require.Equal(t, http.StatusOK, code)
 	require.Len(t, body["targets"], 2)
+	require.Equal(t, map[string]any{keyPaused: false}, pick(body["group"], keyPaused, "strategy"), "the default strategy has no name")
 
 	code, _, _ = f.do(http.MethodGet, "/api/v1/nodes/zzz", "")
 	require.Equal(t, http.StatusNotFound, code)
@@ -221,13 +229,6 @@ func TestReadRoutes(t *testing.T) {
 	code, _, raw = f.do(http.MethodGet, "/api/v1/history?selector=client=a", "")
 	require.Equal(t, http.StatusOK, code)
 	require.Equal(t, "[]\n", raw, "digest events name images, not targets")
-
-	code, _, _ = f.do(http.MethodGet, "/api/v1/policies/zzz", "")
-	require.Equal(t, http.StatusNotFound, code)
-	code, body, _ = f.do(http.MethodGet, "/api/v1/policies/a", "")
-	require.Equal(t, http.StatusOK, code)
-	require.Equal(t, reconcile.ModeAutomated, body["mode"])
-	require.NotContains(t, body, "strategy", "the default strategy has no name")
 
 	code, _, raw = f.do(http.MethodGet, "/api/v1/suspensions", "")
 	require.Equal(t, http.StatusOK, code)
@@ -299,7 +300,97 @@ func TestRolloutRoutesAndVerbs(t *testing.T) {
 	require.Equal(t, "refreshing", body["status"])
 }
 
-func TestSuspendResumeAndPolicy(t *testing.T) {
+// pick returns the named fields present in a decoded JSON object.
+func pick(v any, keys ...string) map[string]any {
+	obj, _ := v.(map[string]any)
+	out := map[string]any{}
+
+	for _, k := range keys {
+		if x, ok := obj[k]; ok {
+			out[k] = x
+		}
+	}
+
+	return out
+}
+
+func TestGroupsShowDeclaredPauseAndStrategy(t *testing.T) {
+	f := newFixture(t)
+	require.NoError(t, f.c.ConfigureGroups(f.ctx, false, map[string]config.Group{"a": {Paused: true, Strategy: "fast"}}))
+
+	_, body, _ := f.do(http.MethodGet, "/api/v1/groups/client/a", "")
+	require.Equal(t, map[string]any{keyPaused: true, "strategy": "fast"}, pick(body["group"], keyPaused, "strategy"))
+	_, body, _ = f.do(http.MethodGet, "/api/v1/groups/client/b", "")
+	require.Equal(t, map[string]any{keyPaused: false}, pick(body["group"], keyPaused, "strategy"))
+
+	// A pause at the top holds every group, whatever its own settings say.
+	require.NoError(t, f.c.ConfigureGroups(f.ctx, true, nil))
+
+	_, body, _ = f.do(http.MethodGet, "/api/v1/fleet", "")
+	groups, isList := body["groups"].([]any)
+	require.True(t, isList)
+	require.NotEmpty(t, groups)
+
+	for _, g := range groups {
+		require.Equal(t, map[string]any{keyPaused: true}, pick(g, keyPaused, "strategy"))
+	}
+}
+
+func TestPolicyRoutesAreGone(t *testing.T) {
+	f := newFixture(t)
+
+	for _, method := range []string{http.MethodGet, http.MethodPut} {
+		code, _, _ := f.do(method, "/api/v1/policies/a", `{"mode": "manual", "strategy": "fast"}`)
+		require.Equal(t, http.StatusNotFound, code, method)
+	}
+
+	g, _, ok := f.c.Group("a")
+	require.True(t, ok)
+	require.Empty(t, g.Strategy)
+}
+
+func TestPauseTakesAnOptionalExpiry(t *testing.T) {
+	f := newFixture(t)
+	f.release()
+
+	code, body, _ := f.do(http.MethodPost, "/api/v1/actions/pause", `{"rollout": "r-1", "expiresIn": "soon"}`)
+	require.Equal(t, http.StatusBadRequest, code)
+	require.Contains(t, body["error"], "expiresIn")
+
+	r1, ok := f.c.Rollout("r-1")
+	require.True(t, ok)
+	require.False(t, r1.PausePending, "a malformed expiry pauses nothing")
+	require.Zero(t, r1.PauseExpiresAt)
+
+	for _, tc := range []struct {
+		name string
+		body string
+		want time.Duration
+	}{
+		{name: "absent", body: `{"rollout": "r-1"}`, want: 24 * time.Hour},
+		{name: "a duration", body: `{"rollout": "r-1", "expiresIn": "2h"}`, want: 2 * time.Hour},
+		{name: "nonpositive", body: `{"rollout": "r-1", "expiresIn": "-1h"}`, want: 24 * time.Hour},
+	} {
+		code, body, _ = f.do(http.MethodPost, "/api/v1/actions/pause", tc.body)
+		require.Equal(t, http.StatusOK, code, tc.name)
+		require.Equal(t, true, body["pausePending"], tc.name)
+
+		raw, isString := body["pauseExpiresAt"].(string)
+		require.True(t, isString, tc.name)
+
+		at, err := time.Parse(time.RFC3339Nano, raw)
+		require.NoError(t, err, tc.name)
+		require.WithinDuration(t, time.Now().Add(tc.want), at, time.Minute, tc.name)
+
+		// Promote lifts the pause before it lapses and forgets the expiry.
+		code, body, _ = f.do(http.MethodPost, "/api/v1/actions/promote", `{"rollout": "r-1"}`)
+		require.Equal(t, http.StatusOK, code, tc.name)
+		require.NotContains(t, body, "pausePending", tc.name)
+		require.NotContains(t, body, "pauseExpiresAt", tc.name)
+	}
+}
+
+func TestSuspendAndResume(t *testing.T) {
 	f := newFixture(t)
 
 	code, _, _ := f.do(http.MethodPost, "/api/v1/actions/suspend", `{"selector": "node=a-1", "reason": "x", "expiresIn": "soon"}`)
@@ -321,16 +412,6 @@ func TestSuspendResumeAndPolicy(t *testing.T) {
 	code, body, _ = f.do(http.MethodPost, "/api/v1/actions/resume", `{"selector": "node=a-1"}`)
 	require.Equal(t, http.StatusOK, code)
 	require.InDelta(t, 1, body["lifted"], 0)
-
-	code, _, _ = f.do(http.MethodPut, "/api/v1/policies/zzz", `{"mode": "manual", "strategy": "fast"}`)
-	require.Equal(t, http.StatusNotFound, code)
-	code, _, _ = f.do(http.MethodPut, "/api/v1/policies/a", `{"mode": "manual"`)
-	require.Equal(t, http.StatusBadRequest, code)
-	code, _, _ = f.do(http.MethodPut, "/api/v1/policies/a", `{"mode": "manual", "strategy": "warp"}`)
-	require.Equal(t, http.StatusBadRequest, code)
-	code, body, _ = f.do(http.MethodPut, "/api/v1/policies/a", `{"mode": "manual", "strategy": "fast"}`)
-	require.Equal(t, http.StatusOK, code)
-	require.Equal(t, "manual", body["mode"])
 }
 
 func TestAuthorization(t *testing.T) {
@@ -349,8 +430,6 @@ func TestAuthorization(t *testing.T) {
 	require.Equal(t, []any{"b"}, body["ownersHeld"])
 
 	code, _, _ = f.do(http.MethodPost, "/api/v1/actions/pause", `{"rollout": "r-1"}`)
-	require.Equal(t, http.StatusForbidden, code)
-	code, _, _ = f.do(http.MethodPut, "/api/v1/policies/a", `{"mode": "manual", "strategy": "fast"}`)
 	require.Equal(t, http.StatusForbidden, code)
 
 	code, _, _ = f.do(http.MethodPost, "/api/v1/actions/sync", `{"selector": "client=b"}`)
@@ -394,6 +473,110 @@ func TestAuthorization(t *testing.T) {
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, "yes", resp.Header.Get("X-Middleware"))
+}
+
+// act posts a verb with extra headers and returns the status and body.
+func (f *fixture) act(verb, body string, header map[string]string) (int, map[string]any) {
+	f.t.Helper()
+
+	req, err := http.NewRequestWithContext(f.ctx, http.MethodPost, f.srv.URL+"/api/v1/actions/"+verb, strings.NewReader(body))
+	require.NoError(f.t, err)
+
+	for k, v := range header {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(f.t, err)
+
+	defer resp.Body.Close()
+
+	out := map[string]any{}
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+
+	return resp.StatusCode, out
+}
+
+func TestSessionActionsMustComeFromThisSiteAsJSON(t *testing.T) {
+	f := newFixture(t)
+	f.release()
+
+	f.auth.id = Identity{Name: admin, Admin: true, Session: true}
+
+	// Every verb refuses a cookie session from elsewhere, or one that does not
+	// declare JSON, before reading the body, and nothing happens.
+	body := `{"selector": "client=a", "rollout": "r-1", "reason": "x"}`
+
+	for _, verb := range []string{"sync", "refresh", "suspend", "resume", "pause", "promote", "abort", "retry"} {
+		code, _ := f.act(verb, body, map[string]string{headerOrigin: foreignOrigin, headerContentType: mediaJSON})
+		require.Equal(t, http.StatusForbidden, code, verb)
+
+		code, _ = f.act(verb, body, map[string]string{headerOrigin: f.srv.URL, headerContentType: mediaText})
+		require.Equal(t, http.StatusUnsupportedMediaType, code, verb)
+	}
+
+	r1, ok := f.c.Rollout("r-1")
+	require.True(t, ok)
+	require.False(t, r1.PausePending)
+	require.Empty(t, f.c.Suspensions())
+
+	for name, h := range map[string]map[string]string{
+		"no origin at all":            {headerContentType: mediaJSON},
+		"a script without an origin":  {headerContentType: mediaJSON, "Authorization": "Basic c2FtOng="},
+		"another site's referer":      {headerReferer: foreignOrigin + "/page", headerContentType: mediaJSON},
+		"cross-site despite origin":   {headerFetchSite: fetchCrossSite, headerOrigin: f.srv.URL, headerContentType: mediaJSON},
+		"a sibling subdomain":         {headerFetchSite: "same-site", headerContentType: mediaJSON},
+		"this site, another origin":   {headerFetchSite: fetchSameOrigin, headerOrigin: foreignOrigin, headerContentType: mediaJSON},
+		"an origin that is not a URL": {headerOrigin: "http://[::1", headerContentType: mediaJSON},
+	} {
+		code, _ := f.act("refresh", "", h)
+		require.Equal(t, http.StatusForbidden, code, name)
+	}
+
+	// From this site, the body must be declared JSON: a form or text post is
+	// what a page elsewhere could send without asking first.
+	for name, h := range map[string]map[string]string{
+		"no content type":    {headerOrigin: f.srv.URL},
+		"a form":             {headerFetchSite: fetchSameOrigin, headerContentType: "application/x-www-form-urlencoded"},
+		"a multipart form":   {headerFetchSite: fetchSameOrigin, headerContentType: "multipart/form-data; boundary=x"},
+		"json-ish but not":   {headerFetchSite: fetchSameOrigin, headerContentType: "application/json-seq"},
+		"a broken parameter": {headerFetchSite: fetchSameOrigin, headerContentType: "application/json; ="},
+	} {
+		code, _ := f.act("refresh", "{}", h)
+		require.Equal(t, http.StatusUnsupportedMediaType, code, name)
+	}
+
+	// Same-origin JSON, with parameters, from any of the signals, acts.
+	for name, h := range map[string]map[string]string{
+		"fetch metadata":       {headerFetchSite: fetchSameOrigin, headerContentType: mediaJSON},
+		"typed into the bar":   {headerFetchSite: fetchUserInitiated, headerContentType: "Application/JSON"},
+		"origin with charset":  {headerOrigin: f.srv.URL, headerContentType: "application/json; charset=utf-8"},
+		"referer on this host": {headerReferer: f.srv.URL + "/rollouts/r-1", headerContentType: mediaJSON},
+	} {
+		code, out := f.act("refresh", "", h)
+		require.Equal(t, http.StatusOK, code, name)
+		require.Equal(t, "refreshing", out["status"], name)
+	}
+
+	code, out := f.act("pause", `{"rollout": "r-1"}`, map[string]string{headerFetchSite: fetchSameOrigin, headerContentType: mediaJSON})
+	require.Equal(t, http.StatusOK, code)
+	require.Equal(t, true, out["pausePending"])
+
+	// A caller the authorizer turned away is a 401 whatever it sent.
+	f.auth.err = errFake
+	code, _ = f.act("refresh", "", map[string]string{headerOrigin: foreignOrigin})
+	require.Equal(t, http.StatusUnauthorized, code)
+
+	// A verified token is not a browser session: it acts from anywhere, with
+	// any declared type.
+	f.auth.err = nil
+	f.auth.id = Identity{Name: admin, Admin: true}
+	code, _ = f.act("suspend", `{"selector": "client=b", "reason": "x"}`, map[string]string{headerOrigin: foreignOrigin, headerContentType: mediaText})
+	require.Equal(t, http.StatusOK, code)
+	require.Len(t, f.c.Suspensions(), 1)
+
+	code, _ = f.act("refresh", "", nil)
+	require.Equal(t, http.StatusOK, code)
 }
 
 func TestMayActAndOpenAccess(t *testing.T) {
@@ -718,4 +901,13 @@ func TestHistoryAfterAnID(t *testing.T) {
 	require.Len(t, later, want)
 	require.Equal(t, cut+1, later[0].ID, "oldest first, starting right after the id")
 	require.Greater(t, later[len(later)-1].ID, later[0].ID)
+
+	// after=0 reads a history from its first event, as a new follower must.
+	_, _, raw = f.do(http.MethodGet, "/api/v1/history?after=0&limit=2", "")
+
+	var first []reconcile.Event
+	require.NoError(t, json.Unmarshal([]byte(raw), &first))
+	require.Len(t, first, 2)
+	require.Equal(t, int64(1), first[0].ID)
+	require.Equal(t, int64(2), first[1].ID)
 }

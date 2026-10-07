@@ -24,10 +24,8 @@ type SyncRequest struct {
 	Strategy string
 }
 
-// Sync asks for the selected groups to converge now. Tags are re-resolved
-// first so the request acts on the current digests. A manual rollout waiting
-// for a sync starts; a group with no rollout gets one; an active rollout is
-// marked as a person's, so the environment check no longer holds it.
+// Sync re-resolves tags and asks the selected groups to converge now.
+// Declarative pauses and the disruption budget still apply.
 func (c *Controller) Sync(ctx context.Context, req SyncRequest) ([]string, error) {
 	set := c.targets()
 
@@ -65,12 +63,13 @@ func (c *Controller) Sync(ctx context.Context, req SyncRequest) ([]string, error
 	var started []string
 
 	for group := range groups {
-		if _, aborted := c.aborted[group]; aborted {
-			delete(c.aborted, group)
+		if err := c.writeOwed(ctx); err != nil {
+			return started, err
+		}
 
-			if err := c.persist(ctx, c.store.ClearAborted(ctx, group)); err != nil {
-				return started, err
-			}
+		var clearAborted []string
+		if _, aborted := c.aborted[group]; aborted {
+			clearAborted = []string{group}
 		}
 
 		r := c.activeRollout(group)
@@ -79,42 +78,50 @@ func (c *Controller) Sync(ctx context.Context, req SyncRequest) ([]string, error
 		if created {
 			eligible, desired, from := c.outOfSync(group, set)
 			if len(eligible) == 0 {
+				if len(clearAborted) > 0 {
+					if err := c.persist(ctx, c.store.ClearAborted(ctx, group)); err != nil {
+						return started, err
+					}
+
+					delete(c.aborted, group)
+				}
+
 				continue
 			}
 
-			policy := c.policyFor(group)
+			strategy := c.groups[group].Strategy
 			if req.Strategy != "" {
-				policy.Strategy = req.Strategy
+				strategy = req.Strategy
 			}
 
-			r = c.newRollout(now, group, policy, eligible, desired, from, set)
+			r = c.newRollout(now, group, strategy, eligible, desired, from, set)
 		}
 
-		// Nothing reaches controller memory before the store has it.
-		err := c.commit(ctx, r, func() {
+		events := []*Event{}
+		if created {
+			events = append(events, &Event{Actor: req.Actor, Action: eventRolloutCreated, Group: group, Rollout: r.ID,
+				Reason: fmt.Sprintf("%d targets to %s (%s)", len(r.Targets), r.DigestShort(), strategyLabel(r.Strategy))})
+		}
+
+		events = append(events, &Event{Actor: req.Actor, Action: "sync", Group: group, Rollout: r.ID, Selector: req.Selector.String(), Reason: syncReason(req)})
+
+		err := c.commitDecision(ctx, r, &Decision{ClearAborted: clearAborted}, func() {
 			r.Human = true
 			r.Force = r.Force || req.Force
 
 			if req.Strategy != "" {
 				r.Strategy = req.Strategy
 			}
-
-			if r.State == WaitingForSync || r.State == WaitingForEnvironment {
-				r.State, r.Reason, r.UpdatedAt = Running, "Started by "+req.Actor, now
-			}
-		})
+		}, events...)
 		if err != nil {
 			return started, err
 		}
 
+		delete(c.aborted, group)
+
 		if created {
 			c.rollouts[r.ID] = r
-			c.event(ctx, now, &Event{Actor: req.Actor, Action: "rollout.created", Group: group, Rollout: r.ID,
-				Reason: fmt.Sprintf("%d targets to %s (%s)", len(r.Targets), r.DigestShort(), strategyLabel(r.Strategy))})
 		}
-
-		c.event(ctx, now, &Event{Actor: req.Actor, Action: "sync", Group: group, Rollout: r.ID, Selector: req.Selector.String(),
-			Reason: syncReason(req)})
 
 		started = append(started, r.ID)
 	}
@@ -181,13 +188,17 @@ func (c *Controller) Suspend(ctx context.Context, req SuspendRequest) (Suspensio
 		return Suspension{}, err
 	}
 
-	if err := c.persist(ctx, c.store.SaveSuspension(ctx, &s)); err != nil {
+	d := &Decision{Suspensions: []Suspension{s}}
+
+	d.Events = c.prepareEvents(now, []*Event{{Actor: req.Actor, Action: "suspend", Selector: req.Selector.String(),
+		Reason: fmt.Sprintf("%s (until %s)", req.Reason, s.ExpiresAt.UTC().Format(time.RFC3339))}})
+	if err := c.persist(ctx, c.store.SaveDecision(ctx, d)); err != nil {
 		return Suspension{}, err
 	}
 
 	c.suspensions[s.ID] = s
-	c.event(ctx, now, &Event{Actor: req.Actor, Action: "suspend", Selector: req.Selector.String(),
-		Reason: fmt.Sprintf("%s (until %s)", req.Reason, s.ExpiresAt.UTC().Format(time.RFC3339))})
+	c.nextEventID += int64(len(d.Events))
+	c.publishEvents(d.Events)
 
 	return s, nil
 }
@@ -204,48 +215,62 @@ func (c *Controller) Resume(ctx context.Context, actor string, sel targets.Selec
 		return 0, err
 	}
 
-	n := 0
+	var ids []string
 
 	for id, s := range c.suspensions {
-		if s.Selector.String() != key {
-			continue
+		if s.Selector.String() == key {
+			ids = append(ids, id)
 		}
-
-		if err := c.persist(ctx, c.store.DeleteSuspension(ctx, id)); err != nil {
-			return n, err
-		}
-
-		delete(c.suspensions, id)
-
-		n++
 	}
 
+	n := len(ids)
 	if n == 0 {
 		return 0, fmt.Errorf("no suspension for %s: %w", key, ErrNotFound)
 	}
 
-	c.event(ctx, now, &Event{Actor: actor, Action: "resume", Selector: key, Reason: fmt.Sprintf("%d suspensions lifted", n)})
+	d := &Decision{DeleteSuspensions: ids, Events: c.prepareEvents(now,
+		[]*Event{{Actor: actor, Action: "resume", Selector: key, Reason: fmt.Sprintf("%d suspensions lifted", n)}})}
+	if err := c.persist(ctx, c.store.SaveDecision(ctx, d)); err != nil {
+		return 0, err
+	}
+
+	for _, id := range ids {
+		delete(c.suspensions, id)
+	}
+
+	c.nextEventID += int64(len(d.Events))
+	c.publishEvents(d.Events)
 	c.Nudge()
 
 	return n, nil
 }
 
-// Pause stops a rollout from starting another batch. The batch in flight
-// finishes its soak.
-func (c *Controller) Pause(ctx context.Context, actor, rolloutID string) error {
+// PauseRequest controls how long an operator's pause remains in effect.
+type PauseRequest struct {
+	Actor   string
+	Rollout string
+	Expires time.Duration
+}
+
+// Pause allows the open batch to finish, then stops admission until expiry.
+func (c *Controller) Pause(ctx context.Context, req PauseRequest) error {
 	now := c.clock.Now()
+
+	if req.Expires <= 0 {
+		req.Expires = 24 * time.Hour
+	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	r, ok := c.rollouts[rolloutID]
+	r, ok := c.rollouts[req.Rollout]
 	if !ok {
-		return fmt.Errorf("rollout %s: %w", rolloutID, ErrNotFound)
+		return fmt.Errorf("rollout %s: %w", req.Rollout, ErrNotFound)
 	}
 
 	switch r.State {
-	case Running, Soaking, WaitingForBudget, WaitingForEnvironment:
-	case WaitingForSync, Paused, Halted, Aborted, Superseded, Complete:
+	case Running, Soaking, WaitingForBudget:
+	case Paused, Halted, Aborted, Superseded, Complete:
 		return fmt.Errorf("rollout is %s: %w", r.State, ErrState)
 	}
 
@@ -255,17 +280,16 @@ func (c *Controller) Pause(ctx context.Context, actor, rolloutID string) error {
 
 	err := c.commit(ctx, r, func() {
 		r.PausePending = true
+		r.PauseExpiresAt = now.Add(req.Expires)
 
 		if r.CurrentBatch() == nil {
 			r.PausePending = false
-			r.State, r.Reason, r.UpdatedAt = Paused, "Paused by "+actor+". Run promote to continue.", now
+			r.State, r.Reason, r.UpdatedAt = Paused, pauseReason(r), now
 		}
-	})
+	}, &Event{Actor: req.Actor, Action: "pause", Group: r.Group, Rollout: r.ID, Reason: "Paused until " + now.Add(req.Expires).UTC().Format(time.RFC3339) + "; resumes automatically."})
 	if err != nil {
 		return err
 	}
-
-	c.event(ctx, now, &Event{Actor: actor, Action: "pause", Group: r.Group, Rollout: r.ID, Reason: r.Reason})
 
 	return nil
 }
@@ -292,17 +316,17 @@ func (c *Controller) Promote(ctx context.Context, actor, rolloutID string) error
 
 	err := c.commit(ctx, r, func() {
 		r.PausePending = false
+		r.PauseExpiresAt = time.Time{}
 		r.Human = true
 
 		if r.State == Paused {
 			r.State, r.Reason, r.UpdatedAt = Running, "Promoted by "+actor, now
 		}
-	})
+	}, &Event{Actor: actor, Action: "promote", Group: r.Group, Rollout: r.ID})
 	if err != nil {
 		return err
 	}
 
-	c.event(ctx, now, &Event{Actor: actor, Action: "promote", Group: r.Group, Rollout: r.ID})
 	c.Nudge()
 
 	return nil
@@ -329,37 +353,34 @@ func (c *Controller) Abort(ctx context.Context, actor, rolloutID string) error {
 		return err
 	}
 
-	// The marker goes first; if the rollout itself cannot be saved the marker
-	// is taken back, so the two never disagree on disk. A restart with the
-	// marker but an active rollout resolves in the marker's favour.
 	key := c.groupDesiredKey(r.Group, c.targets())
-	if err := c.persist(ctx, c.store.SaveAborted(ctx, r.Group, key)); err != nil {
-		return err
-	}
-
 	reason := "Aborted by " + actor
+	d := &Decision{Aborted: map[string]string{r.Group: key}, ClearDegraded: c.rolloutQuarantines(r)}
 
-	err := c.commit(ctx, r, func() {
+	err := c.commitDecision(ctx, r, d, func() {
 		if b := r.CurrentBatch(); b != nil {
 			b.EndedAt = now
 			b.Soak = cloneSoak(&r.Soak)
 		}
 
 		c.end(now, r, Aborted, reason)
-	})
+	}, &Event{Actor: ControllerActor, Action: "rollout.aborted", Group: r.Group, Rollout: r.ID, Reason: reason})
 	if err != nil {
-		_ = c.persist(ctx, c.store.ClearAborted(ctx, r.Group))
-
 		return err
 	}
 
+	for _, id := range d.ClearDegraded {
+		delete(c.degraded, id)
+	}
+
 	c.aborted[r.Group] = key
-	c.event(ctx, now, &Event{Actor: ControllerActor, Action: "rollout.aborted", Group: r.Group, Rollout: r.ID, Reason: reason})
 
 	return nil
 }
 
-// Retry reopens a halted rollout's batch; see retryBatch.
+// Retry resumes a halted rollout. The halted batch stays closed on the
+// record; the targets it failed go back to pending ahead of every untried
+// target, with a fresh attempt window.
 func (c *Controller) Retry(ctx context.Context, actor, rolloutID, reason string) error {
 	if reason == "" {
 		return errors.New("a reason is required")
@@ -384,65 +405,53 @@ func (c *Controller) Retry(ctx context.Context, actor, rolloutID, reason string)
 	}
 
 	err := c.commit(ctx, r, func() {
-		r.RetryPending = true
+		for i := range r.Targets {
+			rt := &r.Targets[i]
+			if rt.Phase != PhaseFailed {
+				continue
+			}
+
+			// An earlier update may still land, so an unexpired hold stays
+			// until the target is seen ready on the build.
+			hold := rt.HoldUntil
+			if !now.Before(hold) || c.heldReady(r, rt) {
+				hold = time.Time{}
+			}
+
+			*rt = RolloutTarget{
+				ID: rt.ID, Node: rt.Node, Image: rt.Image, Wave: rt.Wave, Phase: PhasePending, Reason: "waiting to be retried",
+				NotReadyBefore: rt.NotReadyBefore, NodeWeight: rt.NodeWeight, HoldUntil: hold, Retried: true,
+			}
+		}
+
 		r.Human = true
-	})
+		r.Soak = SoakProgress{}
+		r.State, r.Reason, r.UpdatedAt = Running, "Retried by "+actor, now
+	}, &Event{Actor: actor, Action: "retry", Group: r.Group, Rollout: r.ID, Reason: reason})
 	if err != nil {
 		return err
 	}
 
-	c.event(ctx, now, &Event{Actor: actor, Action: "retry", Group: r.Group, Rollout: r.ID, Reason: reason})
-	c.Nudge()
-
-	return nil
-}
-
-// SetPolicy replaces a group's policy.
-func (c *Controller) SetPolicy(ctx context.Context, actor, group string, p Policy) error {
-	if p.Mode != ModeAutomated && p.Mode != ModeManual {
-		return fmt.Errorf("mode must be %s or %s", ModeAutomated, ModeManual)
-	}
-
-	if _, ok := c.cfg.StrategyNamed(p.Strategy); !ok {
-		return fmt.Errorf("strategy %q is not configured", p.Strategy)
-	}
-
-	set := c.targets()
-	if len(set.InGroup(group)) == 0 {
-		return fmt.Errorf("group %s: %w", group, ErrNotFound)
-	}
-
-	now := c.clock.Now()
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if err := c.writeOwed(ctx); err != nil {
-		return err
-	}
-
-	if err := c.persist(ctx, c.store.SavePolicy(ctx, group, p)); err != nil {
-		return err
-	}
-
-	c.policies[group] = p
-	c.event(ctx, now, &Event{Actor: actor, Action: "policy", Group: group,
-		Reason: fmt.Sprintf("mode=%s strategy=%s pins=%d", p.Mode, strategyLabel(p.Strategy), len(p.Pins))})
 	c.Nudge()
 
 	return nil
 }
 
 // Events returns history from the store.
-func (c *Controller) Events(ctx context.Context, q EventQuery) ([]Event, error) {
+func (c *Controller) Events(ctx context.Context, q *EventQuery) ([]Event, error) {
 	return c.store.Events(ctx, q)
+}
+
+// HistoryID identifies the durable event sequence independently of its cursor.
+func (c *Controller) HistoryID() string {
+	return c.historyID
 }
 
 // EventsAbout returns the history that concerns some targets: events naming
 // one of them, events whose selector matches one, and group or rollout
 // events for the groups they belong to. It filters before it cuts to the
 // limit, so an old match is not hidden by unrelated recent events.
-func (c *Controller) EventsAbout(ctx context.Context, about []targets.Target, q EventQuery) ([]Event, error) {
+func (c *Controller) EventsAbout(ctx context.Context, about []targets.Target, q *EventQuery) ([]Event, error) {
 	limit := q.Limit
 	if limit <= 0 {
 		limit = 200
@@ -467,10 +476,11 @@ func (c *Controller) EventsAbout(ctx context.Context, about []targets.Target, q 
 	c.mu.RUnlock()
 
 	out := make([]Event, 0, limit)
-	q.Limit = eventPage
+	scan := *q
+	scan.Limit = eventPage
 
 	for scanned := 0; scanned < eventScanLimit; {
-		page, err := c.store.Events(ctx, q)
+		page, err := c.store.Events(ctx, &scan)
 		if err != nil {
 			return nil, err
 		}
@@ -492,7 +502,7 @@ func (c *Controller) EventsAbout(ctx context.Context, about []targets.Target, q 
 			break
 		}
 
-		q.Before = page[len(page)-1].ID
+		scan.Before = page[len(page)-1].ID
 	}
 
 	return out, nil

@@ -2,6 +2,7 @@ package reconcile
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -33,6 +34,10 @@ const (
 	refused   = "no"
 	mine      = "mine"
 	tA3el     = "a-3/el"
+	tA3VC     = "a-3/vc"
+	tN0A      = "n0/a"
+	tN1A      = "n1/a"
+	tN2A      = "n2/a"
 
 	imgA  = "org/a:t"
 	imgB  = "org/b:t"
@@ -43,9 +48,11 @@ const (
 	soakA = "soak-a"
 	soakB = "soak-b"
 
-	groupLabel = "client"
-	careful    = "careful"
-	boom       = "boom"
+	groupLabel        = "client"
+	careful           = "careful"
+	boom              = "boom"
+	debugReason       = "debugging"
+	maintenanceReason = "maintenance"
 )
 
 const testConfig = `
@@ -58,10 +65,10 @@ hooks:
   defaults: {soak: ""}
 inspect: {interval: 30s, concurrency: 4, failureThreshold: 2}
 labels: {group: client, owner: owner, section: role, hiddenGroups: [side]}
-strategy: {batchSize: 2, soak: {duration: 60s, interval: 20s, failureLimit: 1}}
+strategy: {batchSize: 2, progressDeadline: 50s, retry: {limit: 1}, soak: {duration: 60s, interval: 20s, failureLimit: 1}}
 strategies:
   nosoak:  {batchSize: 50%, soak: {duration: 0s}}
-  careful: {firstBatch: 1, batchSize: 50%, soak: {duration: 0s}, pauseAfterFirstBatch: true}
+  careful: {firstBatch: 1, batchSize: 50%, soak: {duration: 0s}}
   all:     {batchSize: 100%, soak: {duration: 0s}, waves: false}
 `
 
@@ -89,38 +96,42 @@ type world struct {
 	revisions   map[string]string
 	registryErr map[string]error
 
-	running     map[string]string
-	inspectFail map[string]bool
-	updateFail  map[string]string
-	updateStuck map[string]bool
-	notReady    map[string]bool
-	soakFail    map[string]bool
-	soakStdout  string
-	runErr      map[string]error
-	gates       map[string]chan struct{}
-	entered     chan struct{}
-	resolved    int
+	running         map[string]string
+	inspectFail     map[string]bool
+	updateFail      map[string]string
+	updateStuck     map[string]bool
+	notReady        map[string]bool
+	recoverOnUpdate map[string]bool
+	// breakOnUpdate targets stop being ready once a build lands on them.
+	breakOnUpdate map[string]bool
+	soakFail      map[string]bool
+	soakStdout    string
+	runErr        map[string]error
+	runResult     map[string]hooks.Result
+	gates         map[string]chan struct{}
+	entered       chan struct{}
+	resolved      int
 
-	envOK     bool
-	envReason string
-
-	calls []string
+	calls      []string
+	soakInputs []any
 }
 
 func newWorld() *world {
 	return &world{
-		registry:    map[string]string{imgA: d1, imgB: d1, imgS: d1},
-		revisions:   map[string]string{imgA: "reva", imgB: "revb"},
-		registryErr: map[string]error{},
-		running:     map[string]string{},
-		inspectFail: map[string]bool{},
-		updateFail:  map[string]string{},
-		updateStuck: map[string]bool{},
-		notReady:    map[string]bool{},
-		soakFail:    map[string]bool{},
-		runErr:      map[string]error{},
-		gates:       map[string]chan struct{}{},
-		envOK:       true,
+		registry:        map[string]string{imgA: d1, imgB: d1, imgS: d1},
+		revisions:       map[string]string{imgA: "reva", imgB: "revb"},
+		registryErr:     map[string]error{},
+		running:         map[string]string{},
+		inspectFail:     map[string]bool{},
+		updateFail:      map[string]string{},
+		updateStuck:     map[string]bool{},
+		notReady:        map[string]bool{},
+		recoverOnUpdate: map[string]bool{},
+		breakOnUpdate:   map[string]bool{},
+		soakFail:        map[string]bool{},
+		runErr:          map[string]error{},
+		runResult:       map[string]hooks.Result{},
+		gates:           map[string]chan struct{}{},
 	}
 }
 
@@ -187,8 +198,16 @@ func (w *world) Run(_ context.Context, program, hook, targetID string, input any
 
 	w.calls = append(w.calls, hook+":"+targetID+":"+program)
 
+	if hook == config.HookSoak {
+		w.soakInputs = append(w.soakInputs, input)
+	}
+
 	if err, ok := w.runErr[program]; ok {
 		return hooks.Result{}, err
+	}
+
+	if res, ok := w.runResult[program]; ok {
+		return res, nil
 	}
 
 	res := hooks.Result{Program: program, OK: true, RanAt: time.Now()}
@@ -196,7 +215,7 @@ func (w *world) Run(_ context.Context, program, hook, targetID string, input any
 	switch hook {
 	case config.HookInspect:
 		if w.inspectFail[targetID] {
-			res.OK, res.Reason = false, "connection refused"
+			res.OK, res.ExitCode, res.Reason = false, 1, "connection refused"
 
 			return res, nil
 		}
@@ -205,7 +224,7 @@ func (w *world) Run(_ context.Context, program, hook, targetID string, input any
 		res.Stdout = res.Reason
 	case config.HookUpdate:
 		if why, ok := w.updateFail[targetID]; ok {
-			res.OK, res.Reason = false, why
+			res.OK, res.ExitCode, res.Reason = false, 1, why
 
 			return res, nil
 		}
@@ -218,25 +237,31 @@ func (w *world) Run(_ context.Context, program, hook, targetID string, input any
 			} else {
 				w.running[targetID] = w.registry[in.Image]
 			}
+
+			if w.recoverOnUpdate[targetID] {
+				delete(w.notReady, targetID)
+			}
+
+			if w.breakOnUpdate[targetID] {
+				w.notReady[targetID] = true
+			}
 		}
 
 		res.Reason = "update started"
 	case config.HookReady:
 		if w.notReady[targetID] {
-			res.OK, res.Reason = false, "still syncing"
+			res.OK, res.ExitCode, res.Reason = false, 1, "still syncing"
 		} else {
 			res.Reason = "following"
 		}
 	case config.HookSoak:
 		if w.soakFail[program] {
-			res.OK, res.Reason = false, "61% vs 98%"
+			res.OK, res.ExitCode, res.Reason = false, 1, "61% vs 98%"
 		} else {
 			res.Reason = "fine"
 		}
 
 		res.Stdout = res.Reason + "\n" + w.soakStdout
-	case config.HookEnvironment:
-		res.OK, res.Reason = w.envOK, w.envReason
 	}
 
 	return res, nil
@@ -317,16 +342,18 @@ func (n *notes) actions() []string {
 
 // harness ties a controller to its fakes.
 type harness struct {
-	t     *testing.T
-	ctx   context.Context //nolint:containedctx // a test harness carries the test's context
-	cfg   *config.Config
-	set   *targets.Set
-	world *world
-	clock *fakeClock
-	store *MemoryStore
-	notes *notes
-	c     *Controller
-	ids   int
+	t             *testing.T
+	ctx           context.Context //nolint:containedctx // a test harness carries the test's context
+	cfg           *config.Config
+	set           *targets.Set
+	world         *world
+	clock         *fakeClock
+	store         *MemoryStore
+	notes         *notes
+	c             *Controller
+	ids           int
+	admission     map[string]float64
+	admissionUsed float64
 	// setMu guards set for tests that swap it while programs are running.
 	setMu sync.Mutex
 }
@@ -384,6 +411,49 @@ func (h *harness) newController() *Controller {
 	return c
 }
 
+// declare changes the config file's pause and group settings and applies them
+// to the running controller as the config watcher would.
+func (h *harness) declare(paused bool, groups map[string]config.Group) {
+	h.t.Helper()
+	h.cfg.Paused, h.cfg.Groups = paused, groups
+	require.NoError(h.t, h.c.ConfigureGroups(h.ctx, paused, groups))
+}
+
+// pause is an operator pausing a rollout for a while; zero takes the default.
+func (h *harness) pause(rollout string, expires time.Duration) error {
+	return h.c.Pause(h.ctx, PauseRequest{Actor: actor, Rollout: rollout, Expires: expires})
+}
+
+// lastSoakInput decodes the last soak input as the soak program reads it.
+func (h *harness) lastSoakInput() soakSeen {
+	h.t.Helper()
+	h.world.mu.Lock()
+	inputs := append([]any(nil), h.world.soakInputs...)
+	h.world.mu.Unlock()
+	require.NotEmpty(h.t, inputs)
+
+	raw, err := json.Marshal(inputs[len(inputs)-1])
+	require.NoError(h.t, err)
+
+	var in soakSeen
+
+	require.NoError(h.t, json.Unmarshal(raw, &in))
+
+	return in
+}
+
+// soakSeen is the part of a soak input the tests read, with timestamps kept
+// as text to check their encoding.
+type soakSeen struct {
+	Updated []struct {
+		ID        string `json:"id"`
+		Node      string `json:"node"`
+		Image     string `json:"image"`
+		UpdatedAt string `json:"updatedAt"`
+	} `json:"updated"`
+	Remaining []map[string]any `json:"remaining"`
+}
+
 // nextID hands out rollout and suspension ids that stay unique across
 // controllers built on the same harness.
 func (h *harness) nextID() string {
@@ -396,11 +466,18 @@ func (h *harness) nextID() string {
 func (h *harness) prime() {
 	h.t.Helper()
 	h.c.InspectAll(h.ctx)
+	h.c.ProbeAll(h.ctx)
 	require.NoError(h.t, h.c.Tick(h.ctx))
 }
 
 func (h *harness) tick() {
 	h.t.Helper()
+	h.c.InspectAll(h.ctx)
+	h.clock.Advance(time.Nanosecond)
+	h.c.ProbeAll(h.ctx)
+	h.admission = h.oracleUnavailable()
+	h.admissionUsed, _ = h.unavailable()
+
 	require.NoError(h.t, h.c.Tick(h.ctx))
 }
 
@@ -442,6 +519,15 @@ func (h *harness) rollout(id string) RolloutView {
 	return r
 }
 
+func (h *harness) rolloutTarget(rolloutID, targetID string) *RolloutTarget {
+	h.t.Helper()
+	r := h.rollout(rolloutID)
+	rt := r.target(targetID)
+	require.NotNil(h.t, rt)
+
+	return rt
+}
+
 func (h *harness) active(group string) RolloutView {
 	h.t.Helper()
 
@@ -465,15 +551,76 @@ func (h *harness) phases(r RolloutView) map[string]TargetPhase {
 	return out
 }
 
-// unavailable is the weight the controller counts as mid-update, and the
-// weight the disruption budget allows.
+// unavailable sums the independent oracle's unavailable nodes, each at least
+// the weight its rollout targets recorded at admission, and the weight the
+// configured budget allows.
 func (h *harness) unavailable() (used, allowed float64) {
 	set := h.current()
+
+	for node, least := range h.oracleUnavailable() {
+		used += max(set.NodeWeight(node), least)
+	}
+
+	return used, h.cfg.DisruptionBudget.MaxUnavailable.OfWeight(set.TotalWeight())
+}
+
+func (h *harness) oracleUnavailable() map[string]float64 {
+	set, now := h.current(), h.clock.Now()
 
 	h.c.mu.RLock()
 	defer h.c.mu.RUnlock()
 
-	return h.c.inFlightWeight(set), h.cfg.DisruptionBudget.MaxUnavailable.OfWeight(set.TotalWeight())
+	return h.oracleUnavailableLocked(set, now, "", nil)
+}
+
+func (h *harness) oracleUnavailableLocked(set *targets.Set, now time.Time, changed string, before *Rollout) map[string]float64 {
+	nodes := map[string]float64{}
+
+	for _, t := range set.Targets {
+		probe := h.c.live[t.ID].Readiness
+		if !probe.Ready || probe.ProbedAt.IsZero() {
+			nodes[t.Node] = 0
+		}
+	}
+
+	for id, r := range h.c.rollouts {
+		if id == changed {
+			r = before
+		}
+
+		if r == nil {
+			continue
+		}
+
+		h.oracleRolloutUnavailableLocked(set, now, r, nodes)
+	}
+
+	return nodes
+}
+
+func (h *harness) oracleRolloutUnavailableLocked(set *targets.Set, now time.Time, r *Rollout, nodes map[string]float64) {
+	for _, rt := range r.Targets {
+		t, present := set.Get(rt.ID)
+		live := h.c.live[rt.ID]
+		probe := live.Readiness
+		known := !live.SeenAt.IsZero() && live.Failures < h.cfg.Inspect.FailureThreshold
+		sameTarget := present && t.Node == rt.Node && t.Image == rt.Image
+		observedReady := sameTarget && known && live.Digest == r.Desired[rt.Image] && probe.Ready && probe.LastSuccessAt.After(live.DigestSince) && probe.LastSuccessAt.After(rt.UpdatedAt)
+		forced := sameTarget && r.Force && rt.Updated && (rt.Phase == PhaseReady || rt.Phase == PhasePassed) && (!probe.Ready || rt.DigestSeenAt.IsZero() || !probe.LastSuccessAt.After(rt.DigestSeenAt))
+
+		if (now.Before(rt.HoldUntil) || forced) && !observedReady {
+			nodes[rt.Node] = max(nodes[rt.Node], rt.NodeWeight)
+		}
+
+		b := r.CurrentBatch()
+		if !r.State.Active() || b == nil || rt.Batch != b.Number || (rt.Phase != PhasePending && rt.Phase != PhaseUpdating && rt.Phase != PhaseReady) {
+			continue
+		}
+
+		if !present || !rt.Updated || !probe.Ready || !probe.LastSuccessAt.After(rt.DigestSeenAt) {
+			nodes[rt.Node] = max(nodes[rt.Node], rt.NodeWeight)
+		}
+	}
 }
 
 func (h *harness) view(id string) TargetView {

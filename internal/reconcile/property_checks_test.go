@@ -6,14 +6,18 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 // dispatched checks an update at the moment the process runs it: the batch
-// that admitted it is already on disk, the target is not suspended, and the
-// rollout was free to move when the step began.
+// that admitted it is already on disk, the target is not suspended, its group
+// is not paused by config, and the rollout was free to move when the step began.
 func (s *sim) dispatched(disk *MemoryStore, id, digest string) {
 	if !onDisk(disk, id, digest) {
-		s.violation("update %s to %s ran before its batch reached the store", id, shortDigest(digest))
+		s.violation("update %s to %s ran before its batch and dispatch reached the store", id, shortDigest(digest))
 	}
 
 	t, ok := s.fleet.get(id)
@@ -31,56 +35,112 @@ func (s *sim) dispatched(disk *MemoryStore, id, digest string) {
 		}
 	}
 
-	s.checkAdmission(id)
+	if s.configPaused(t.group) {
+		s.violation("update %s ran while group %s is paused by config", id, t.group)
+	}
 
 	s.mu.Lock()
-	s.dispatches = append(s.dispatches, propDispatch{id: id, group: t.group, digest: digest})
+	s.dispatches = append(s.dispatches, propDispatch{id: id, group: t.group, digest: digest, at: now})
 	s.mu.Unlock()
 }
 
-// checkAdmission asserts the budget when a newly admitted target's update
-// runs, after every batch of the tick was cut: the weight unavailable is
-// within the budget, or the target's node is the only weighted node
-// unavailable. A node already counted, free or weightless adds nothing.
-func (s *sim) checkAdmission(id string) {
-	h := s.h
-	set := h.current()
+// configPaused reports whether the config file pauses a group.
+func (s *sim) configPaused(group string) bool {
+	return s.h.cfg.Paused || s.h.cfg.Groups[group].Paused
+}
 
-	for _, r := range h.c.Rollouts() {
-		b := r.CurrentBatch()
-		if !r.State.Active() || b == nil || !slices.Contains(b.Targets, id) {
+// admissionProblem checks a durable reservation before its hooks run, using
+// current observations and the previous reservation rather than Free flags.
+// The caller holds the controller lock while publishing the decision.
+func (s *sim) admissionProblem(r, before *Rollout) error {
+	b := r.CurrentBatch()
+	if !r.State.Active() || b == nil {
+		return nil
+	}
+
+	var prior *Batch
+	if before != nil {
+		prior = before.CurrentBatch()
+	}
+
+	if (prior == nil || prior.Number != b.Number) && s.configPaused(r.Group) {
+		return fmt.Errorf("rollout %s admitted batch %d while group %s is paused by config", r.ID, b.Number, r.Group)
+	}
+
+	var nodes map[string]bool
+
+	for _, id := range b.Targets {
+		rt := r.target(id)
+		if rt.Phase != PhasePending && rt.Phase != PhaseUpdating && rt.Phase != PhaseReady {
 			continue
 		}
 
-		rt := r.target(id)
-		if rt.Free || s.before.open[r.ID+"/"+id] || s.before.inflight[rt.Node] || set.NodeWeight(rt.Node) == 0 {
-			return
+		if prior != nil && prior.Number == b.Number {
+			old := before.target(id)
+			if old != nil && old.Batch == b.Number && (old.Phase == PhasePending || old.Phase == PhaseUpdating || old.Phase == PhaseReady) {
+				continue
+			}
 		}
 
-		if used, allowed := h.unavailable(); used > allowed && s.weightedUnavailable() > 1 {
-			s.violation("%s was admitted with %v unavailable, over the %v the budget allows", id, used, allowed)
+		if nodes == nil {
+			nodes = map[string]bool{}
 		}
 
-		return
+		nodes[rt.Node] = true
 	}
+
+	if len(nodes) == 0 {
+		return nil
+	}
+
+	h := s.h
+	set := h.current()
+	busy := h.oracleUnavailableLocked(set, h.clock.Now(), r.ID, before)
+
+	var used, cost float64
+
+	for node, least := range busy {
+		used += max(set.NodeWeight(node), least)
+	}
+
+	for node := range nodes {
+		weight := set.NodeWeight(node)
+		if _, held := busy[node]; held || weight == 0 {
+			delete(nodes, node)
+
+			continue
+		}
+
+		cost += weight
+	}
+
+	allowed := h.cfg.DisruptionBudget.MaxUnavailable.OfWeight(set.TotalWeight())
+	if cost == 0 || used+cost <= allowed || (allowed > 0 && used == 0 && len(nodes) == 1) {
+		return nil
+	}
+
+	return fmt.Errorf("rollout %s batch %d admitted %v available weight with %v already unavailable, over the %v the budget allows; charged nodes=%v",
+		r.ID, b.Number, cost, used, allowed, nodes)
 }
 
 // propDispatch is one update the process ran during a step.
 type propDispatch struct {
 	id, group, digest string
+	at                time.Time
 }
 
-// checkHeld asserts that a rollout held at the start of the step (paused,
-// halted without a retry, or waiting for a sync) and still its group's
-// rollout at the end ran no update.
+// checkHeld asserts that a rollout halted or paused by an operator at the
+// start of the step, and still its group's rollout at the end, ran no update
+// unless its pause had expired.
 func (s *sim) checkHeld(dispatches []propDispatch) error {
 	for _, d := range dispatches {
-		r, had := s.before.active[d.group]
+		r, had := s.before[d.group]
 		if !had {
 			continue
 		}
 
-		if held := r.State == Paused || r.State == WaitingForSync || (r.State == Halted && !r.RetryPending); !held {
+		expired := r.State == Paused && !r.PauseExpiresAt.IsZero() && !d.at.Before(r.PauseExpiresAt)
+		if held := r.State == Paused || r.State == Halted; !held || expired {
 			continue
 		}
 
@@ -92,50 +152,21 @@ func (s *sim) checkHeld(dispatches []propDispatch) error {
 	return nil
 }
 
-// snapshot records what the next step's checks compare against. While no
-// process runs, the last one's record stands, and an edit counts until a
-// process checks after it.
+// snapshot records the held rollouts to compare against the next step.
 func (s *sim) snapshot() {
 	if s.down {
 		return
 	}
 
-	s.edited, s.started = false, false
+	before := map[string]*RolloutView{}
 
-	b := propBefore{active: map[string]*RolloutView{}, free: map[string]bool{}, inflight: map[string]bool{}, open: map[string]bool{}}
-
-	h := s.h
-	b.used, _ = h.unavailable()
-
-	b.degraded = s.degradedNodes()
-
-	for _, r := range h.c.Rollouts() {
+	for _, r := range s.h.c.Rollouts() {
 		if r.State.Active() {
-			b.active[r.Group] = &r
-		}
-
-		for _, rt := range r.Targets {
-			if rt.Free && rt.Batch > 0 {
-				b.free[r.ID+"/"+rt.ID] = true
-			}
-		}
-
-		if cur := r.CurrentBatch(); r.State.Active() && cur != nil {
-			for _, id := range cur.Targets {
-				b.open[r.ID+"/"+id] = true
-			}
+			before[r.Group] = &r
 		}
 	}
 
-	h.c.mu.RLock()
-
-	for node := range h.c.inFlightNodes(h.clock.Now()) {
-		b.inflight[node] = true
-	}
-
-	h.c.mu.RUnlock()
-
-	s.before = b
+	s.before = before
 }
 
 // check asserts what must hold after every step.
@@ -159,19 +190,6 @@ func (s *sim) check() error {
 
 	h := s.h
 
-	// The budget is a limit on admission: a step may leave more weight
-	// unavailable than allowed only when the targets file changed under it,
-	// when one node heavier than the budget went while nothing else was
-	// unavailable, or when a new process started from a disk that was behind
-	// the old one's memory.
-	if used, allowed := h.unavailable(); used > allowed && used > s.before.used && !s.edited && !s.started && s.weightedUnavailable() > 1 {
-		return fmt.Errorf("unavailable weight rose from %v to %v, over the %v the budget allows", s.before.used, used, allowed)
-	}
-
-	// A halt earlier in the same tick may have degraded a node before
-	// another group's batch took it, so a free admission is checked against
-	// quarantines at either end of the step.
-	degraded := s.degradedNodes()
 	active := map[string]string{}
 
 	for _, r := range h.c.Rollouts() {
@@ -179,7 +197,7 @@ func (s *sim) check() error {
 			return fmt.Errorf("rollout %s left terminal state %s for %s", r.ID, was, r.State)
 		}
 
-		if err := s.checkRollout(&r, degraded); err != nil {
+		if err := s.checkRollout(&r); err != nil {
 			return err
 		}
 
@@ -203,56 +221,9 @@ func (s *sim) check() error {
 	return nil
 }
 
-// degradedNodes is every node with a quarantined target, and every
-// quarantined target, which may have moved since its rollout began.
-func (s *sim) degradedNodes() map[string]bool {
-	set := s.h.current()
-	nodes := map[string]bool{}
-
-	s.h.c.mu.RLock()
-	defer s.h.c.mu.RUnlock()
-
-	for id := range s.h.c.degraded {
-		nodes[id] = true
-
-		if t, ok := set.Get(id); ok {
-			nodes[t.Node] = true
-		}
-	}
-
-	return nodes
-}
-
-// weightedUnavailable counts the unavailable nodes that carry weight.
-func (s *sim) weightedUnavailable() int {
-	set := s.h.current()
-
-	s.h.c.mu.RLock()
-	defer s.h.c.mu.RUnlock()
-
-	n := 0
-
-	for node := range s.h.c.inFlightNodes(s.h.clock.Now()) {
-		if set.NodeWeight(node) > 0 {
-			n++
-		}
-	}
-
-	return n
-}
-
 // checkRollout asserts the shape of one rollout: batch sizes, wave order,
-// manual policy, what completion means, and that a node was admitted free
-// only when it was already degraded.
-func (s *sim) checkRollout(r *RolloutView, after map[string]bool) error {
-	if _, seen := s.manual[r.ID]; !seen {
-		s.manual[r.ID] = s.modes[r.Group] == ModeManual
-	}
-
-	if s.manual[r.ID] && !r.Human && len(r.Batches) > 0 {
-		return fmt.Errorf("rollout %s started a batch under a manual policy without a sync", r.ID)
-	}
-
+// retry isolation and what completion means.
+func (s *sim) checkRollout(r *RolloutView) error {
 	total := len(rolloutNodes(&r.Rollout))
 
 	for i := range r.Batches {
@@ -261,6 +232,11 @@ func (s *sim) checkRollout(r *RolloutView, after map[string]bool) error {
 		key := r.ID + "/" + strconv.Itoa(b.Number)
 		if _, seen := s.strategy[key]; !seen {
 			s.strategy[key] = r.Strategy
+		}
+
+		// A retry batch is sized by the budget alone.
+		if b.Retried {
+			continue
 		}
 
 		st := s.h.c.strategy(s.strategy[key])
@@ -275,32 +251,247 @@ func (s *sim) checkRollout(r *RolloutView, after map[string]bool) error {
 		}
 	}
 
-	// A batch that went ahead of a lower wave breaks the order only if the
-	// strategy it was cut under follows waves.
-	for _, a := range r.Targets {
-		for _, b := range r.Targets {
-			if a.DegradedBefore || b.DegradedBefore || a.Batch == 0 || b.Batch == 0 {
-				continue
-			}
+	if err := checkRetries(r); err != nil {
+		return err
+	}
 
-			if st := s.h.c.strategy(s.strategy[r.ID+"/"+strconv.Itoa(b.Batch)]); a.Wave < b.Wave && a.Batch > b.Batch && st.UsesWaves() {
-				return fmt.Errorf("rollout %s moved %s (wave %d) in batch %d, after %s (wave %d) in batch %d",
-					r.ID, a.ID, a.Wave, a.Batch, b.ID, b.Wave, b.Batch)
-			}
-		}
+	if err := s.checkWaves(r); err != nil {
+		return err
 	}
 
 	for _, rt := range r.Targets {
 		if r.State == Complete && rt.Phase != PhasePassed && rt.Phase != PhaseSkipped {
 			return fmt.Errorf("rollout %s is Complete with %s %s", r.ID, rt.ID, rt.Phase)
 		}
+	}
 
-		// A new process may load a grant an earlier one made, from a disk
-		// that was behind its memory; grants are checked as they are made.
-		if !s.started && rt.Free && rt.Batch > 0 && !s.before.free[r.ID+"/"+rt.ID] && !s.before.degraded[rt.Node] && !s.before.degraded[rt.ID] && !after[rt.Node] {
-			return fmt.Errorf("rollout %s admitted %s free, but node %s was not degraded", r.ID, rt.ID, rt.Node)
+	return nil
+}
+
+// checkWaves asserts that a batch went ahead of a lower wave only if the
+// strategy it was cut under ignores waves. A retry repeats targets already
+// ordered, so each target counts where it was first batched.
+func (s *sim) checkWaves(r *RolloutView) error {
+	first := map[string]int{}
+
+	for i := range r.Batches {
+		for _, id := range r.Batches[i].Targets {
+			if _, seen := first[id]; !seen {
+				first[id] = r.Batches[i].Number
+			}
+		}
+	}
+
+	for _, a := range r.Targets {
+		for _, b := range r.Targets {
+			fa, fb := first[a.ID], first[b.ID]
+			if a.NotReadyBefore || b.NotReadyBefore || fa == 0 || fb == 0 {
+				continue
+			}
+
+			if st := s.h.c.strategy(s.strategy[r.ID+"/"+strconv.Itoa(fb)]); a.Wave < b.Wave && fa > fb && st.UsesWaves() {
+				return fmt.Errorf("rollout %s moved %s (wave %d) in batch %d, after %s (wave %d) in batch %d",
+					r.ID, a.ID, a.Wave, fa, b.ID, b.Wave, fb)
+			}
 		}
 	}
 
 	return nil
+}
+
+// checkRetries asserts from batch history that a retry appends batches: a
+// retry batch repeats only retried targets, an ordinary batch repeats none, a
+// target's batch is the last to take it, and none is cut past a waiting retry.
+func checkRetries(r *RolloutView) error {
+	last := map[string]int{}
+	ordinary := 0
+
+	for i := range r.Batches {
+		b := &r.Batches[i]
+		if !b.Retried {
+			ordinary = b.Number
+		}
+
+		for _, id := range b.Targets {
+			_, repeat := last[id]
+			if b.Retried && (!repeat || !r.target(id).Retried) {
+				return fmt.Errorf("rollout %s retry batch %d took %s, which no retry sent back", r.ID, b.Number, id)
+			}
+
+			if !b.Retried && repeat {
+				return fmt.Errorf("rollout %s batch %d took %s again without a retry", r.ID, b.Number, id)
+			}
+
+			last[id] = b.Number
+		}
+	}
+
+	for _, rt := range r.Targets {
+		if rt.Batch != 0 && rt.Batch != last[rt.ID] {
+			return fmt.Errorf("rollout %s puts %s in batch %d, but batch %d last took it", r.ID, rt.ID, rt.Batch, last[rt.ID])
+		}
+
+		if rt.Retried && last[rt.ID] == 0 {
+			return fmt.Errorf("rollout %s retried %s, which no batch took", r.ID, rt.ID)
+		}
+
+		if rt.Retried && rt.Batch == 0 && rt.Phase == PhasePending && ordinary > last[rt.ID] {
+			return fmt.Errorf("rollout %s cut ordinary batch %d while retried %s waited", r.ID, ordinary, rt.ID)
+		}
+	}
+
+	return nil
+}
+
+func TestPropertyControllerInvariantsAdmissionBudget(t *testing.T) {
+	const fleet = `
+- {id: n0/a, node: n0, weight: 0, image: org/a:t, labels: {client: a, owner: a}}
+- {id: n1/a, node: n1, weight: 100, image: org/a:t, labels: {client: a, owner: a}}
+- {id: n1/b, node: n1, weight: 100, image: org/a:t, labels: {client: a, owner: a}}
+- {id: n2/a, node: n2, weight: 100, image: org/a:t, labels: {client: a, owner: a}}
+`
+
+	cases := []struct {
+		name        string
+		budget      string
+		unavailable []string
+		targets     []string
+		retry       bool
+		reserved    bool
+		rejected    bool
+	}{
+		{name: "fits exactly", budget: "100", targets: []string{tN1A}},
+		{name: "lone heavy node with weightless outage", budget: "1", unavailable: []string{tN0A}, targets: []string{tN1A}},
+		{name: "two available nodes despite free flags", budget: "1", targets: []string{tN1A, tN2A}, rejected: true},
+		{name: "weighted outage blocks another heavy node", budget: "100", unavailable: []string{tN2A}, targets: []string{tN1A}, rejected: true},
+		{name: "zero cost above budget", budget: "0", unavailable: []string{tN2A}, targets: []string{tN2A, tN0A}},
+		{name: "two targets charge one node", budget: "1", targets: []string{tN1A, "n1/b"}},
+		{name: "zero budget rejects available weight", budget: "0", targets: []string{tN1A}, rejected: true},
+		{name: "retry charges recovered nodes", budget: "100", targets: []string{tN1A, tN2A}, retry: true, rejected: true},
+		{name: "retry adds no unavailable weight", budget: "0", unavailable: []string{tN2A}, targets: []string{tN2A, tN0A}, retry: true},
+		{name: "persisted reservation is not a new admission", budget: "0", targets: []string{tN1A}, reserved: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := replaceLine(testConfig, "maxUnavailable: 50%", "maxUnavailable: "+tc.budget)
+			h := newHarness(t, cfg, fleet)
+			h.cfg.ReadinessProbe.FailureThreshold = 1
+			h.prime()
+			h.world.set(func(w *world) {
+				for _, id := range tc.unavailable {
+					w.notReady[id] = true
+				}
+			})
+			h.c.ProbeAll(h.ctx)
+
+			r := &Rollout{ID: "proposed", Group: "a", State: Running,
+				Desired: map[string]string{imgA: d2}, Batches: []Batch{{Number: 1, Targets: tc.targets}}}
+
+			for _, id := range tc.targets {
+				target, ok := h.current().Get(id)
+				require.True(t, ok)
+
+				r.Targets = append(r.Targets, RolloutTarget{ID: id, Node: target.Node, Batch: 1, Phase: PhasePending, Free: true})
+			}
+
+			var before *Rollout
+			if tc.retry || tc.reserved {
+				before = cloneRollout(r)
+			}
+
+			// A retry leaves batch 1 closed, saves its targets waiting to be
+			// retried, then cuts them into batch 2.
+			if tc.retry {
+				before.Batches[0].EndedAt = h.clock.Now()
+				r.Batches = []Batch{before.Batches[0], {Number: 2, Targets: tc.targets, Retried: true}}
+
+				for i := range before.Targets {
+					before.Targets[i] = RolloutTarget{ID: r.Targets[i].ID, Node: r.Targets[i].Node, Phase: PhasePending, Retried: true}
+					r.Targets[i].Batch, r.Targets[i].Retried = 2, true
+				}
+			}
+
+			if before != nil {
+				require.NoError(t, h.store.SaveRollout(h.ctx, before))
+			}
+
+			s := &sim{h: h, terminal: map[string]RolloutState{}, strategy: map[string]string{}}
+			p := &process{MemoryStore: h.store, sim: s, writes: -1}
+			h.c.mu.Lock()
+			h.c.rollouts[r.ID] = r
+			writeErr := p.SaveRollout(h.ctx, r)
+			h.c.mu.Unlock()
+			require.NoError(t, writeErr)
+
+			err := s.check()
+
+			if tc.rejected {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestPropertyControllerInvariantsRetryIsolation(t *testing.T) {
+	in := func(id string, batch int, retried bool) RolloutTarget {
+		return RolloutTarget{ID: id, Batch: batch, Phase: PhaseUpdating, Retried: retried}
+	}
+	waiting := RolloutTarget{ID: tN2A, Phase: PhasePending, Retried: true}
+	untried := RolloutTarget{ID: tN0A, Phase: PhasePending}
+	halted := Batch{Number: 1, Targets: []string{tN1A, tN2A}}
+
+	cases := []struct {
+		name     string
+		batches  []Batch
+		targets  []RolloutTarget
+		rejected bool
+	}{
+		{name: "retry batch takes the retried targets that fit", batches: []Batch{halted, {Number: 2, Targets: []string{tN1A}, Retried: true}},
+			targets: []RolloutTarget{in(tN1A, 2, true), waiting, untried}},
+		{name: "ordinary batches resume after the retries", batches: []Batch{halted, {Number: 2, Targets: []string{tN1A, tN2A}, Retried: true}, {Number: 3, Targets: []string{tN0A}}},
+			targets: []RolloutTarget{in(tN1A, 2, true), in(tN2A, 2, true), in(tN0A, 3, false)}},
+		{name: "retry batch mixes in an untried target", batches: []Batch{halted, {Number: 2, Targets: []string{tN1A, tN0A}, Retried: true}},
+			targets: []RolloutTarget{in(tN1A, 2, true), waiting, in(tN0A, 2, true)}, rejected: true},
+		{name: "ordinary batch goes ahead of a waiting retry", batches: []Batch{halted, {Number: 2, Targets: []string{tN0A}}},
+			targets: []RolloutTarget{{ID: tN1A, Phase: PhasePending, Retried: true}, waiting, in(tN0A, 2, false)}, rejected: true},
+		{name: "ordinary batch repeats a target", batches: []Batch{halted, {Number: 2, Targets: []string{tN1A}}},
+			targets: []RolloutTarget{in(tN1A, 2, true), {ID: tN2A, Phase: PhaseSkipped, Retried: true}, untried}, rejected: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := checkRetries(&RolloutView{Rollout: Rollout{ID: "r", Batches: tc.batches, Targets: tc.targets}})
+			require.Equal(t, tc.rejected, err != nil, "%v", err)
+		})
+	}
+}
+
+func TestPropertyControllerInvariantsInspectionCanRestoreAnEndedHoldWithoutAdmission(t *testing.T) {
+	h := newHarness(t, testConfig, `
+- {id: n1/a, node: n1, weight: 100, image: org/a:t, labels: {client: a, owner: a}}
+- {id: n2/a, node: n2, weight: 100, image: org/a:t, labels: {client: a, owner: a}}
+`)
+	h.cfg.ReadinessProbe.FailureThreshold = 1
+	h.prime()
+	h.release(imgA, d2)
+	require.NoError(t, h.c.Abort(h.ctx, actor, h.active("a").ID))
+	h.world.set(func(w *world) { w.notReady[tN2A] = true })
+	h.clock.Advance(time.Nanosecond)
+	h.c.ProbeAll(h.ctx)
+	used, allowed := h.unavailable()
+	require.Equal(t, float64(100), used)
+	require.Equal(t, float64(100), allowed)
+
+	s := &sim{h: h, terminal: map[string]RolloutState{}, strategy: map[string]string{}}
+	s.snapshot()
+	h.world.set(func(w *world) { w.runErr["inspect"] = errFake })
+	h.c.InspectAll(h.ctx)
+	h.c.InspectAll(h.ctx)
+	used, _ = h.unavailable()
+	require.Equal(t, float64(200), used)
+	require.Len(t, h.world.callsFor("update"), 1)
+	require.NoError(t, s.check())
 }

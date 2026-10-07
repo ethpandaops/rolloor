@@ -38,12 +38,10 @@ const (
 	selA      = "client=a"
 	selC      = "client=c"
 	nope      = "nope"
-	keyGroup  = "group"
 	keyRoll   = "rollout"
 	keyNext   = "next"
 	keyReason = "reason"
 	keySel    = "selector"
-	keyMode   = "mode"
 	keySpeed  = "strategy"
 	slow      = "slow"
 	keyConf   = "confirm"
@@ -51,7 +49,6 @@ const (
 	hdrOrigin = "Origin"
 	hdrSite   = "Sec-Fetch-Site"
 	hdrRef    = "Referer"
-	manual    = "manual"
 )
 
 var errFake = errors.New("fake")
@@ -61,15 +58,19 @@ environment: test
 disruptionBudget: {maxUnavailable: 100%}
 labels: {group: client, owner: owner, section: role, hiddenGroups: [side]}
 hooks: {dir: /tmp, defaults: {soak: ""}}
-strategy: {batchSize: 100%, soak: {duration: 0s}}
+strategy: {batchSize: 100%, retry: {limit: 1}, soak: {duration: 0s, failureLimit: 0}}
 strategies:
   slow: {batchSize: 1, soak: {duration: 1h, interval: 1s, failureLimit: 1}}
+  bad: {soak: {duration: 1m, interval: 1s, failureLimit: 0}}
+groups:
+  a: {strategy: slow}
+  b: {strategy: bad}
 `
 
 const testTargets = `
 - {id: a-1/cl, node: a-1, weight: 0,   image: org/a:t, labels: {client: a, owner: a, role: cl, wave: "0"}, hooks: {soak: soak-a}}
 - {id: a-2/cl, node: a-2, weight: 100, image: org/a:t, labels: {client: a, owner: a, role: cl, wave: "1"}, hooks: {soak: soak-a}}
-- {id: b-1/el, node: a-2, weight: 100, image: org/b:t, labels: {client: b, owner: b, role: el, wave: "1"}}
+- {id: b-1/el, node: a-2, weight: 100, image: org/b:t, labels: {client: b, owner: b, role: el, wave: "1"}, hooks: {soak: soak-b}}
 - {id: c-1/x,  node: c-1, weight: 0,   image: org/c:t, labels: {client: c, owner: a, role: x, wave: "0"}}
 - {id: c-2/x,  node: c-2, weight: 0,   image: org/c:t, labels: {client: c, owner: b, role: x, wave: "0"}}
 - {id: s-1/side, node: a-1, weight: 0, image: org/s:t, labels: {client: side, owner: ops, role: sidecar}}
@@ -100,14 +101,14 @@ func (f *fakeWorld) Run(_ context.Context, program, hook, id string, input any) 
 	case config.HookInspect:
 		res.Reason = f.running[id]
 	case config.HookUpdate:
-		if why, ok := f.fail[id]; ok {
-			return hooks.Result{Program: program, Reason: why, ExitCode: 1}, nil
-		}
-
 		if in, ok := input.(reconcile.HookInput); ok {
 			f.running[id] = in.Desired
 		}
 	case config.HookSoak:
+		if why, ok := f.fail[program]; ok {
+			return hooks.Result{Program: program, Reason: why, ExitCode: 1}, nil
+		}
+
 		res.Stdout = "fine\nupdated=1 remaining=2 unit=rps\n"
 	}
 
@@ -175,6 +176,7 @@ func newFixture(t *testing.T, loginURL func(string) string) *fixture {
 	require.NoError(t, err)
 
 	f.c.InspectAll(f.ctx)
+	f.c.ProbeAll(f.ctx)
 	require.NoError(t, f.c.Tick(f.ctx))
 
 	s, err := New(cfg, f.c, func() *targets.Set { return f.set }, f.auth, loginURL, "test", logrus.New())
@@ -187,19 +189,20 @@ func newFixture(t *testing.T, loginURL func(string) string) *fixture {
 }
 
 // release moves the tag, opens rollouts for every group and ticks them along.
-// Group a soaks under the slow preset; group b halts because b-1 refuses.
+// Group a soaks under its slow strategy; group b fails its comparison.
 func (f *fixture) release() {
 	f.t.Helper()
-	require.NoError(f.t, f.c.SetPolicy(f.ctx, "sam", "a", reconcile.Policy{Mode: reconcile.ModeAutomated, Strategy: slow}))
 
 	f.world.mu.Lock()
 	f.world.digest = d2
-	f.world.fail[tB1] = "refused"
+	f.world.fail["soak-b"] = "negative comparison"
 	f.world.mu.Unlock()
 
 	f.c.Refresh(f.ctx, "test")
 
 	for range 6 {
+		f.c.InspectAll(f.ctx)
+		f.c.ProbeAll(f.ctx)
 		require.NoError(f.t, f.c.Tick(f.ctx))
 	}
 }
@@ -282,7 +285,11 @@ func TestPagesRender(t *testing.T) {
 	code, body = f.get("/groups/client/a", false)
 	require.Equal(t, http.StatusOK, code)
 	require.Contains(t, body, tA1)
-	require.NotContains(t, body, "/actions/policy", "policy is not edited from the pages")
+	require.Contains(t, body, "<dt>Paused</dt><dd>no</dd>")
+	require.Contains(t, body, "<dt>Strategy</dt><dd>slow</dd>", "the strategy the config names for a")
+
+	code, _ = f.get("/groups/client/b", false)
+	require.Equal(t, http.StatusOK, code)
 
 	code, _ = f.get("/groups/team/a", false)
 	require.Equal(t, http.StatusNotFound, code)
@@ -302,7 +309,6 @@ func TestPagesRender(t *testing.T) {
 	code, body = f.get("/rollouts/"+halted.ID, false)
 	require.Equal(t, http.StatusOK, code)
 	require.Contains(t, body, "1 quarantined targets")
-	require.Contains(t, body, "refused")
 
 	code, body = f.get("/rollouts/"+f.rolloutFor("c").ID, false)
 	require.Equal(t, http.StatusOK, code)
@@ -327,7 +333,6 @@ func TestPagesRender(t *testing.T) {
 	code, body = f.get("/history", false)
 	require.Equal(t, http.StatusOK, code)
 	require.Contains(t, body, "digest.changed")
-	require.Contains(t, body, "refused")
 
 	code, body = f.get("/history?node=a-2&group=b&rollout="+halted.ID, false)
 	require.Equal(t, http.StatusOK, code)
@@ -391,7 +396,7 @@ func TestControlsAreDisabledWithAReason(t *testing.T) {
 	// Their own halted rollout offers the retry dialog.
 	code, body = f.get("/rollouts/"+f.rolloutFor("b").ID, false)
 	require.Equal(t, http.StatusOK, code)
-	require.Contains(t, body, "Retry the soak")
+	require.Contains(t, body, "Retry this build")
 	require.NotContains(t, body, `class="disabled"`)
 }
 
@@ -434,10 +439,6 @@ func TestActionsRedirectWithFlashOrError(t *testing.T) {
 	_, loc = f.post("resume", url.Values{keySel: {selC}, keyConf: {on}, keyNext: {"/"}})
 	require.Contains(t, loc, "error=", "nothing left to lift")
 
-	// Policy is not a page action.
-	_, loc = f.post("policy", url.Values{keyGroup: {"a"}, keyMode: {manual}, keySpeed: {slow}, keyNext: {"/"}})
-	require.Contains(t, loc, "error=unknown+action+%22policy%22")
-
 	// A malformed return path falls back to the root before anything runs.
 	_, loc = f.post("sync", url.Values{keySel: {nope}, keyNext: {"/%zz"}})
 	require.True(t, strings.HasPrefix(loc, "/?error="), loc)
@@ -458,7 +459,7 @@ func TestActionsRedirectWithFlashOrError(t *testing.T) {
 	// Rollout verbs.
 	r := f.rolloutFor("a")
 	_, loc = f.post("pause", url.Values{keyRoll: {r.ID}, keyNext: {"/rollouts/" + r.ID}})
-	require.Equal(t, "/rollouts/"+r.ID+"?flash=Pause+sent.", loc)
+	require.True(t, strings.HasPrefix(loc, "/rollouts/"+r.ID+"?flash=Pause+sent.+It+lapses+on+its+own+at+"), loc)
 
 	_, loc = f.post("promote", url.Values{keyRoll: {r.ID}, keyNext: {"/"}})
 	require.Contains(t, loc, "flash=Promote+sent.")
@@ -522,6 +523,10 @@ func TestTemplateHelpers(t *testing.T) {
 	require.Equal(t, "5 min ago", ago(time.Date(2026, 9, 22, 11, 55, 0, 0, time.UTC)))
 
 	require.Equal(t, "Tue 12:00:00", helper[func(time.Time) string](t, fn, "clock")(time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)))
+
+	until := helper[func(time.Time) string](t, fn, "until")
+	require.Equal(t, "2 h", until(time.Date(2026, 9, 22, 14, 0, 0, 0, time.UTC)))
+	require.Equal(t, "0s", until(time.Date(2026, 9, 22, 11, 0, 0, 0, time.UTC)), "a moment already past")
 
 	pct := helper[func(float64, float64) string](t, fn, "pct")
 	require.Equal(t, "0%", pct(1, 0))
@@ -635,4 +640,114 @@ func TestPublicReadsShowPagesButNotControls(t *testing.T) {
 	code, loc := f.post("refresh", url.Values{})
 	require.Equal(t, http.StatusFound, code)
 	require.Contains(t, loc, "/auth/login")
+}
+
+func TestPauseLapsesOnItsOwnUnlessPromoted(t *testing.T) {
+	f := newFixture(t, nil)
+	f.release()
+
+	r := f.rolloutFor("a")
+	require.Equal(t, reconcile.Soaking, r.State)
+
+	next := "/rollouts/" + r.ID
+
+	_, body := f.get(next, false)
+	require.Contains(t, body, `action="/actions/pause"`)
+	require.Contains(t, body, `<option value="24h" selected>`, "a day unless the operator picks otherwise")
+
+	_, loc := f.post("pause", url.Values{keyRoll: {r.ID}, keyExpires: {"soon"}, keyNext: {next}})
+	require.Contains(t, loc, "error=expiry")
+	require.False(t, f.rolloutFor("a").PausePending, "a malformed expiry pauses nothing")
+
+	// Without an expiry the controller's day applies.
+	_, loc = f.post("pause", url.Values{keyRoll: {r.ID}, keyNext: {next}})
+	require.Contains(t, loc, "flash=Pause+sent.")
+
+	paused := f.rolloutFor("a")
+	require.True(t, paused.PausePending, "the soaking batch finishes first")
+	require.WithinDuration(t, time.Now().Add(24*time.Hour), paused.PauseExpiresAt, time.Minute)
+
+	_, body = f.get(next, false)
+	require.Contains(t, body, "<dt>Pause lapses</dt>")
+	require.Contains(t, body, `action="/actions/promote"`)
+	require.NotContains(t, body, `action="/actions/pause"`, "one pause at a time")
+
+	_, loc = f.post("promote", url.Values{keyRoll: {r.ID}, keyNext: {next}})
+	require.Contains(t, loc, "flash=Promote+sent.")
+	require.Zero(t, f.rolloutFor("a").PauseExpiresAt)
+
+	_, body = f.get(next, false)
+	require.NotContains(t, body, "Pause lapses")
+	require.Contains(t, body, `action="/actions/pause"`)
+
+	_, loc = f.post("pause", url.Values{keyRoll: {r.ID}, keyExpires: {"2h"}, keyNext: {next}})
+	require.Contains(t, loc, "flash=Pause+sent.")
+	require.WithinDuration(t, time.Now().Add(2*time.Hour), f.rolloutFor("a").PauseExpiresAt, time.Minute)
+
+	_, _ = f.post("abort", url.Values{keyRoll: {r.ID}, keyNext: {next}})
+	ended := f.rolloutFor("a")
+	require.Equal(t, reconcile.Aborted, ended.State)
+	require.False(t, ended.PausePending)
+	require.Zero(t, ended.PauseExpiresAt)
+
+	_, body = f.get(next, false)
+	require.NotContains(t, body, `action="/actions/promote"`)
+}
+
+func TestConfigPauseIsShownAndNeedsNoVerb(t *testing.T) {
+	f := newFixture(t, nil)
+	f.release()
+	require.NoError(t, f.c.ConfigureGroups(f.ctx, false, map[string]config.Group{"a": {Paused: true, Strategy: slow}}))
+	require.NoError(t, f.c.Tick(f.ctx))
+
+	_, body := f.get("/", false)
+	require.Equal(t, 1, strings.Count(body, `class="badge paused"`), "only a's tile")
+
+	_, body = f.get("/groups/client/a", false)
+	require.Contains(t, body, "<dt>Paused</dt><dd>yes, by the config file</dd>")
+
+	r := f.rolloutFor("a")
+	require.NotEqual(t, reconcile.Paused, r.State, "a config pause is not an operator pause")
+	require.False(t, r.PausePending)
+
+	code, body := f.get("/rollouts/"+r.ID, false)
+	require.Equal(t, http.StatusOK, code)
+	require.NotContains(t, body, `action="/actions/promote"`, "there is no operator pause to lift")
+
+	// A pause at the top holds every group shown.
+	require.NoError(t, f.c.ConfigureGroups(f.ctx, true, nil))
+
+	_, body = f.get("/", false)
+	require.Equal(t, 3, strings.Count(body, `class="badge paused"`))
+
+	// Clearing the config is all it takes.
+	require.NoError(t, f.c.ConfigureGroups(f.ctx, false, nil))
+
+	_, body = f.get("/groups/client/a", false)
+	require.Contains(t, body, "<dt>Paused</dt><dd>no</dd>")
+}
+
+func TestHaltKeepsRetryVisibleWithPendingPause(t *testing.T) {
+	f := newFixture(t, nil)
+	f.release()
+	r := f.rolloutFor("b")
+	require.Equal(t, reconcile.Halted, r.State)
+	require.NoError(t, f.c.Retry(f.ctx, "sam", r.ID, "confirmed build"))
+	require.NoError(t, f.c.Tick(f.ctx))
+	require.NoError(t, f.c.Pause(f.ctx, reconcile.PauseRequest{Actor: "sam", Rollout: r.ID}))
+
+	for range 3 {
+		f.c.InspectAll(f.ctx)
+		f.c.ProbeAll(f.ctx)
+		require.NoError(t, f.c.Tick(f.ctx))
+	}
+
+	r = f.rolloutFor("b")
+	require.Equal(t, reconcile.Halted, r.State)
+	require.True(t, r.PausePending)
+
+	code, body := f.get("/rollouts/"+r.ID, false)
+	require.Equal(t, http.StatusOK, code)
+	require.Contains(t, body, `action="/actions/retry"`)
+	require.NotContains(t, body, `action="/actions/promote"`)
 }

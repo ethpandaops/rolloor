@@ -3,9 +3,13 @@ package reconcile
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -73,15 +77,12 @@ type Controller struct {
 	desired     map[string]Desired
 	live        map[string]Live
 	degraded    map[string]string
-	policies    map[string]Policy
+	paused      bool
+	groups      map[string]config.Group
 	suspensions map[string]Suspension
 	rollouts    map[string]*Rollout
 	aborted     map[string]string
 	hookRuns    map[string]map[string]HookRun
-
-	envOK        bool
-	envReason    string
-	envCheckedAt time.Time
 
 	lastResolve   time.Time
 	lastTick      time.Time
@@ -92,9 +93,20 @@ type Controller struct {
 	// resolveMu serializes registry scans so an older scan cannot publish
 	// over a newer one.
 	resolveMu     sync.Mutex
+	probeMu       sync.Mutex
 	resolveErrors map[string]string
 	targetsError  string
 	nextEventID   int64
+	pendingEvents []Event
+	historyID     string
+	configError   bool
+	lastInspect   time.Time
+	lastProbe     time.Time
+	probes        probePacer
+	// generations hold each observed target's current generation; forgetting
+	// a target deletes its entry, so results begun before are refused.
+	generations    map[string]generation
+	lastGeneration uint64
 
 	nudge chan struct{}
 }
@@ -118,13 +130,14 @@ func New(ctx context.Context, opts *Options) (*Controller, error) {
 		desired:       map[string]Desired{},
 		live:          map[string]Live{},
 		degraded:      map[string]string{},
-		policies:      map[string]Policy{},
+		paused:        opts.Config.Paused,
+		groups:        maps.Clone(opts.Config.Groups),
 		suspensions:   map[string]Suspension{},
 		rollouts:      map[string]*Rollout{},
 		aborted:       map[string]string{},
 		hookRuns:      map[string]map[string]HookRun{},
 		resolveErrors: map[string]string{},
-		envOK:         true,
+		generations:   map[string]generation{},
 		nudge:         make(chan struct{}, 1),
 	}
 
@@ -152,25 +165,46 @@ func New(ctx context.Context, opts *Options) (*Controller, error) {
 	}
 
 	c.restore(snap)
+	c.flush(ctx)
+
+	// Observations restored for a target whose definition changed while the
+	// process was down describe a target that no longer exists.
+	var stale []string
+
+	set := c.targets()
+
+	for id := range c.live {
+		t, present := set.Get(id)
+		if d := c.live[id].Definition; !present || d == "" || d != c.generationFor(&t).definition {
+			stale = append(stale, id)
+		}
+	}
+
+	c.Forget(ctx, stale)
+
+	for _, r := range c.rollouts {
+		if !r.State.Active() {
+			c.clearRolloutQuarantine(ctx, r)
+		}
+	}
 
 	return c, nil
 }
 
 func (c *Controller) restore(snap *Snapshot) {
+	c.nextEventID = max(snap.NextEventID, 1)
+	c.historyID = snap.HistoryID
+
 	for _, r := range snap.Rollouts {
 		c.rollouts[r.ID] = r
-	}
-
-	for g, p := range snap.Policies {
-		c.policies[g] = p
 	}
 
 	for _, s := range snap.Suspensions {
 		c.suspensions[s.ID] = s
 	}
 
-	for id, l := range snap.Live {
-		c.live[id] = l
+	for id := range snap.Live {
+		c.live[id] = snap.Live[id]
 	}
 
 	for id, reason := range snap.Degraded {
@@ -193,21 +227,23 @@ func (c *Controller) restore(snap *Snapshot) {
 	for _, r := range c.rollouts {
 		if _, aborted := c.aborted[r.Group]; aborted && r.State.Active() {
 			c.end(c.clock.Now(), r, Aborted, "Aborted before the last restart.")
+			c.pendingEvents = append(c.pendingEvents, Event{ID: c.nextEventID, At: c.clock.Now(),
+				Actor: ControllerActor, Action: "rollout.aborted", Group: r.Group, Rollout: r.ID, Reason: r.Reason})
+			c.nextEventID++
+			c.dirty = true
 		}
 	}
 
-	// An update whose hook was running when the process stopped never
-	// reported back; the hook is idempotent, so it runs again.
+	// A dispatched update might have landed without a response. Planning checks
+	// its digest and remaining dispatch allowance before sending another attempt.
 	for _, r := range c.rollouts {
 		for i := range r.Targets {
 			rt := &r.Targets[i]
-			if rt.Phase == PhaseUpdating && !rt.UpdateDone {
-				rt.Phase, rt.Reason = PhasePending, "update interrupted by a restart; running again"
+			if rt.Phase == PhaseUpdating && !rt.UpdateDone && rt.RetryAt.IsZero() {
+				rt.Phase, rt.Reason = PhasePending, "update interrupted by a restart; checking whether it landed"
 			}
 		}
 	}
-
-	c.nextEventID = max(snap.NextEventID, 1)
 }
 
 func randomID() string {
@@ -245,17 +281,20 @@ func (c *Controller) Nudge() {
 	}
 }
 
-// Tick advances everything as far as the present moment allows: resolve tags
-// if due, run the environment check if due, expire suspensions, open rollouts
-// for groups that need one, and move every active rollout one step.
+// Tick resolves tags, expires suspensions, opens rollouts and advances active
+// operations from their observations.
 func (c *Controller) Tick(ctx context.Context) error {
 	now := c.clock.Now()
 
-	if err := c.resolveIfDue(ctx, now); err != nil {
-		return err
+	c.mu.Lock()
+	stored := c.flush(ctx)
+	c.mu.Unlock()
+
+	if !stored {
+		return ctx.Err()
 	}
 
-	if err := c.checkEnvironmentIfDue(ctx, now); err != nil {
+	if err := c.resolveIfDue(ctx, now); err != nil {
 		return err
 	}
 
@@ -267,6 +306,7 @@ func (c *Controller) Tick(ctx context.Context) error {
 	// made or any program runs on their behalf.
 	if c.flush(ctx) {
 		c.expireSuspensions(ctx, now)
+		c.expirePauses(ctx, now)
 		c.supersedeChangedRollouts(ctx, now)
 		c.openRollouts(ctx, now)
 		jobs = c.planRollouts(ctx, now)
@@ -282,11 +322,14 @@ func (c *Controller) Tick(ctx context.Context) error {
 	c.mu.Unlock()
 
 	results := c.execute(ctx, jobs)
+	now = c.clock.Now()
 
 	c.mu.Lock()
 	c.applyResults(ctx, now, results)
 	c.lastTick = now
 	c.mu.Unlock()
+
+	c.observeBatch(ctx)
 
 	return ctx.Err()
 }
@@ -353,6 +396,10 @@ func (c *Controller) resolveAll(ctx context.Context, now time.Time) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if err := c.writeOwed(ctx); err != nil {
+		return err
+	}
+
 	c.lastResolve = now
 
 	for img, res := range resolved {
@@ -366,8 +413,7 @@ func (c *Controller) resolveAll(ctx context.Context, now time.Time) error {
 		}
 
 		if !had || prev.Digest != res.Digest {
-			_ = c.persist(ctx, c.store.SaveDesired(ctx, img, d))
-			c.event(ctx, now, &Event{Actor: ControllerActor, Action: "digest.changed", Target: img,
+			c.recordDecision(ctx, now, &Decision{Desired: map[string]Desired{img: d}}, &Event{Actor: ControllerActor, Action: "digest.changed", Target: img,
 				Reason: fmt.Sprintf("%s → %s %s", shortDigest(prev.Digest), shortDigest(res.Digest), res.Revision)})
 		}
 	}
@@ -412,69 +458,68 @@ func (c *Controller) ReportTargetsError(ctx context.Context, err error) {
 	c.event(ctx, now, &Event{Actor: ControllerActor, Action: "targets.invalid", Reason: msg})
 }
 
-// checkEnvironmentIfDue runs the environment hook on its interval.
-func (c *Controller) checkEnvironmentIfDue(ctx context.Context, now time.Time) error {
-	prog := c.cfg.Hooks.Environment.Program
-	if prog == "" {
-		return nil
-	}
-
-	c.mu.Lock()
-	due := c.envCheckedAt.IsZero() || now.Sub(c.envCheckedAt) >= c.cfg.Hooks.Environment.Interval
-	c.mu.Unlock()
-
-	if !due {
-		return nil
-	}
-
-	res, err := c.runner.Run(ctx, prog, config.HookEnvironment, "", map[string]string{"environment": c.cfg.Environment})
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.envCheckedAt = now
-
-	ok := err == nil && res.OK
-	reason := res.Reason
-
-	if err != nil {
-		reason = err.Error()
-	}
-
-	if ok != c.envOK {
-		action := "environment.passing"
-		if !ok {
-			action = "environment.failing"
-		}
-
-		c.event(ctx, now, &Event{Actor: ControllerActor, Action: action, Reason: reason})
-	}
-
-	c.envOK, c.envReason = ok, reason
-
-	return ctx.Err()
-}
-
 func (c *Controller) expireSuspensions(ctx context.Context, now time.Time) {
 	for id, s := range c.suspensions {
+		if c.dirty {
+			break
+		}
+
 		if !now.Before(s.ExpiresAt) {
 			delete(c.suspensions, id)
-			_ = c.persist(ctx, c.store.DeleteSuspension(ctx, id))
-			c.event(ctx, now, &Event{Actor: ControllerActor, Action: "suspend.expired", Selector: s.Selector.String(), Reason: s.Reason})
+			c.recordDecision(ctx, now, &Decision{DeleteSuspensions: []string{id}},
+				&Event{Actor: ControllerActor, Action: "suspend.expired", Selector: s.Selector.String(), Reason: s.Reason})
 		}
 	}
 }
 
-// event records one line of history and tells listeners.
+// event queues history until its write succeeds; listeners see durable events.
 func (c *Controller) event(ctx context.Context, now time.Time, e *Event) {
-	e.ID = c.nextEventID
-	e.At = now
+	e.ID, e.At = c.nextEventID, now
 	c.nextEventID++
 
-	_ = c.persist(ctx, c.store.AppendEvent(ctx, e))
+	if !c.dirty && len(c.pendingEvents) == 0 {
+		if err := c.persist(ctx, c.store.AppendEvent(ctx, e)); err == nil {
+			if c.notifier != nil {
+				c.notifier.Publish(e)
+			}
 
+			return
+		}
+	}
+
+	c.pendingEvents = append(c.pendingEvents, *e)
+}
+
+func (c *Controller) prepareEvents(now time.Time, events []*Event) []Event {
+	out := make([]Event, len(events))
+	for i, e := range events {
+		e.ID, e.At = c.nextEventID+int64(i), now
+		out[i] = *e
+	}
+
+	return out
+}
+
+func (c *Controller) recordDecision(ctx context.Context, now time.Time, d *Decision, events ...*Event) {
+	d.Events = c.prepareEvents(now, events)
+	c.nextEventID += int64(len(d.Events))
+
+	if !c.dirty && len(c.pendingEvents) == 0 {
+		if err := c.persist(ctx, c.store.SaveDecision(ctx, d)); err == nil {
+			c.publishEvents(d.Events)
+
+			return
+		}
+	}
+
+	c.pendingEvents = append(c.pendingEvents, d.Events...)
+}
+
+func (c *Controller) publishEvents(events []Event) {
 	if c.notifier != nil {
-		c.notifier.Publish(e)
+		for i := range events {
+			c.notifier.Publish(&events[i])
+		}
 	}
 }
 
@@ -501,6 +546,10 @@ func (c *Controller) flush(ctx context.Context) bool {
 	c.dirty = false
 
 	_ = c.persist(ctx, c.store.ReplaceDecisions(ctx, c.decisions()))
+	if !c.dirty {
+		c.publishEvents(c.pendingEvents)
+		c.pendingEvents = nil
+	}
 
 	if c.dirty {
 		c.log.WithContext(ctx).Warn("store still failing; no programs run this tick")
@@ -523,6 +572,9 @@ func (c *Controller) writeOwed(ctx context.Context) error {
 		return fmt.Errorf("earlier decisions are still not stored, so nothing was changed: %w", err)
 	}
 
+	c.publishEvents(c.pendingEvents)
+	c.pendingEvents = nil
+
 	return nil
 }
 
@@ -530,7 +582,7 @@ func (c *Controller) writeOwed(ctx context.Context) error {
 // quarantine or abort marker must not come back after a restart, so the
 // tables are replaced whole.
 func (c *Controller) decisions() *Snapshot {
-	snap := &Snapshot{Degraded: c.degraded, Aborted: c.aborted, Desired: c.desired}
+	snap := &Snapshot{Degraded: c.degraded, Aborted: c.aborted, Desired: c.desired, Live: c.live, HookRuns: c.hookRuns, Events: c.pendingEvents}
 
 	for _, r := range c.rollouts {
 		snap.Rollouts = append(snap.Rollouts, r)
@@ -545,16 +597,24 @@ func (c *Controller) decisions() *Snapshot {
 
 // commit applies change to r and saves it. When the store refuses, the
 // rollout is put back so memory never runs ahead of disk.
-func (c *Controller) commit(ctx context.Context, r *Rollout, change func()) error {
+func (c *Controller) commit(ctx context.Context, r *Rollout, change func(), events ...*Event) error {
+	return c.commitDecision(ctx, r, &Decision{}, change, events...)
+}
+
+func (c *Controller) commitDecision(ctx context.Context, r *Rollout, d *Decision, change func(), events ...*Event) error {
 	before := cloneRollout(r)
 
 	change()
 
-	if err := c.saveRollout(ctx, r); err != nil {
+	d.Rollouts, d.Events = []*Rollout{r}, c.prepareEvents(c.clock.Now(), events)
+	if err := c.persist(ctx, c.store.SaveDecision(ctx, d)); err != nil {
 		*r = *before
 
 		return err
 	}
+
+	c.nextEventID += int64(len(d.Events))
+	c.publishEvents(d.Events)
 
 	return nil
 }
@@ -572,88 +632,240 @@ func (c *Controller) SetLive(ctx context.Context, id, digest string, ok bool, re
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.setLiveLocked(ctx, now, observedAt, id, digest, ok, reason)
+	if t, present := c.targets().Get(id); present {
+		c.setLiveLocked(ctx, now, &observation{id: id, started: observedAt, generation: c.generationFor(&t)}, digest, ok, reason)
+	}
 }
 
-// setLiveLocked applies an observation unless a newer one is already
-// recorded or the target has left the files. It reports whether it applied.
-func (c *Controller) setLiveLocked(ctx context.Context, now, observedAt time.Time, id, digest string, ok bool, reason string) bool {
-	if _, present := c.targets().Get(id); !present {
-		return false
-	}
-
-	l := c.live[id]
-	if observedAt.Before(l.ObservedAt) {
+// setLiveLocked applies an observation unless a newer one is already recorded.
+func (c *Controller) setLiveLocked(ctx context.Context, now time.Time, o *observation, digest string, ok bool, reason string) bool {
+	l := c.live[o.id]
+	if o.started.Before(l.ObservedAt) {
 		return false
 	}
 
 	if ok {
-		l = Live{Digest: digest, SeenAt: now}
+		since := l.DigestSince
+		if l.Digest != digest || since.IsZero() {
+			since = now
+		}
+
+		l = Live{Digest: digest, SeenAt: now, DigestSince: since, Readiness: l.Readiness}
 	} else {
 		l.Failures++
 		l.Reason = reason
 	}
 
-	l.ObservedAt = observedAt
-	c.live[id] = l
-	_ = c.persist(ctx, c.store.SaveLive(ctx, id, &l))
+	l.ObservedAt, l.Definition = o.started, o.generation.definition
+	c.live[o.id] = l
+	_ = c.persist(ctx, c.store.SaveLive(ctx, o.id, &l))
 
 	return true
 }
 
-// InspectAll runs the inspect hook for every target and records the result.
+// InspectAll runs the inspect hook for every target now and records the result.
 func (c *Controller) InspectAll(ctx context.Context) {
-	set := c.targets()
+	c.observeTargets(ctx, c.targets().Targets, config.HookInspect, false)
+}
 
-	// Hook input reads the desired digests, so it is built under the lock
-	// before the programs run.
-	c.mu.Lock()
+// observation is one inspect or readiness run as its worker began it: the
+// target's program and input then, and the generation its result must match.
+type observation struct {
+	id         string
+	program    string
+	input      HookInput
+	started    time.Time
+	generation generation
+}
 
-	inputs := make([]HookInput, len(set.Targets))
-	for i := range set.Targets {
-		inputs[i] = c.hookInput(set, &set.Targets[i])
+// generation is a target's observations since it was last forgotten, with a
+// stamp of the definition they describe.
+type generation struct {
+	n          uint64
+	definition string
+}
+
+// observeTargets runs hook for the targets ts names, each with its definition
+// and input as its worker starts; a result is refused once the target is
+// forgotten. A paced pass skips a target the hook began observing too recently.
+func (c *Controller) observeTargets(ctx context.Context, ts []targets.Target, hook string, paced bool) {
+	if hook == config.HookReady {
+		c.probeMu.Lock()
+		defer c.probeMu.Unlock()
 	}
-
-	c.mu.Unlock()
 
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(c.cfg.Inspect.Concurrency)
 
-	for i := range set.Targets {
-		t := set.Targets[i]
-		in := inputs[i]
+	for i := range ts {
+		id := ts[i].ID
 
 		g.Go(func() error {
-			started := c.clock.Now()
-			res, err := c.runner.Run(gctx, c.programFor(&t, config.HookInspect), config.HookInspect, t.ID, in)
+			o, run := c.beginObservation(hook, id, paced)
+			if !run {
+				return nil
+			}
+
+			res, err := c.runner.Run(gctx, o.program, hook, id, o.input)
+
+			if hook == config.HookReady && gctx.Err() != nil {
+				return nil
+			}
+
+			if err != nil {
+				res = hooks.Result{Program: o.program, Reason: err.Error(), ExitCode: -1, RanAt: c.clock.Now()}
+			}
+
+			if res.CouldNotCheck() {
+				res.Reason = "could not check: " + res.Reason
+			}
 
 			c.mu.Lock()
 			defer c.mu.Unlock()
 
-			if err != nil {
-				c.setLiveLocked(gctx, c.clock.Now(), started, t.ID, "", false, err.Error())
-
+			if _, present := c.targets().Get(id); !present || c.generations[id].n != o.generation.n {
 				return nil
 			}
 
-			c.recordHookRun(gctx, t.ID, config.HookInspect, &res)
-			c.setLiveLocked(gctx, c.clock.Now(), started, t.ID, strings.TrimSpace(res.Reason), res.OK, res.Reason)
+			accepted := false
+
+			if hook == config.HookInspect {
+				accepted = c.setLiveLocked(gctx, c.clock.Now(), &o, strings.TrimSpace(res.Reason), res.OK, res.Reason)
+			} else {
+				accepted = c.setReadinessLocked(gctx, &o, res.OK, res.Reason)
+			}
+
+			if accepted {
+				c.recordHookRun(gctx, id, hook, &res)
+			}
 
 			return nil
 		})
 	}
 
 	_ = g.Wait()
+
+	c.mu.Lock()
+
+	if hook == config.HookInspect {
+		c.lastInspect = c.clock.Now()
+	} else {
+		c.lastProbe = c.clock.Now()
+	}
+
+	c.mu.Unlock()
+}
+
+// beginObservation decides as a worker starts whether its target is still
+// listed and due, taking the input from what is known at that moment.
+func (c *Controller) beginObservation(hook, id string, paced bool) (observation, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	t, present := c.targets().Get(id)
+	started := c.clock.Now()
+
+	if !present || (paced && !c.probes.due(hook, id, started)) {
+		return observation{}, false
+	}
+
+	c.probes.begin(hook, id, started)
+
+	return observation{
+		id: id, program: c.programFor(&t, hook), input: c.hookInput(&t), started: started, generation: c.generationFor(&t),
+	}, true
+}
+
+// generationFor returns the target's generation, opening one stamped with
+// its definition if it has none.
+func (c *Controller) generationFor(t *targets.Target) generation {
+	g, ok := c.generations[t.ID]
+	if !ok {
+		c.lastGeneration++
+		g = generation{n: c.lastGeneration, definition: c.definition(t)}
+		c.generations[t.ID] = g
+	}
+
+	return g
+}
+
+// definition stamps hook inputs and program selection across process restarts.
+func (c *Controller) definition(t *targets.Target) string {
+	raw, err := json.Marshal(struct {
+		Target      *targets.Target
+		Environment string
+		Dir         string
+		Programs    [4]string
+	}{t, c.cfg.Environment, c.cfg.Hooks.Dir, [4]string{
+		c.programFor(t, config.HookInspect), c.programFor(t, config.HookReady),
+		c.programFor(t, config.HookUpdate), c.programFor(t, config.HookSoak),
+	}})
+	if err != nil {
+		return ""
+	}
+
+	sum := sha256.Sum256(raw)
+
+	return hex.EncodeToString(sum[:])
+}
+
+// observeBatch looks again at targets waiting on an update between the
+// background passes, with each hook paced per target like those passes.
+func (c *Controller) observeBatch(ctx context.Context) {
+	set := c.targets()
+	c.mu.RLock()
+
+	now := c.clock.Now()
+
+	var inspect, ready []targets.Target
+
+	seen := map[string]struct{}{}
+
+	for _, r := range c.rollouts {
+		b := r.CurrentBatch()
+		if r.State != Running || b == nil {
+			continue
+		}
+
+		for _, id := range b.Targets {
+			if r.target(id).Phase != PhaseUpdating {
+				continue
+			}
+
+			t, present := set.Get(id)
+			_, duplicate := seen[id]
+			seen[id] = struct{}{}
+
+			if present && !duplicate && c.probes.due(config.HookInspect, id, now) {
+				inspect = append(inspect, t)
+			}
+
+			if present && !duplicate && c.probes.due(config.HookReady, id, now) {
+				ready = append(ready, t)
+			}
+		}
+	}
+
+	c.mu.RUnlock()
+
+	if len(inspect) > 0 {
+		c.observeTargets(ctx, inspect, config.HookInspect, true)
+	}
+
+	if len(ready) > 0 {
+		c.observeTargets(ctx, ready, config.HookReady, true)
+	}
 }
 
 // RunInspector observes every target on the inspect interval until ctx ends.
-// It blocks. The first pass runs before it returns control to the ticker.
+// It blocks. The first pass runs before it returns control to the ticker; a
+// target observed within earlyProbeSpacing waits for a later pass.
 func (c *Controller) RunInspector(ctx context.Context) error {
 	ticker := time.NewTicker(c.cfg.Inspect.Interval)
 	defer ticker.Stop()
 
 	for {
-		c.InspectAll(ctx)
+		c.observeTargets(ctx, c.targets().Targets, config.HookInspect, true)
 
 		select {
 		case <-ctx.Done():
@@ -663,19 +875,48 @@ func (c *Controller) RunInspector(ctx context.Context) error {
 	}
 }
 
-// Forget drops live state and quarantine for targets that left the files.
+// Forget drops everything observed about targets, in memory and the store,
+// and refuses their results still in flight, so each reads unobserved and
+// unavailable until observed again.
 func (c *Controller) Forget(ctx context.Context, ids []string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	for _, id := range ids {
-		delete(c.live, id)
-		delete(c.degraded, id)
-		delete(c.hookRuns, id)
-		_ = c.persist(ctx, c.store.DeleteLive(ctx, id))
-		_ = c.persist(ctx, c.store.ClearDegraded(ctx, id))
-		_ = c.persist(ctx, c.store.DeleteHookRuns(ctx, id))
+		c.forgetLocked(ctx, id)
 	}
+}
+
+// ReplaceTargets runs publish, which makes Options.Targets return the new set,
+// and forgets every target that left or changed under the same lock, so no
+// reader pairs a new definition with observations of the old one.
+func (c *Controller) ReplaceTargets(ctx context.Context, publish func() (old, current *targets.Set)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	old, current := publish()
+
+	for i := range old.Targets {
+		t := &old.Targets[i]
+		if kept, present := current.Get(t.ID); !present || !reflect.DeepEqual(*t, kept) {
+			c.forgetLocked(ctx, t.ID)
+		}
+	}
+}
+
+func (c *Controller) forgetLocked(ctx context.Context, id string) {
+	delete(c.live, id)
+	delete(c.degraded, id)
+	delete(c.hookRuns, id)
+	delete(c.generations, id)
+
+	for _, hook := range []string{config.HookInspect, config.HookReady} {
+		key := probeKey{hook: hook, target: id}
+		delete(c.probes.began, key)
+		delete(c.probes.kicked, key)
+	}
+
+	_ = c.persist(ctx, c.store.SaveDecision(ctx, &Decision{DeleteTargets: []string{id}}))
 }
 
 // HookInput is what target hooks receive on stdin: the target plus the
@@ -685,12 +926,15 @@ type HookInput struct {
 
 	Desired    string `json:"desired,omitempty"`
 	DesiredRef string `json:"desiredRef,omitempty"`
+	// DigestSince is when the target was first seen running the digest it
+	// runs now, so a program can tell a fresh restart from steady state.
+	DigestSince time.Time `json:"digestSince,omitzero"`
 }
 
-func (c *Controller) hookInput(set *targets.Set, t *targets.Target) HookInput {
-	in := HookInput{Target: *t}
+func (c *Controller) hookInput(t *targets.Target) HookInput {
+	in := HookInput{Target: *t, DigestSince: c.live[t.ID].DigestSince}
 
-	if d, ok := c.desiredFor(set.Group(t), t); ok && d.Digest != "" {
+	if d, ok := c.desiredFor(t); ok && d.Digest != "" {
 		in.Desired = d.Digest
 		in.DesiredRef = DesiredRef(t.Image, d.Digest)
 	}
@@ -739,14 +983,8 @@ func (c *Controller) liveKnown(id string) (string, bool) {
 	return l.Digest, true
 }
 
-// desiredFor is the digest a target should run: a pin, else the tag's head.
-func (c *Controller) desiredFor(group string, t *targets.Target) (Desired, bool) {
-	if p, ok := c.policies[group]; ok {
-		if pin, pinned := p.Pins[t.Image]; pinned {
-			return Desired{Digest: pin}, true
-		}
-	}
-
+// desiredFor is the current head digest of a target's image tag.
+func (c *Controller) desiredFor(t *targets.Target) (Desired, bool) {
 	d, ok := c.desired[t.Image]
 
 	return d, ok
@@ -764,14 +1002,6 @@ func (c *Controller) suspensionFor(t *targets.Target) *Suspension {
 	}
 
 	return found
-}
-
-func (c *Controller) policyFor(group string) Policy {
-	if p, ok := c.policies[group]; ok {
-		return p
-	}
-
-	return Policy{Mode: c.cfg.DefaultPolicy.Mode, Strategy: c.cfg.DefaultPolicy.Strategy}
 }
 
 // strategy is a named strategy, or the default when the name is empty or no

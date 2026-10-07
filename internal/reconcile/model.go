@@ -25,10 +25,11 @@ type Health string
 
 // Health states.
 const (
-	Healthy     Health = "Healthy"
-	Progressing Health = "Progressing"
-	Degraded    Health = "Degraded"
-	Suspended   Health = "Suspended"
+	Healthy       Health = "Healthy"
+	Progressing   Health = "Progressing"
+	Degraded      Health = "Degraded"
+	Suspended     Health = "Suspended"
+	HealthUnknown Health = "Unknown"
 )
 
 // RolloutState is where a rollout is.
@@ -37,43 +38,26 @@ type RolloutState string
 // Rollout states. Terminal ones are Complete, Halted-then-Superseded, Aborted
 // and Superseded; Halted itself waits for a retry or a new digest.
 const (
-	WaitingForSync        RolloutState = "WaitingForSync"
-	Running               RolloutState = "Running"
-	Soaking               RolloutState = "Soaking"
-	Paused                RolloutState = "Paused"
-	WaitingForBudget      RolloutState = "WaitingForBudget"
-	WaitingForEnvironment RolloutState = "WaitingForEnvironment"
-	Halted                RolloutState = "Halted"
-	Aborted               RolloutState = "Aborted"
-	Superseded            RolloutState = "Superseded"
-	Complete              RolloutState = "Complete"
+	Running          RolloutState = "Running"
+	Soaking          RolloutState = "Soaking"
+	Paused           RolloutState = "Paused"
+	WaitingForBudget RolloutState = "WaitingForBudget"
+	Halted           RolloutState = "Halted"
+	Aborted          RolloutState = "Aborted"
+	Superseded       RolloutState = "Superseded"
+	Complete         RolloutState = "Complete"
 )
 
 // Active reports whether the controller still has work to do on this state.
 func (s RolloutState) Active() bool {
 	switch s {
-	case WaitingForSync, Running, Soaking, Paused, WaitingForBudget, WaitingForEnvironment, Halted:
+	case Running, Soaking, Paused, WaitingForBudget, Halted:
 		return true
 	case Aborted, Superseded, Complete:
 		return false
 	}
 
 	return false
-}
-
-// Policy modes.
-const (
-	ModeAutomated = "automated"
-	ModeManual    = "manual"
-)
-
-// Policy is what a group has chosen.
-type Policy struct {
-	Mode string `json:"mode"`
-	// Strategy names a configured strategy; empty is the default.
-	Strategy string `json:"strategy,omitempty"`
-	// Pins hold an image at a digest regardless of the tag.
-	Pins map[string]string `json:"pins,omitempty"`
 }
 
 // Suspension keeps matching targets out of every rollout until it expires.
@@ -86,15 +70,38 @@ type Suspension struct {
 	ExpiresAt time.Time        `json:"expiresAt"`
 }
 
-// Live is what inspect last reported for a target.
+// Live holds the independent digest and readiness observations for a target.
 type Live struct {
-	Digest   string    `json:"digest"`
-	Failures int       `json:"failures"`
-	SeenAt   time.Time `json:"seenAt"`
-	Reason   string    `json:"reason,omitempty"`
+	Digest      string    `json:"digest"`
+	Failures    int       `json:"failures"`
+	SeenAt      time.Time `json:"seenAt"`
+	DigestSince time.Time `json:"digestSince,omitzero"`
+	Reason      string    `json:"reason,omitempty"`
 	// ObservedAt is when the observation that produced this began, so a slow
 	// inspect that returns after a newer one cannot overwrite it.
 	ObservedAt time.Time `json:"observedAt,omitzero"`
+	Readiness  Readiness `json:"readiness"`
+	// Definition stamps the target definition these observations describe;
+	// a restart forgets them when the target's definition no longer matches.
+	Definition string `json:"definition,omitempty"`
+}
+
+// Readiness is the thresholded result of a target's readiness probe.
+type Readiness struct {
+	Ready         bool      `json:"ready"`
+	Since         time.Time `json:"since,omitzero"`
+	Reason        string    `json:"reason,omitempty"`
+	ProbedAt      time.Time `json:"probedAt,omitzero"`
+	ObservedAt    time.Time `json:"observedAt,omitzero"`
+	LastSuccessAt time.Time `json:"lastSuccessAt,omitzero"`
+	Failures      int       `json:"failures"`
+	Successes     int       `json:"successes"`
+}
+
+// Quarantine identifies the rollout that stopped with a target in its batch.
+type Quarantine struct {
+	Rollout string `json:"rollout"`
+	Reason  string `json:"reason"`
 }
 
 // Desired is what a tag currently points at.
@@ -121,25 +128,35 @@ const (
 type RolloutTarget struct {
 	ID     string      `json:"id"`
 	Node   string      `json:"node"`
+	Image  string      `json:"image"`
 	Wave   int         `json:"wave"`
 	Batch  int         `json:"batch"` // 0 = not yet batched
 	Phase  TargetPhase `json:"phase"`
 	Reason string      `json:"reason,omitempty"`
-	// UpdateDone is set once the update hook has returned success; Updated
-	// once inspect has seen the desired digest running.
-	UpdateDone bool      `json:"updateDone"`
-	Updated    bool      `json:"updated"`
-	UpdatedAt  time.Time `json:"updatedAt,omitzero"`
-	// DegradedBefore marks a target that was already Degraded when the
-	// rollout began, so its node costs nothing against the budget.
-	DegradedBefore bool `json:"degradedBefore,omitempty"`
-	// Free marks a target whose node was already degraded when its update
-	// was admitted: the node costs nothing against the budget while that
-	// update is in flight, even if the quarantine is lifted meanwhile.
+	// UpdateDone is set once the update hook has returned success; Updated once
+	// inspect has seen the desired digest. UpdateAttempts counts dispatches, each
+	// stored before its program runs; UpdatedAt is the first, DispatchedAt the last.
+	UpdateDone     bool      `json:"updateDone"`
+	Updated        bool      `json:"updated"`
+	UpdatedAt      time.Time `json:"updatedAt,omitzero"`
+	DispatchedAt   time.Time `json:"dispatchedAt,omitzero"`
+	DigestSeenAt   time.Time `json:"digestSeenAt,omitzero"`
+	UpdateAttempts int       `json:"updateAttempts"`
+	RetryAt        time.Time `json:"retryAt,omitzero"`
+	UpdateError    string    `json:"updateError,omitempty"`
+	// NotReadyBefore fixes the observation-based priority at rollout creation.
+	NotReadyBefore bool `json:"notReadyBefore,omitempty"`
+	// Free records that admission added no unavailable node.
 	Free bool `json:"free,omitempty"`
-	// HoldUntil keeps the node counted against the budget after the rollout
-	// ended while this target's update may still be landing.
+	// NodeWeight is the node's weight at admission; while the rollout keeps
+	// the node unavailable it counts at least this, even once the node is gone.
+	NodeWeight float64 `json:"nodeWeight,omitempty"`
+	// HoldUntil keeps the node counted against the budget after the target
+	// left its batch while an update dispatched to it may still be landing.
 	HoldUntil time.Time `json:"holdUntil,omitzero"`
+	// Retried marks a target a person sent back after a halt; it goes before
+	// untried targets and passes a batch even when already on the build.
+	Retried bool `json:"retried,omitempty"`
 }
 
 // Batch is one step of a rollout.
@@ -151,9 +168,10 @@ type Batch struct {
 	EndedAt   time.Time `json:"endedAt,omitzero"`
 	Passed    bool      `json:"passed"`
 	// Soak is the batch's soak once it has ended; the open batch's lives on
-	// the rollout. PriorSoaks are the attempts a retry replaced.
-	Soak       *SoakProgress   `json:"soak,omitempty"`
-	PriorSoaks []*SoakProgress `json:"priorSoaks,omitempty"`
+	// the rollout.
+	Soak *SoakProgress `json:"soak,omitempty"`
+	// Retried batches take only targets a retry sent back.
+	Retried bool `json:"retried,omitempty"`
 }
 
 // SoakCheck is one run of one soak program.
@@ -161,6 +179,7 @@ type SoakCheck struct {
 	At        time.Time `json:"at"`
 	Program   string    `json:"program"`
 	OK        bool      `json:"ok"`
+	Error     bool      `json:"error,omitempty"`
 	Reason    string    `json:"reason"`
 	Updated   string    `json:"updated,omitempty"`
 	Remaining string    `json:"remaining,omitempty"`
@@ -176,6 +195,7 @@ type SoakProgress struct {
 	LastCheckStartedAt time.Time   `json:"lastCheckStartedAt,omitzero"`
 	Streak             int         `json:"streak"`
 	Failures           int         `json:"failures"`
+	ConsecutiveErrors  int         `json:"consecutiveErrors"`
 	Checks             []SoakCheck `json:"checks,omitempty"`
 }
 
@@ -187,19 +207,20 @@ type Rollout struct {
 	// Desired is image → digest at creation; the rollout moves targets here.
 	Desired   map[string]string `json:"desired"`
 	Revisions map[string]string `json:"revisions,omitempty"`
+	// GroupDesiredKey includes images already in sync when the operation began.
+	GroupDesiredKey string `json:"groupDesiredKey,omitempty"`
 	// From is image → the digest most targets ran before, for display.
 	From map[string]string `json:"from,omitempty"`
 
 	State  RolloutState `json:"state"`
 	Reason string       `json:"reason"`
 
-	// Human is true when a person started or resumed it; the environment
-	// check never pauses a human's rollout.
+	// Human records that a person started or resumed the operation.
 	Human bool `json:"human"`
 	Force bool `json:"force"`
 
-	PausePending bool `json:"pausePending,omitempty"`
-	RetryPending bool `json:"retryPending,omitempty"`
+	PausePending   bool      `json:"pausePending,omitempty"`
+	PauseExpiresAt time.Time `json:"pauseExpiresAt,omitzero"`
 
 	Targets []RolloutTarget `json:"targets"`
 	Batches []Batch         `json:"batches"`
@@ -259,6 +280,11 @@ type Event struct {
 
 // ControllerActor is the actor recorded for the controller's own decisions.
 const ControllerActor = "controller"
+
+const (
+	eventRolloutCreated = "rollout.created"
+	eventRolloutHalted  = "rollout.halted"
+)
 
 // HookRun is the last result of one hook for one target, kept for display.
 type HookRun struct {

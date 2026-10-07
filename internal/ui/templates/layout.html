@@ -29,3 +29,5 @@
 {{define "state-badge"}}<span class="badge state-{{lower (printf "%s" .)}}">{{.}}</span>{{end}}
 
 {{define "disabled-why"}}{{if not .OK}}<span class="why">{{.Why}}, so these are view-only for you.</span>{{end}}{{end}}
+
+{{define "config-pause"}}<p class="held">The config file pauses {{.}}: no new batch starts and no update is sent until the config clears it. Updated targets are still watched, and Promote does not override it.</p>{{end}}

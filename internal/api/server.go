@@ -6,8 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"mime"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/ethpandaops/rolloor/internal/config"
@@ -18,6 +21,20 @@ import (
 
 // errKey is the JSON field every error response carries.
 const errKey = "error"
+
+const (
+	headerContentType    = "Content-Type"
+	mediaJSON            = "application/json"
+	headerOrigin         = "Origin"
+	headerReferer        = "Referer"
+	headerFetchSite      = "Sec-Fetch-Site"
+	headerForwardedProto = "X-Forwarded-Proto"
+	fetchSameOrigin      = "same-origin"
+	fetchCrossSite       = "cross-site"
+	fetchUserInitiated   = "none"
+	originOpaque         = "null"
+	schemeHTTPS          = "https"
+)
 
 const (
 	sseWriteTimeout = 10 * time.Second
@@ -57,21 +74,20 @@ func (s *Server) Routes() http.Handler {
 
 	mux.HandleFunc("GET /healthz", s.healthz)
 	mux.HandleFunc("GET /api/v1/me", s.me)
-	mux.HandleFunc("PUT /api/v1/policies/{group}", s.policyPut)
 
 	for path, h := range map[string]http.HandlerFunc{
 		"/fleet": s.fleet, "/groups/{label}/{value}": s.group, "/nodes/{node}": s.node, "/targets": s.targetsList,
-		"/rollouts": s.rollouts, "/rollouts/{id}": s.rollout, "/history": s.history, "/policies/{group}": s.policyGet,
+		"/rollouts": s.rollouts, "/rollouts/{id}": s.rollout, "/history": s.history,
 		"/suspensions": s.suspensions, "/events": s.stream,
 	} {
 		mux.HandleFunc("GET /api/v1"+path, s.readable(h))
 	}
 
-	for verb, h := range map[string]http.HandlerFunc{
+	for verb, h := range map[string]actionHandler{
 		"sync": s.actionSync, "refresh": s.actionRefresh, "suspend": s.actionSuspend, "resume": s.actionResume,
 		"pause": s.actionPause, "promote": s.actionPromote, "abort": s.actionAbort, "retry": s.actionRetry,
 	} {
-		mux.HandleFunc("POST /api/v1/actions/"+verb, h)
+		mux.HandleFunc("POST /api/v1/actions/"+verb, s.acting(h))
 	}
 
 	return mux
@@ -91,11 +107,99 @@ func (s *Server) readable(h http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// actionHandler serves a verb for a caller already resolved and admitted.
+type actionHandler func(w http.ResponseWriter, r *http.Request, id *Identity)
+
+// acting resolves the caller once. A session cookie rides along on requests
+// any page can make, so a session must also act from this site and send JSON,
+// which a page elsewhere cannot do without passing a CORS preflight.
+func (s *Server) acting(h actionHandler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, ok := s.identity(w, r)
+		if !ok {
+			return
+		}
+
+		if id.Session && !SameOrigin(r) {
+			writeError(w, http.StatusForbidden, "cross-site request refused")
+
+			return
+		}
+
+		if id.Session && !sendsJSON(r) {
+			writeError(w, http.StatusUnsupportedMediaType, headerContentType+" must be "+mediaJSON)
+
+			return
+		}
+
+		h(w, r, &id)
+	}
+}
+
+// sendsJSON reports whether the request declares a JSON body, with any
+// parameters such as a charset.
+func sendsJSON(r *http.Request) bool {
+	media, _, err := mime.ParseMediaType(r.Header.Get(headerContentType))
+
+	return err == nil && media == mediaJSON
+}
+
+// SameOrigin requires browser provenance to match this server's origin.
+// Every supplied provenance header must agree and at least one must vouch.
+func SameOrigin(r *http.Request) bool {
+	vouched := false
+
+	switch r.Header.Get(headerFetchSite) {
+	case fetchSameOrigin, fetchUserInitiated:
+		vouched = true
+	case "":
+	default:
+		return false
+	}
+
+	for _, h := range []string{headerOrigin, headerReferer} {
+		v := r.Header.Get(h)
+		if v == "" {
+			continue
+		}
+
+		if !ownOrigin(r, v) {
+			return false
+		}
+
+		vouched = true
+	}
+
+	return vouched
+}
+
+// ownOrigin compares the browser's URL against the request's external origin.
+// TLS-terminating proxies must preserve Host and set X-Forwarded-Proto.
+func ownOrigin(r *http.Request, raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || !strings.EqualFold(u.Host, r.Host) {
+		return false
+	}
+
+	switch strings.ToLower(u.Scheme) {
+	case schemeHTTPS:
+		return Secure(r)
+	case "http":
+		return !Secure(r)
+	default:
+		return false
+	}
+}
+
+// Secure reports whether the request arrived over TLS, directly or through a
+// proxy that says so.
+func Secure(r *http.Request) bool {
+	return r.TLS != nil || strings.EqualFold(r.Header.Get(headerForwardedProto), schemeHTTPS)
+}
+
 func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
-	ok, reason, at := s.c.EnvironmentStatus()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "version": s.version, "environment": s.cfg.Environment,
-		"environmentCheck": map[string]any{"ok": ok, "reason": reason, "at": at},
 	})
 }
 
@@ -198,8 +302,11 @@ func (s *Server) history(w http.ResponseWriter, r *http.Request) {
 		about = s.targets().Select(sel)
 	}
 
+	// Any after, zero included, asks for history oldest first from that id;
+	// without it the newest events come first.
 	after, _ := strconv.ParseInt(q.Get("after"), 10, 64)
-	query := reconcile.EventQuery{Group: q.Get("group"), Rollout: q.Get("rollout"), Target: q.Get("target"), Limit: limit, After: max(after, 0)}
+	_, oldest := q["after"]
+	query := reconcile.EventQuery{Group: q.Get("group"), Rollout: q.Get("rollout"), Target: q.Get("target"), Limit: limit, After: max(after, 0), Oldest: oldest}
 
 	var (
 		events []reconcile.Event
@@ -207,9 +314,9 @@ func (s *Server) history(w http.ResponseWriter, r *http.Request) {
 	)
 
 	if about != nil {
-		events, err = s.c.EventsAbout(r.Context(), about, query)
+		events, err = s.c.EventsAbout(r.Context(), about, &query)
 	} else {
-		events, err = s.c.Events(r.Context(), query)
+		events, err = s.c.Events(r.Context(), &query)
 	}
 
 	if err != nil {
@@ -222,40 +329,9 @@ func (s *Server) history(w http.ResponseWriter, r *http.Request) {
 		events = []reconcile.Event{}
 	}
 
+	w.Header().Set("Rolloor-History", s.c.HistoryID())
+
 	writeJSON(w, http.StatusOK, events)
-}
-
-func (s *Server) policyGet(w http.ResponseWriter, r *http.Request) {
-	g, _, ok := s.c.Group(r.PathValue("group"))
-	if !ok {
-		writeError(w, http.StatusNotFound, "no such group")
-
-		return
-	}
-
-	writeJSON(w, http.StatusOK, g.Policy)
-}
-
-func (s *Server) policyPut(w http.ResponseWriter, r *http.Request) {
-	group := r.PathValue("group")
-
-	id, ok := s.authorizeGroup(w, r, group)
-	if !ok {
-		return
-	}
-
-	var p reconcile.Policy
-	if !readJSON(w, r, &p) {
-		return
-	}
-
-	if err := s.c.SetPolicy(r.Context(), id.Name, group, p); err != nil {
-		writeActionError(w, err)
-
-		return
-	}
-
-	writeJSON(w, http.StatusOK, p)
 }
 
 func (s *Server) suspensions(w http.ResponseWriter, _ *http.Request) {
@@ -289,7 +365,7 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 	var replay []reconcile.Event
 
 	if last > 0 {
-		missed, err := s.c.Events(r.Context(), reconcile.EventQuery{After: last})
+		missed, err := s.c.Events(r.Context(), &reconcile.EventQuery{After: last})
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 
@@ -311,7 +387,7 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 		return rc.Flush() == nil
 	}
 
-	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set(headerContentType, "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
 
@@ -379,25 +455,17 @@ func (s *Server) identity(w http.ResponseWriter, r *http.Request) (Identity, boo
 	return id, true
 }
 
-// ownersOf lists the distinct owner values of some targets, sorted.
 // authorizeSelector checks the caller may act on everything the selector
-// matches, and that a selector spanning several owners was confirmed. With
-// wholeGroups, the check covers every target in the groups the selector
-// touches, because that is what a sync acts on.
-func (s *Server) authorizeSelector(w http.ResponseWriter, r *http.Request, sel targets.Selector, confirm, wholeGroups bool) (Identity, []targets.Target, bool) {
-	id, ok := s.identity(w, r)
-	if !ok {
-		return Identity{}, nil, false
-	}
-
-	matched, err := Authorize(s.targets(), &id, sel, confirm, wholeGroups)
-	if err != nil {
+// matches and confirmed a selection spanning several owners. With wholeGroups
+// it covers every target in the touched groups, because a sync moves those.
+func (s *Server) authorizeSelector(w http.ResponseWriter, id *Identity, sel targets.Selector, confirm, wholeGroups bool) bool {
+	if _, err := Authorize(s.targets(), id, sel, confirm, wholeGroups); err != nil {
 		writeActionRefusal(w, err, id.Owners)
 
-		return Identity{}, nil, false
+		return false
 	}
 
-	return id, matched, true
+	return true
 }
 
 // writeActionRefusal answers with the status and body an ActionError carries.
@@ -420,43 +488,38 @@ func writeActionRefusal(w http.ResponseWriter, err error, held []string) {
 }
 
 // authorizeGroup checks the caller may act on a group.
-func (s *Server) authorizeGroup(w http.ResponseWriter, r *http.Request, group string) (Identity, bool) {
-	id, ok := s.identity(w, r)
-	if !ok {
-		return Identity{}, false
-	}
-
+func (s *Server) authorizeGroup(w http.ResponseWriter, id *Identity, group string) bool {
 	members := s.targets().InGroup(group)
 	if len(members) == 0 {
 		writeError(w, http.StatusNotFound, "no such group")
 
-		return Identity{}, false
+		return false
 	}
 
 	owners := OwnersOf(s.targets(), members)
-	if allowed, why := MayAct(&id, owners); !allowed {
+	if allowed, why := MayAct(id, owners); !allowed {
 		writeForbidden(w, why, owners, id.Owners)
 
-		return Identity{}, false
+		return false
 	}
 
-	return id, true
+	return true
 }
 
 // authorizeRollout checks the caller may act on a rollout's group.
-func (s *Server) authorizeRollout(w http.ResponseWriter, r *http.Request, rolloutID string) (Identity, bool) {
+func (s *Server) authorizeRollout(w http.ResponseWriter, id *Identity, rolloutID string) bool {
 	v, ok := s.c.Rollout(rolloutID)
 	if !ok {
 		writeError(w, http.StatusNotFound, "no such rollout")
 
-		return Identity{}, false
+		return false
 	}
 
-	return s.authorizeGroup(w, r, v.Group)
+	return s.authorizeGroup(w, id, v.Group)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set(headerContentType, mediaJSON)
 	w.WriteHeader(status)
 
 	_ = json.NewEncoder(w).Encode(v)
