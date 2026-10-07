@@ -19,7 +19,7 @@ Programs in `hooks.dir` read JSON. Exit 0 means yes, exit 1 means no, and exit 3
 |---|---|---|---|---|
 | `inspect` | target | prints the running digest or `none` | failed observation | failed observation, reason says could not check |
 | `update` | target with `desired`, `desiredRef` | update accepted | failed attempt, retried | failed attempt, retried |
-| `ready` | target | target is available now | negative readiness observation | failed readiness observation, reason says could not check |
+| `ready` | target with `digestSince` (when it was first seen on its current digest) | target is available now | negative readiness observation | failed readiness observation, reason says could not check |
 | `soak` | `{updated, remaining, rollout}` | updated targets are no worse than the rest | negative comparison, counts toward `failureLimit` | neutral error; wait and retry, never halt on its own |
 
 `ready` ignores desired digests and runs outside rollouts too. Hooks must be idempotent: interrupted updates may repeat, observed landed updates do not.

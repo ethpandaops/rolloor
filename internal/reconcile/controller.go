@@ -812,10 +812,13 @@ type HookInput struct {
 
 	Desired    string `json:"desired,omitempty"`
 	DesiredRef string `json:"desiredRef,omitempty"`
+	// DigestSince is when the target was first seen running the digest it
+	// runs now, so a program can tell a fresh restart from steady state.
+	DigestSince time.Time `json:"digestSince,omitzero"`
 }
 
 func (c *Controller) hookInput(t *targets.Target) HookInput {
-	in := HookInput{Target: *t}
+	in := HookInput{Target: *t, DigestSince: c.live[t.ID].DigestSince}
 
 	if d, ok := c.desiredFor(t); ok && d.Digest != "" {
 		in.Desired = d.Digest

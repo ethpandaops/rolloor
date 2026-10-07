@@ -447,3 +447,31 @@ func TestBatchObservationsArePacedPerTargetAndHook(t *testing.T) {
 	step(0, [2]int{7, 7}, "a target past updating is not observed early")
 	require.Equal(t, PhaseReady, h.phases(h.active("a"))[tN1A])
 }
+
+func TestHookInputSaysWhenTheRunningDigestWasFirstSeen(t *testing.T) {
+	h := newHarness(t, testConfig, testTargets)
+	first := h.clock.Now()
+	h.prime()
+
+	// A program can tell a fresh restart from steady state: the input names
+	// when the target was first seen on the digest it runs now.
+	tg, _ := h.current().Get(tA1)
+
+	h.c.mu.RLock()
+	in := h.c.hookInput(&tg)
+	h.c.mu.RUnlock()
+
+	require.Equal(t, first, in.DigestSince)
+
+	h.clock.Advance(time.Minute)
+	h.release(imgA, d2)
+	h.ticks(3, 20*time.Second)
+	h.c.InspectAll(h.ctx)
+
+	h.c.mu.RLock()
+	in = h.c.hookInput(&tg)
+	h.c.mu.RUnlock()
+
+	require.Equal(t, d2, h.view(tA1).Live)
+	require.True(t, in.DigestSince.After(first), "a new digest has a new since")
+}
