@@ -12,29 +12,40 @@ type eventFailureStore struct {
 	*MemoryStore
 	failEvents bool
 	failAction string
-	written    []string
+}
+
+func (s *eventFailureStore) rejects(events []Event) bool {
+	for _, e := range events {
+		if s.failEvents || (s.failAction != "" && e.Action == s.failAction) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (s *eventFailureStore) AppendEvent(ctx context.Context, e *Event) error {
-	if s.failEvents || (s.failAction != "" && e.Action == s.failAction) {
+	if s.rejects([]Event{*e}) {
 		return errFake
 	}
-
-	s.written = append(s.written, e.Action)
 
 	return s.MemoryStore.AppendEvent(ctx, e)
 }
 
-func (s *eventFailureStore) SaveRollout(ctx context.Context, rollout *Rollout) error {
-	s.written = append(s.written, "save.rollout:"+rollout.Group)
+func (s *eventFailureStore) SaveDecision(ctx context.Context, d *Decision) error {
+	if s.rejects(d.Events) {
+		return errFake
+	}
 
-	return s.MemoryStore.SaveRollout(ctx, rollout)
+	return s.MemoryStore.SaveDecision(ctx, d)
 }
 
-func (s *eventFailureStore) SaveSuspension(ctx context.Context, suspension *Suspension) error {
-	s.written = append(s.written, "save.suspension")
+func (s *eventFailureStore) ReplaceDecisions(ctx context.Context, snap *Snapshot) error {
+	if s.rejects(snap.Events) {
+		return errFake
+	}
 
-	return s.MemoryStore.SaveSuspension(ctx, suspension)
+	return s.MemoryStore.ReplaceDecisions(ctx, snap)
 }
 
 func TestGuaranteeHistorySurvivesStoreFailures(t *testing.T) {
@@ -55,7 +66,6 @@ func TestGuaranteeHistorySurvivesStoreFailures(t *testing.T) {
 	disk.failEvents = false
 	_, err = h.c.Suspend(h.ctx, SuspendRequest{Actor: actor, Selector: mustSel("client=a"), Reason: "stop"})
 	require.NoError(t, err)
-	require.Equal(t, []string{"refresh", "targets.invalid", "save.suspension", "suspend"}, disk.written)
 	require.False(t, h.c.Fleet().StoreWritesOwed)
 
 	events, err := h.c.Events(h.ctx, &EventQuery{})
@@ -221,10 +231,9 @@ func TestOwedHistoryStopsFurtherDecisionsInTheSameTick(t *testing.T) {
 			require.True(t, h.c.Fleet().StoreWritesOwed)
 			tc.check(t, h)
 
-			disk.failAction, disk.written = "", nil
+			disk.failAction = ""
 
 			h.tick()
-			require.Equal(t, tc.action, disk.written[0], "the older history lands before new decisions")
 			require.False(t, h.c.Fleet().StoreWritesOwed)
 		})
 	}
@@ -241,14 +250,49 @@ func TestSyncStoresOlderGroupHistoryBeforeChangingAnotherGroup(t *testing.T) {
 
 	started, err := h.c.Sync(h.ctx, SyncRequest{Actor: actor, Selector: mustSel("node=a-3")})
 	require.ErrorIs(t, err, errFake)
-	require.Len(t, started, 1)
-	require.Len(t, h.c.Rollouts(), 1)
+	require.Empty(t, started)
+	require.Empty(t, h.c.Rollouts())
 	require.Empty(t, h.world.callsFor("update"))
 
-	disk.failAction, disk.written = "", nil
+	disk.failAction = ""
 	started, err = h.c.Sync(h.ctx, SyncRequest{Actor: actor, Selector: mustSel("node=a-3")})
 	require.NoError(t, err)
 	require.Len(t, started, 2)
-	require.Equal(t, "rollout.created", disk.written[0])
 	require.Len(t, h.c.Rollouts(), 2)
+}
+
+func TestHaltDecisionCannotOutliveItsHistory(t *testing.T) {
+	h := newHarness(t, testConfig, testTargets)
+	h.prime()
+	h.release(imgA, d2)
+	h.tick()
+	id := h.active("a").ID
+	before := h.rollout(id)
+	disk := &eventFailureStore{MemoryStore: h.store, failEvents: true}
+	h.c.store = disk
+
+	h.c.mu.Lock()
+	h.c.halt(h.ctx, h.clock.Now(), h.c.rollouts[id], "", "bad comparison")
+	h.c.mu.Unlock()
+
+	snap, err := h.store.Load(h.ctx)
+	require.NoError(t, err)
+
+	for _, r := range snap.Rollouts {
+		if r.ID == id {
+			require.Equal(t, before.State, r.State)
+			require.Equal(t, before.Batches, r.Batches)
+		}
+	}
+
+	require.Empty(t, snap.Degraded)
+
+	h.c = h.newController()
+	require.Equal(t, before.State, h.rollout(id).State)
+	events, err := h.c.Events(h.ctx, &EventQuery{Rollout: id})
+	require.NoError(t, err)
+
+	for _, e := range events {
+		require.NotEqual(t, "rollout.halted", e.Action)
+	}
 }

@@ -73,7 +73,6 @@ func (c *Controller) expirePauses(ctx context.Context, now time.Time) {
 			r.State, r.Reason = Running, "Operator pause expired; resuming automatically."
 		}
 
-		_ = c.saveRollout(ctx, r)
-		c.event(ctx, now, &Event{Actor: ControllerActor, Action: "pause.expired", Group: r.Group, Rollout: r.ID})
+		c.recordDecision(ctx, now, &Decision{Rollouts: []*Rollout{r}}, &Event{Actor: ControllerActor, Action: "pause.expired", Group: r.Group, Rollout: r.ID})
 	}
 }

@@ -2,6 +2,7 @@ package reconcile
 
 import (
 	"context"
+	"crypto/rand"
 	"maps"
 	"sort"
 	"sync"
@@ -17,6 +18,22 @@ type Snapshot struct {
 	Aborted     map[string]string
 	HookRuns    map[string]map[string]HookRun
 	NextEventID int64
+	HistoryID   string
+	Events      []Event
+}
+
+// Decision groups changed records with the history they cause.
+type Decision struct {
+	Rollouts          []*Rollout
+	Suspensions       []Suspension
+	DeleteSuspensions []string
+	DeleteTargets     []string
+	Degraded          map[string]string
+	Desired           map[string]Desired
+	Aborted           map[string]string
+	ClearAborted      []string
+	ClearDegraded     []string
+	Events            []Event
 }
 
 // Store persists the controller's decisions. The controller is the only
@@ -24,6 +41,7 @@ type Snapshot struct {
 type Store interface {
 	Load(ctx context.Context) (*Snapshot, error)
 	SaveRollout(ctx context.Context, r *Rollout) error
+	SaveDecision(ctx context.Context, d *Decision) error
 	SaveSuspension(ctx context.Context, s *Suspension) error
 	DeleteSuspension(ctx context.Context, id string) error
 	SaveLive(ctx context.Context, id string, l *Live) error
@@ -73,6 +91,7 @@ type MemoryStore struct {
 	desired     map[string]Desired
 	aborted     map[string]string
 	events      []Event
+	historyID   string
 	// Fail, when set, is returned by every write; FailRollouts by rollout
 	// saves only. Tests use them.
 	Fail         error
@@ -90,6 +109,7 @@ func NewMemoryStore() *MemoryStore {
 		desired:     map[string]Desired{},
 		aborted:     map[string]string{},
 		hookRuns:    map[string]map[string]HookRun{},
+		historyID:   rand.Text(),
 	}
 }
 
@@ -111,6 +131,7 @@ func (m *MemoryStore) Load(context.Context) (*Snapshot, error) {
 		Aborted:     map[string]string{},
 		HookRuns:    map[string]map[string]HookRun{},
 		NextEventID: int64(len(m.events)) + 1,
+		HistoryID:   m.historyID,
 	}
 
 	for id, runs := range m.hookRuns {
@@ -168,6 +189,54 @@ func cloneRollout(r *Rollout) *Rollout {
 	}
 
 	return &cp
+}
+
+// SaveDecision stores records and their events under one lock.
+func (m *MemoryStore) SaveDecision(_ context.Context, d *Decision) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.Fail != nil {
+		return m.Fail
+	}
+
+	if len(d.Rollouts) > 0 && m.FailRollouts != nil {
+		return m.FailRollouts
+	}
+
+	for _, r := range d.Rollouts {
+		m.rollouts[r.ID] = cloneRollout(r)
+	}
+
+	for _, s := range d.Suspensions {
+		m.suspensions[s.ID] = s
+	}
+
+	for _, id := range d.DeleteSuspensions {
+		delete(m.suspensions, id)
+	}
+
+	for _, id := range d.DeleteTargets {
+		delete(m.live, id)
+		delete(m.degraded, id)
+		delete(m.hookRuns, id)
+	}
+
+	maps.Copy(m.desired, d.Desired)
+	maps.Copy(m.aborted, d.Aborted)
+	maps.Copy(m.degraded, d.Degraded)
+
+	for _, group := range d.ClearAborted {
+		delete(m.aborted, group)
+	}
+
+	for _, id := range d.ClearDegraded {
+		delete(m.degraded, id)
+	}
+
+	m.events = append(m.events, d.Events...)
+
+	return nil
 }
 
 // SaveRollout stores a copy.
@@ -375,6 +444,7 @@ func (m *MemoryStore) ReplaceDecisions(_ context.Context, snap *Snapshot) error 
 	}
 
 	maps.Copy(m.desired, snap.Desired)
+	m.events = append(m.events, snap.Events...)
 
 	return nil
 }

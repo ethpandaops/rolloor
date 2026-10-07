@@ -481,6 +481,8 @@ func (c *Controller) passBatch(ctx context.Context, now time.Time, r *Rollout, w
 	b.Passed = true
 	b.Soak = cloneSoak(&r.Soak)
 
+	var cleared []string
+
 	for _, id := range b.Targets {
 		rt := r.target(id)
 		if rt.Phase == PhaseReady {
@@ -489,21 +491,21 @@ func (c *Controller) passBatch(ctx context.Context, now time.Time, r *Rollout, w
 
 		if _, was := c.degraded[id]; was && rt.Phase == PhasePassed {
 			delete(c.degraded, id)
-			_ = c.persist(ctx, c.store.ClearDegraded(ctx, id))
+			cleared = append(cleared, id)
 		}
 	}
 
-	c.event(ctx, now, &Event{Actor: ControllerActor, Action: "batch.passed", Group: r.Group, Rollout: r.ID,
-		Reason: fmt.Sprintf("batch %d: %s", b.Number, why)})
+	events := []*Event{{Actor: ControllerActor, Action: "batch.passed", Group: r.Group, Rollout: r.ID,
+		Reason: fmt.Sprintf("batch %d: %s", b.Number, why)}}
+	r.State, r.Reason, r.UpdatedAt = Running, fmt.Sprintf("Batch %d passed.", b.Number), now
 
 	if r.PausePending {
 		r.PausePending = false
-		c.setState(ctx, now, r, Paused, pauseReason(r))
-
-		return
+		r.State, r.Reason = Paused, pauseReason(r)
+		events = append(events, &Event{Actor: ControllerActor, Action: "rollout.paused", Group: r.Group, Rollout: r.ID, Reason: r.Reason})
 	}
 
-	c.setState(ctx, now, r, Running, fmt.Sprintf("Batch %d passed.", b.Number))
+	c.recordDecision(ctx, now, &Decision{Rollouts: []*Rollout{r}, ClearDegraded: cleared}, events...)
 }
 
 func cloneSoak(s *SoakProgress) *SoakProgress {
@@ -520,6 +522,7 @@ func (c *Controller) halt(ctx context.Context, now time.Time, r *Rollout, culpri
 	b.Soak = cloneSoak(&r.Soak)
 
 	held := 0
+	degraded := map[string]string{}
 
 	for _, id := range b.Targets {
 		rt := r.target(id)
@@ -537,7 +540,7 @@ func (c *Controller) halt(ctx context.Context, now time.Time, r *Rollout, culpri
 		c.leave(now, r, rt, PhaseFailed, reason)
 
 		c.degraded[id] = reason
-		_ = c.persist(ctx, c.store.SaveDegraded(ctx, id, reason))
+		degraded[id] = reason
 	}
 
 	msg := fmt.Sprintf("Halted at batch %d: %s. %d targets quarantined on %s for debugging.", b.Number, why, held, r.DigestShort())
@@ -545,7 +548,9 @@ func (c *Controller) halt(ctx context.Context, now time.Time, r *Rollout, culpri
 		msg = fmt.Sprintf("Halted at batch %d: %s %s. %d targets quarantined on %s for debugging.", b.Number, culprit, why, held, r.DigestShort())
 	}
 
-	c.setState(ctx, now, r, Halted, msg)
+	r.State, r.Reason, r.UpdatedAt = Halted, msg, now
+	c.recordDecision(ctx, now, &Decision{Rollouts: []*Rollout{r}, Degraded: degraded},
+		&Event{Actor: ControllerActor, Action: eventRolloutHalted, Group: r.Group, Rollout: r.ID, Reason: msg})
 }
 
 // storeWait is why an update waits after the store refused a decision.

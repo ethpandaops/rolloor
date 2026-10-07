@@ -67,12 +67,9 @@ func (c *Controller) Sync(ctx context.Context, req SyncRequest) ([]string, error
 			return started, err
 		}
 
+		var clearAborted []string
 		if _, aborted := c.aborted[group]; aborted {
-			delete(c.aborted, group)
-
-			if err := c.persist(ctx, c.store.ClearAborted(ctx, group)); err != nil {
-				return started, err
-			}
+			clearAborted = []string{group}
 		}
 
 		r := c.activeRollout(group)
@@ -81,6 +78,14 @@ func (c *Controller) Sync(ctx context.Context, req SyncRequest) ([]string, error
 		if created {
 			eligible, desired, from := c.outOfSync(group, set)
 			if len(eligible) == 0 {
+				if len(clearAborted) > 0 {
+					if err := c.persist(ctx, c.store.ClearAborted(ctx, group)); err != nil {
+						return started, err
+					}
+
+					delete(c.aborted, group)
+				}
+
 				continue
 			}
 
@@ -92,27 +97,31 @@ func (c *Controller) Sync(ctx context.Context, req SyncRequest) ([]string, error
 			r = c.newRollout(now, group, strategy, eligible, desired, from, set)
 		}
 
-		// Nothing reaches controller memory before the store has it.
-		err := c.commit(ctx, r, func() {
+		events := []*Event{}
+		if created {
+			events = append(events, &Event{Actor: req.Actor, Action: eventRolloutCreated, Group: group, Rollout: r.ID,
+				Reason: fmt.Sprintf("%d targets to %s (%s)", len(r.Targets), r.DigestShort(), strategyLabel(r.Strategy))})
+		}
+
+		events = append(events, &Event{Actor: req.Actor, Action: "sync", Group: group, Rollout: r.ID, Selector: req.Selector.String(), Reason: syncReason(req)})
+
+		err := c.commitDecision(ctx, r, &Decision{ClearAborted: clearAborted}, func() {
 			r.Human = true
 			r.Force = r.Force || req.Force
 
 			if req.Strategy != "" {
 				r.Strategy = req.Strategy
 			}
-		})
+		}, events...)
 		if err != nil {
 			return started, err
 		}
 
+		delete(c.aborted, group)
+
 		if created {
 			c.rollouts[r.ID] = r
-			c.event(ctx, now, &Event{Actor: req.Actor, Action: eventRolloutCreated, Group: group, Rollout: r.ID,
-				Reason: fmt.Sprintf("%d targets to %s (%s)", len(r.Targets), r.DigestShort(), strategyLabel(r.Strategy))})
 		}
-
-		c.event(ctx, now, &Event{Actor: req.Actor, Action: "sync", Group: group, Rollout: r.ID, Selector: req.Selector.String(),
-			Reason: syncReason(req)})
 
 		started = append(started, r.ID)
 	}
@@ -179,13 +188,17 @@ func (c *Controller) Suspend(ctx context.Context, req SuspendRequest) (Suspensio
 		return Suspension{}, err
 	}
 
-	if err := c.persist(ctx, c.store.SaveSuspension(ctx, &s)); err != nil {
+	d := &Decision{Suspensions: []Suspension{s}}
+
+	d.Events = c.prepareEvents(now, []*Event{{Actor: req.Actor, Action: "suspend", Selector: req.Selector.String(),
+		Reason: fmt.Sprintf("%s (until %s)", req.Reason, s.ExpiresAt.UTC().Format(time.RFC3339))}})
+	if err := c.persist(ctx, c.store.SaveDecision(ctx, d)); err != nil {
 		return Suspension{}, err
 	}
 
 	c.suspensions[s.ID] = s
-	c.event(ctx, now, &Event{Actor: req.Actor, Action: "suspend", Selector: req.Selector.String(),
-		Reason: fmt.Sprintf("%s (until %s)", req.Reason, s.ExpiresAt.UTC().Format(time.RFC3339))})
+	c.nextEventID += int64(len(d.Events))
+	c.publishEvents(d.Events)
 
 	return s, nil
 }
@@ -202,27 +215,31 @@ func (c *Controller) Resume(ctx context.Context, actor string, sel targets.Selec
 		return 0, err
 	}
 
-	n := 0
+	var ids []string
 
 	for id, s := range c.suspensions {
-		if s.Selector.String() != key {
-			continue
+		if s.Selector.String() == key {
+			ids = append(ids, id)
 		}
-
-		if err := c.persist(ctx, c.store.DeleteSuspension(ctx, id)); err != nil {
-			return n, err
-		}
-
-		delete(c.suspensions, id)
-
-		n++
 	}
 
+	n := len(ids)
 	if n == 0 {
 		return 0, fmt.Errorf("no suspension for %s: %w", key, ErrNotFound)
 	}
 
-	c.event(ctx, now, &Event{Actor: actor, Action: "resume", Selector: key, Reason: fmt.Sprintf("%d suspensions lifted", n)})
+	d := &Decision{DeleteSuspensions: ids, Events: c.prepareEvents(now,
+		[]*Event{{Actor: actor, Action: "resume", Selector: key, Reason: fmt.Sprintf("%d suspensions lifted", n)}})}
+	if err := c.persist(ctx, c.store.SaveDecision(ctx, d)); err != nil {
+		return 0, err
+	}
+
+	for _, id := range ids {
+		delete(c.suspensions, id)
+	}
+
+	c.nextEventID += int64(len(d.Events))
+	c.publishEvents(d.Events)
 	c.Nudge()
 
 	return n, nil
@@ -269,12 +286,10 @@ func (c *Controller) Pause(ctx context.Context, req PauseRequest) error {
 			r.PausePending = false
 			r.State, r.Reason, r.UpdatedAt = Paused, pauseReason(r), now
 		}
-	})
+	}, &Event{Actor: req.Actor, Action: "pause", Group: r.Group, Rollout: r.ID, Reason: "Paused until " + now.Add(req.Expires).UTC().Format(time.RFC3339) + "; resumes automatically."})
 	if err != nil {
 		return err
 	}
-
-	c.event(ctx, now, &Event{Actor: req.Actor, Action: "pause", Group: r.Group, Rollout: r.ID, Reason: pauseReason(r)})
 
 	return nil
 }
@@ -307,12 +322,11 @@ func (c *Controller) Promote(ctx context.Context, actor, rolloutID string) error
 		if r.State == Paused {
 			r.State, r.Reason, r.UpdatedAt = Running, "Promoted by "+actor, now
 		}
-	})
+	}, &Event{Actor: actor, Action: "promote", Group: r.Group, Rollout: r.ID})
 	if err != nil {
 		return err
 	}
 
-	c.event(ctx, now, &Event{Actor: actor, Action: "promote", Group: r.Group, Rollout: r.ID})
 	c.Nudge()
 
 	return nil
@@ -339,33 +353,27 @@ func (c *Controller) Abort(ctx context.Context, actor, rolloutID string) error {
 		return err
 	}
 
-	// The marker goes first; if the rollout itself cannot be saved the marker
-	// is taken back, so the two never disagree on disk. A restart with the
-	// marker but an active rollout resolves in the marker's favour.
 	key := c.groupDesiredKey(r.Group, c.targets())
-	if err := c.persist(ctx, c.store.SaveAborted(ctx, r.Group, key)); err != nil {
-		return err
-	}
-
 	reason := "Aborted by " + actor
+	d := &Decision{Aborted: map[string]string{r.Group: key}, ClearDegraded: c.rolloutQuarantines(r)}
 
-	err := c.commit(ctx, r, func() {
+	err := c.commitDecision(ctx, r, d, func() {
 		if b := r.CurrentBatch(); b != nil {
 			b.EndedAt = now
 			b.Soak = cloneSoak(&r.Soak)
 		}
 
 		c.end(now, r, Aborted, reason)
-	})
+	}, &Event{Actor: ControllerActor, Action: "rollout.aborted", Group: r.Group, Rollout: r.ID, Reason: reason})
 	if err != nil {
-		_ = c.persist(ctx, c.store.ClearAborted(ctx, r.Group))
-
 		return err
 	}
 
-	c.clearRolloutQuarantine(ctx, r)
+	for _, id := range d.ClearDegraded {
+		delete(c.degraded, id)
+	}
+
 	c.aborted[r.Group] = key
-	c.event(ctx, now, &Event{Actor: ControllerActor, Action: "rollout.aborted", Group: r.Group, Rollout: r.ID, Reason: reason})
 
 	return nil
 }
@@ -419,12 +427,11 @@ func (c *Controller) Retry(ctx context.Context, actor, rolloutID, reason string)
 		r.Human = true
 		r.Soak = SoakProgress{}
 		r.State, r.Reason, r.UpdatedAt = Running, "Retried by "+actor, now
-	})
+	}, &Event{Actor: actor, Action: "retry", Group: r.Group, Rollout: r.ID, Reason: reason})
 	if err != nil {
 		return err
 	}
 
-	c.event(ctx, now, &Event{Actor: actor, Action: "retry", Group: r.Group, Rollout: r.ID, Reason: reason})
 	c.Nudge()
 
 	return nil
@@ -433,6 +440,11 @@ func (c *Controller) Retry(ctx context.Context, actor, rolloutID, reason string)
 // Events returns history from the store.
 func (c *Controller) Events(ctx context.Context, q *EventQuery) ([]Event, error) {
 	return c.store.Events(ctx, q)
+}
+
+// HistoryID identifies the durable event sequence independently of its cursor.
+func (c *Controller) HistoryID() string {
+	return c.historyID
 }
 
 // EventsAbout returns the history that concerns some targets: events naming

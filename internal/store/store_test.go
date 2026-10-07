@@ -15,11 +15,22 @@ import (
 )
 
 const (
-	img   = "img"
-	worse = "worse"
-	r1    = "r1"
-	t1    = "t1"
-	sha   = "sha256:1"
+	img              = "img"
+	worse            = "worse"
+	r1               = "r1"
+	t1               = "t1"
+	sha              = "sha256:1"
+	s1               = "s1"
+	s2               = "s2"
+	newValue         = "new"
+	eventHalted      = "rollout.halted"
+	eventSync        = "sync"
+	opInsert         = "INSERT"
+	opDelete         = "DELETE"
+	tableSuspensions = "suspensions"
+	tableDegraded    = "degraded"
+	tableDesired     = "desired"
+	tableAborted     = "aborted"
 )
 
 func open(t *testing.T) (*SQLite, string) {
@@ -57,10 +68,10 @@ func TestRoundTrip(t *testing.T) {
 	require.NoError(t, s.SaveRollout(ctx, r), "upsert")
 	require.NoError(t, s.SaveRollout(ctx, &reconcile.Rollout{ID: "r0", Group: "b", CreatedAt: now}))
 
-	sp := &reconcile.Suspension{ID: "s1", Selector: targets.Selector{"node": "n1"}, Reason: "x", Actor: "sam", CreatedAt: now, ExpiresAt: now.Add(time.Hour)}
+	sp := &reconcile.Suspension{ID: s1, Selector: targets.Selector{"node": "n1"}, Reason: "x", Actor: "sam", CreatedAt: now, ExpiresAt: now.Add(time.Hour)}
 	require.NoError(t, s.SaveSuspension(ctx, sp))
-	require.NoError(t, s.SaveSuspension(ctx, &reconcile.Suspension{ID: "s2"}))
-	require.NoError(t, s.DeleteSuspension(ctx, "s2"))
+	require.NoError(t, s.SaveSuspension(ctx, &reconcile.Suspension{ID: s2}))
+	require.NoError(t, s.DeleteSuspension(ctx, s2))
 
 	readiness := reconcile.Readiness{Ready: true, Since: now, ProbedAt: now, ObservedAt: now.Add(-time.Second), LastSuccessAt: now.Add(-time.Second), Failures: 0, Successes: 2, Reason: "running"}
 	require.NoError(t, s.SaveLive(ctx, t1, &reconcile.Live{Digest: sha, SeenAt: now, Readiness: readiness}))
@@ -84,7 +95,7 @@ func TestRoundTrip(t *testing.T) {
 	require.NoError(t, s.ClearDegraded(ctx, "t3"))
 
 	for i := int64(1); i <= 3; i++ {
-		e := &reconcile.Event{ID: i, At: now.Add(time.Duration(i) * time.Second), Actor: "sam", Action: "sync", Group: "a", Rollout: r1, Target: t1, Reason: "why"}
+		e := &reconcile.Event{ID: i, At: now.Add(time.Duration(i) * time.Second), Actor: "sam", Action: eventSync, Group: "a", Rollout: r1, Target: t1, Reason: "why"}
 		if i == 2 {
 			e.Group, e.Rollout, e.Target = "b", "r0", ""
 		}
@@ -183,6 +194,7 @@ func TestClosedStoreFailsEveryCall(t *testing.T) {
 	require.NoError(t, s.Close())
 
 	require.Error(t, s.SaveRollout(ctx, &reconcile.Rollout{ID: "x"}))
+	require.Error(t, s.SaveDecision(ctx, &reconcile.Decision{}))
 	require.Error(t, s.SaveSuspension(ctx, &reconcile.Suspension{ID: "x"}))
 	require.Error(t, s.DeleteSuspension(ctx, "x"))
 	require.Error(t, s.SaveLive(ctx, "x", &reconcile.Live{}))
@@ -246,14 +258,14 @@ func TestReplaceDecisionsDropsWhatMemoryNoLongerHolds(t *testing.T) {
 
 	require.NoError(t, s.SaveDegraded(ctx, t1, "bad"))
 	require.NoError(t, s.SaveAborted(ctx, "a", "k"))
-	require.NoError(t, s.SaveSuspension(ctx, &reconcile.Suspension{ID: "s1"}))
+	require.NoError(t, s.SaveSuspension(ctx, &reconcile.Suspension{ID: s1}))
 
 	now := time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
 	require.NoError(t, s.ReplaceDecisions(ctx, &reconcile.Snapshot{
 		Rollouts:    []*reconcile.Rollout{{ID: r1, Group: "a", State: reconcile.Running, CreatedAt: now}},
 		Degraded:    map[string]string{"t2": worse},
 		Aborted:     map[string]string{},
-		Suspensions: []reconcile.Suspension{{ID: "s2"}},
+		Suspensions: []reconcile.Suspension{{ID: s2}},
 		Desired:     map[string]reconcile.Desired{img: {Digest: sha}},
 	}))
 
@@ -262,7 +274,7 @@ func TestReplaceDecisionsDropsWhatMemoryNoLongerHolds(t *testing.T) {
 	require.Equal(t, map[string]string{"t2": worse}, snap.Degraded)
 	require.Empty(t, snap.Aborted)
 	require.Len(t, snap.Suspensions, 1)
-	require.Equal(t, "s2", snap.Suspensions[0].ID)
+	require.Equal(t, s2, snap.Suspensions[0].ID)
 	require.Len(t, snap.Rollouts, 1)
 	require.Equal(t, sha, snap.Desired[img].Digest)
 
@@ -275,7 +287,7 @@ func TestReplaceDecisionsDropsWhatMemoryNoLongerHolds(t *testing.T) {
 		Desired:     map[string]reconcile.Desired{img: {Digest: sha}},
 	}
 
-	for _, table := range []string{"rollouts", "degraded", "aborted", "suspensions", "desired"} {
+	for _, table := range []string{"rollouts", tableDegraded, tableAborted, tableSuspensions, tableDesired} {
 		_, err = s.db.ExecContext(ctx, `CREATE TRIGGER refuse_`+table+` BEFORE INSERT ON `+table+` BEGIN SELECT RAISE(ABORT, 'refused'); END`)
 		require.NoError(t, err)
 		require.ErrorContains(t, s.ReplaceDecisions(ctx, full), "refused", table)

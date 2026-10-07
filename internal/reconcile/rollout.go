@@ -41,9 +41,27 @@ func (c *Controller) supersedeChangedRollouts(ctx context.Context, now time.Time
 // finish moves a rollout to a terminal state and records it.
 func (c *Controller) finish(ctx context.Context, now time.Time, r *Rollout, state RolloutState, reason string) {
 	c.end(now, r, state, reason)
-	_ = c.saveRollout(ctx, r)
-	c.clearRolloutQuarantine(ctx, r)
-	c.event(ctx, now, &Event{Actor: ControllerActor, Action: "rollout." + lower(state), Group: r.Group, Rollout: r.ID, Reason: reason})
+
+	ids := c.rolloutQuarantines(r)
+	for _, id := range ids {
+		delete(c.degraded, id)
+	}
+
+	c.recordDecision(ctx, now, &Decision{Rollouts: []*Rollout{r}, ClearDegraded: ids},
+		&Event{Actor: ControllerActor, Action: "rollout." + lower(state), Group: r.Group, Rollout: r.ID, Reason: reason})
+}
+
+func (c *Controller) rolloutQuarantines(r *Rollout) []string {
+	var ids []string
+
+	for i := range r.Targets {
+		rt := &r.Targets[i]
+		if q := c.quarantineFor(rt.ID); q != nil && q.Rollout == r.ID {
+			ids = append(ids, rt.ID)
+		}
+	}
+
+	return ids
 }
 
 func (c *Controller) clearRolloutQuarantine(ctx context.Context, r *Rollout) {
@@ -124,8 +142,7 @@ func (c *Controller) openRollouts(ctx context.Context, now time.Time) {
 		r := c.newRollout(now, group, strategy, eligible, desired, from, set)
 
 		c.rollouts[r.ID] = r
-		_ = c.saveRollout(ctx, r)
-		c.event(ctx, now, &Event{Actor: ControllerActor, Action: eventRolloutCreated, Group: group, Rollout: r.ID,
+		c.recordDecision(ctx, now, &Decision{Rollouts: []*Rollout{r}}, &Event{Actor: ControllerActor, Action: eventRolloutCreated, Group: group, Rollout: r.ID,
 			Reason: fmt.Sprintf("%d targets to %s (%s)", len(eligible), r.DigestShort(), strategyLabel(strategy))})
 	}
 }
@@ -421,8 +438,9 @@ func (c *Controller) startBatch(ctx context.Context, now time.Time, r *Rollout, 
 	}
 
 	r.Batches = append(r.Batches, b)
-	c.setState(ctx, now, r, Running, fmt.Sprintf("Wave %d, %sbatch %d of about %d: updating %d targets on %d nodes.", wave, kind, b.Number, c.estimateBatches(r, &st), len(picked), len(nodes)))
-	c.event(ctx, now, &Event{Actor: ControllerActor, Action: "batch.started", Group: r.Group, Rollout: r.ID,
+	r.State, r.UpdatedAt = Running, now
+	r.Reason = fmt.Sprintf("Wave %d, %sbatch %d of about %d: updating %d targets on %d nodes.", wave, kind, b.Number, c.estimateBatches(r, &st), len(picked), len(nodes))
+	c.recordDecision(ctx, now, &Decision{Rollouts: []*Rollout{r}}, &Event{Actor: ControllerActor, Action: "batch.started", Group: r.Group, Rollout: r.ID,
 		Reason: fmt.Sprintf("%sbatch %d: %d targets on %d nodes in wave %d", kind, b.Number, len(picked), len(nodes), wave)})
 }
 
@@ -533,13 +551,13 @@ func (c *Controller) setState(ctx context.Context, now time.Time, r *Rollout, st
 	r.Reason = reason
 	r.UpdatedAt = now
 
-	_ = c.saveRollout(ctx, r)
-
 	// History records moves between states; a soak's running progress is
 	// only shown on the rollout itself.
 	progress := state == Soaking && prev == Soaking
 	if changed && state != Running && !progress {
-		c.event(ctx, now, &Event{Actor: ControllerActor, Action: "rollout." + lower(state), Group: r.Group, Rollout: r.ID, Reason: reason})
+		c.recordDecision(ctx, now, &Decision{Rollouts: []*Rollout{r}}, &Event{Actor: ControllerActor, Action: "rollout." + lower(state), Group: r.Group, Rollout: r.ID, Reason: reason})
+	} else {
+		_ = c.saveRollout(ctx, r)
 	}
 }
 

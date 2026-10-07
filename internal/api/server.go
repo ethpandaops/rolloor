@@ -329,6 +329,8 @@ func (s *Server) history(w http.ResponseWriter, r *http.Request) {
 		events = []reconcile.Event{}
 	}
 
+	w.Header().Set("Rolloor-History", s.c.HistoryID())
+
 	writeJSON(w, http.StatusOK, events)
 }
 

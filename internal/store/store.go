@@ -3,6 +3,7 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -17,6 +18,10 @@ import (
 )
 
 const schema = `
+CREATE TABLE IF NOT EXISTS history_metadata (
+	id INTEGER PRIMARY KEY CHECK (id = 1),
+	identity TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS rollouts (
 	id TEXT PRIMARY KEY,
 	group_name TEXT NOT NULL,
@@ -70,11 +75,12 @@ var _ reconcile.Store = (*SQLite)(nil)
 
 // Open creates the directory and file if needed and applies the schema.
 func Open(ctx context.Context, dir string) (*SQLite, error) {
+	dir = filepath.Clean(dir)
+	path := filepath.Join(dir, "rolloor.db")
+
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return nil, fmt.Errorf("store: create %s: %w", dir, err)
 	}
-
-	path := filepath.Join(dir, "rolloor.db")
 
 	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(FULL)")
 	if err != nil {
@@ -87,6 +93,12 @@ func Open(ctx context.Context, dir string) (*SQLite, error) {
 		db.Close()
 
 		return nil, fmt.Errorf("store: apply schema: %w", err)
+	}
+
+	if _, err := db.ExecContext(ctx, `INSERT OR IGNORE INTO history_metadata (id, identity) VALUES (1, ?)`, rand.Text()); err != nil {
+		db.Close()
+
+		return nil, fmt.Errorf("store: initialize history identity: %w", err)
 	}
 
 	return &SQLite{db: db}, nil
@@ -105,6 +117,9 @@ func (s *SQLite) Load(ctx context.Context) (*reconcile.Snapshot, error) {
 		Desired:  map[string]reconcile.Desired{},
 		Aborted:  map[string]string{},
 		HookRuns: map[string]map[string]reconcile.HookRun{},
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT identity FROM history_metadata WHERE id = 1`).Scan(&snap.HistoryID); err != nil {
+		return nil, fmt.Errorf("store: load history identity: %w", err)
 	}
 
 	if err := s.loadKeyed(ctx, `SELECT target_id, data FROM hook_runs`, func(key string, raw []byte) error {
@@ -246,6 +261,98 @@ func (s *SQLite) loadKeyed(ctx context.Context, query string, each func(string, 
 	}
 
 	return rows.Err()
+}
+
+// SaveDecision commits changed records and their events together.
+func (s *SQLite) SaveDecision(ctx context.Context, d *reconcile.Decision) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("store: begin decision: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // a no-op after commit
+
+	w := &SQLite{tx: tx}
+	if err := w.writeDecision(ctx, d); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: commit decision: %w", err)
+	}
+
+	return nil
+}
+
+func (s *SQLite) writeDecision(ctx context.Context, d *reconcile.Decision) error {
+	for _, r := range d.Rollouts {
+		if err := s.SaveRollout(ctx, r); err != nil {
+			return err
+		}
+	}
+
+	for i := range d.Suspensions {
+		if err := s.SaveSuspension(ctx, &d.Suspensions[i]); err != nil {
+			return err
+		}
+	}
+
+	for _, id := range d.DeleteSuspensions {
+		if err := s.DeleteSuspension(ctx, id); err != nil {
+			return err
+		}
+	}
+
+	for _, id := range d.DeleteTargets {
+		if err := s.DeleteLive(ctx, id); err != nil {
+			return err
+		}
+
+		if err := s.ClearDegraded(ctx, id); err != nil {
+			return err
+		}
+
+		if err := s.DeleteHookRuns(ctx, id); err != nil {
+			return err
+		}
+	}
+
+	for image, desired := range d.Desired {
+		if err := s.SaveDesired(ctx, image, desired); err != nil {
+			return err
+		}
+	}
+
+	for id, reason := range d.Degraded {
+		if err := s.SaveDegraded(ctx, id, reason); err != nil {
+			return err
+		}
+	}
+
+	for group, key := range d.Aborted {
+		if err := s.SaveAborted(ctx, group, key); err != nil {
+			return err
+		}
+	}
+
+	for _, group := range d.ClearAborted {
+		if err := s.ClearAborted(ctx, group); err != nil {
+			return err
+		}
+	}
+
+	for _, id := range d.ClearDegraded {
+		if err := s.ClearDegraded(ctx, id); err != nil {
+			return err
+		}
+	}
+
+	for i := range d.Events {
+		if err := s.AppendEvent(ctx, &d.Events[i]); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // SaveRollout upserts the whole rollout as JSON with a few indexed columns.
@@ -444,6 +551,10 @@ func (s *SQLite) ReplaceDecisions(ctx context.Context, snap *reconcile.Snapshot)
 				return err
 			}
 		}
+	}
+
+	if err := w.writeDecision(ctx, &reconcile.Decision{Events: snap.Events}); err != nil {
+		return err
 	}
 
 	if err := tx.Commit(); err != nil {

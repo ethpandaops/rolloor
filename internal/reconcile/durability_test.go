@@ -54,6 +54,14 @@ func (s *saveOrder) SaveRollout(ctx context.Context, r *Rollout) error {
 	return s.MemoryStore.SaveRollout(ctx, r)
 }
 
+func (s *saveOrder) SaveDecision(ctx context.Context, d *Decision) error {
+	for _, r := range d.Rollouts {
+		s.saves = append(s.saves, *cloneRollout(r))
+	}
+
+	return s.MemoryStore.SaveDecision(ctx, d)
+}
+
 func TestASkipReachesTheStoreBeforeTheBudgetItFreesIsSpent(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -161,6 +169,10 @@ func TestARecoveredAbortIsStoredOnceTheStoreTakesIt(t *testing.T) {
 	unsaved := storedRollout(h, r.ID)
 	require.NoError(t, h.c.Abort(h.ctx, actor, r.ID))
 	loseRolloutSave(h, unsaved)
+	before, err := h.store.Load(h.ctx)
+	require.NoError(t, err)
+
+	cursor := before.NextEventID - 1
 
 	disk := &refusingStore{MemoryStore: h.store, refuse: true}
 	c, err := New(h.ctx, &Options{
@@ -174,10 +186,18 @@ func TestARecoveredAbortIsStoredOnceTheStoreTakesIt(t *testing.T) {
 	require.Equal(t, Aborted, got.State)
 	require.True(t, c.FleetStatus().StoreWritesOwed)
 	require.Equal(t, Running, durableState(h.store, r.ID))
+	events, err := h.store.Events(h.ctx, &EventQuery{After: cursor})
+	require.NoError(t, err)
+	require.Empty(t, events)
 
 	disk.refuse = false
 
 	require.NoError(t, c.Tick(h.ctx))
 	require.False(t, c.FleetStatus().StoreWritesOwed)
 	require.Equal(t, Aborted, durableState(h.store, r.ID))
+	events, err = h.store.Events(h.ctx, &EventQuery{After: cursor})
+	require.NoError(t, err)
+	require.Len(t, events, 1)
+	require.Equal(t, "rollout.aborted", events[0].Action)
+	require.Equal(t, r.ID, events[0].Rollout)
 }

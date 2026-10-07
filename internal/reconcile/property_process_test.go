@@ -89,6 +89,34 @@ func (p *process) SaveRollout(ctx context.Context, r *Rollout) error {
 	return nil
 }
 
+func (p *process) SaveDecision(ctx context.Context, d *Decision) error {
+	if !p.lands() {
+		return nil
+	}
+
+	var problems []error
+
+	for _, r := range d.Rollouts {
+		p.MemoryStore.mu.Lock()
+		before := p.rollouts[r.ID]
+		p.MemoryStore.mu.Unlock()
+
+		if problem := p.sim.admissionProblem(r, before); problem != nil {
+			problems = append(problems, problem)
+		}
+	}
+
+	if err := p.MemoryStore.SaveDecision(ctx, d); err != nil {
+		return err
+	}
+
+	for _, problem := range problems {
+		p.sim.violation("%v", problem)
+	}
+
+	return nil
+}
+
 func (p *process) SaveSuspension(ctx context.Context, s *Suspension) error {
 	if !p.lands() {
 		return nil

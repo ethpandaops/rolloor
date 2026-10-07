@@ -98,6 +98,7 @@ type Controller struct {
 	targetsError  string
 	nextEventID   int64
 	pendingEvents []Event
+	historyID     string
 	lastInspect   time.Time
 	lastProbe     time.Time
 	probes        probePacer
@@ -190,6 +191,9 @@ func New(ctx context.Context, opts *Options) (*Controller, error) {
 }
 
 func (c *Controller) restore(snap *Snapshot) {
+	c.nextEventID = max(snap.NextEventID, 1)
+	c.historyID = snap.HistoryID
+
 	for _, r := range snap.Rollouts {
 		c.rollouts[r.ID] = r
 	}
@@ -222,12 +226,15 @@ func (c *Controller) restore(snap *Snapshot) {
 	for _, r := range c.rollouts {
 		if _, aborted := c.aborted[r.Group]; aborted && r.State.Active() {
 			c.end(c.clock.Now(), r, Aborted, "Aborted before the last restart.")
+			c.pendingEvents = append(c.pendingEvents, Event{ID: c.nextEventID, At: c.clock.Now(),
+				Actor: ControllerActor, Action: "rollout.aborted", Group: r.Group, Rollout: r.ID, Reason: r.Reason})
+			c.nextEventID++
 			c.dirty = true
 		}
 	}
 
-	// An update whose hook was running when the process stopped never
-	// reported back; the hook is idempotent, so it runs again.
+	// A dispatched update might have landed without a response. Planning checks
+	// its digest and remaining dispatch allowance before sending another attempt.
 	for _, r := range c.rollouts {
 		for i := range r.Targets {
 			rt := &r.Targets[i]
@@ -236,8 +243,6 @@ func (c *Controller) restore(snap *Snapshot) {
 			}
 		}
 	}
-
-	c.nextEventID = max(snap.NextEventID, 1)
 }
 
 func randomID() string {
@@ -407,8 +412,7 @@ func (c *Controller) resolveAll(ctx context.Context, now time.Time) error {
 		}
 
 		if !had || prev.Digest != res.Digest {
-			_ = c.persist(ctx, c.store.SaveDesired(ctx, img, d))
-			c.event(ctx, now, &Event{Actor: ControllerActor, Action: "digest.changed", Target: img,
+			c.recordDecision(ctx, now, &Decision{Desired: map[string]Desired{img: d}}, &Event{Actor: ControllerActor, Action: "digest.changed", Target: img,
 				Reason: fmt.Sprintf("%s → %s %s", shortDigest(prev.Digest), shortDigest(res.Digest), res.Revision)})
 		}
 	}
@@ -461,16 +465,15 @@ func (c *Controller) expireSuspensions(ctx context.Context, now time.Time) {
 
 		if !now.Before(s.ExpiresAt) {
 			delete(c.suspensions, id)
-			_ = c.persist(ctx, c.store.DeleteSuspension(ctx, id))
-			c.event(ctx, now, &Event{Actor: ControllerActor, Action: "suspend.expired", Selector: s.Selector.String(), Reason: s.Reason})
+			c.recordDecision(ctx, now, &Decision{DeleteSuspensions: []string{id}},
+				&Event{Actor: ControllerActor, Action: "suspend.expired", Selector: s.Selector.String(), Reason: s.Reason})
 		}
 	}
 }
 
 // event queues history until its write succeeds; listeners see durable events.
 func (c *Controller) event(ctx context.Context, now time.Time, e *Event) {
-	e.ID = c.nextEventID
-	e.At = now
+	e.ID, e.At = c.nextEventID, now
 	c.nextEventID++
 
 	if !c.dirty && len(c.pendingEvents) == 0 {
@@ -484,6 +487,39 @@ func (c *Controller) event(ctx context.Context, now time.Time, e *Event) {
 	}
 
 	c.pendingEvents = append(c.pendingEvents, *e)
+}
+
+func (c *Controller) prepareEvents(now time.Time, events []*Event) []Event {
+	out := make([]Event, len(events))
+	for i, e := range events {
+		e.ID, e.At = c.nextEventID+int64(i), now
+		out[i] = *e
+	}
+
+	return out
+}
+
+func (c *Controller) recordDecision(ctx context.Context, now time.Time, d *Decision, events ...*Event) {
+	d.Events = c.prepareEvents(now, events)
+	c.nextEventID += int64(len(d.Events))
+
+	if !c.dirty && len(c.pendingEvents) == 0 {
+		if err := c.persist(ctx, c.store.SaveDecision(ctx, d)); err == nil {
+			c.publishEvents(d.Events)
+
+			return
+		}
+	}
+
+	c.pendingEvents = append(c.pendingEvents, d.Events...)
+}
+
+func (c *Controller) publishEvents(events []Event) {
+	if c.notifier != nil {
+		for i := range events {
+			c.notifier.Publish(&events[i])
+		}
+	}
 }
 
 // persist logs a store failure, marks the state dirty and returns it. A
@@ -510,7 +546,8 @@ func (c *Controller) flush(ctx context.Context) bool {
 
 	_ = c.persist(ctx, c.store.ReplaceDecisions(ctx, c.decisions()))
 	if !c.dirty {
-		_ = c.flushEvents(ctx)
+		c.publishEvents(c.pendingEvents)
+		c.pendingEvents = nil
 	}
 
 	if c.dirty {
@@ -534,9 +571,8 @@ func (c *Controller) writeOwed(ctx context.Context) error {
 		return fmt.Errorf("earlier decisions are still not stored, so nothing was changed: %w", err)
 	}
 
-	if err := c.flushEvents(ctx); err != nil {
-		return fmt.Errorf("earlier history is still not stored, so nothing was changed: %w", err)
-	}
+	c.publishEvents(c.pendingEvents)
+	c.pendingEvents = nil
 
 	return nil
 }
@@ -545,7 +581,7 @@ func (c *Controller) writeOwed(ctx context.Context) error {
 // quarantine or abort marker must not come back after a restart, so the
 // tables are replaced whole.
 func (c *Controller) decisions() *Snapshot {
-	snap := &Snapshot{Degraded: c.degraded, Aborted: c.aborted, Desired: c.desired, Live: c.live, HookRuns: c.hookRuns}
+	snap := &Snapshot{Degraded: c.degraded, Aborted: c.aborted, Desired: c.desired, Live: c.live, HookRuns: c.hookRuns, Events: c.pendingEvents}
 
 	for _, r := range c.rollouts {
 		snap.Rollouts = append(snap.Rollouts, r)
@@ -560,16 +596,24 @@ func (c *Controller) decisions() *Snapshot {
 
 // commit applies change to r and saves it. When the store refuses, the
 // rollout is put back so memory never runs ahead of disk.
-func (c *Controller) commit(ctx context.Context, r *Rollout, change func()) error {
+func (c *Controller) commit(ctx context.Context, r *Rollout, change func(), events ...*Event) error {
+	return c.commitDecision(ctx, r, &Decision{}, change, events...)
+}
+
+func (c *Controller) commitDecision(ctx context.Context, r *Rollout, d *Decision, change func(), events ...*Event) error {
 	before := cloneRollout(r)
 
 	change()
 
-	if err := c.saveRollout(ctx, r); err != nil {
+	d.Rollouts, d.Events = []*Rollout{r}, c.prepareEvents(c.clock.Now(), events)
+	if err := c.persist(ctx, c.store.SaveDecision(ctx, d)); err != nil {
 		*r = *before
 
 		return err
 	}
+
+	c.nextEventID += int64(len(d.Events))
+	c.publishEvents(d.Events)
 
 	return nil
 }
@@ -871,9 +915,7 @@ func (c *Controller) forgetLocked(ctx context.Context, id string) {
 		delete(c.probes.kicked, key)
 	}
 
-	_ = c.persist(ctx, c.store.DeleteLive(ctx, id))
-	_ = c.persist(ctx, c.store.ClearDegraded(ctx, id))
-	_ = c.persist(ctx, c.store.DeleteHookRuns(ctx, id))
+	_ = c.persist(ctx, c.store.SaveDecision(ctx, &Decision{DeleteTargets: []string{id}}))
 }
 
 // HookInput is what target hooks receive on stdin: the target plus the
@@ -1054,23 +1096,4 @@ func pct(part, whole float64) string {
 	}
 
 	return fmt.Sprintf("%.1f%%", 100*part/whole)
-}
-
-func (c *Controller) flushEvents(ctx context.Context) error {
-	for len(c.pendingEvents) > 0 {
-		e := &c.pendingEvents[0]
-		if err := c.persist(ctx, c.store.AppendEvent(ctx, e)); err != nil {
-			return err
-		}
-
-		if c.notifier != nil {
-			c.notifier.Publish(e)
-		}
-
-		c.pendingEvents = c.pendingEvents[1:]
-	}
-
-	c.pendingEvents = nil
-
-	return nil
 }
