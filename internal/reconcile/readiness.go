@@ -78,15 +78,11 @@ func (c *Controller) RunProber(ctx context.Context) error {
 	}
 }
 
-func (c *Controller) setReadinessLocked(ctx context.Context, id string, started time.Time, ok bool, reason string) bool {
-	if _, present := c.targets().Get(id); !present {
-		return false
-	}
-
-	l := c.live[id]
+func (c *Controller) setReadinessLocked(ctx context.Context, o *observation, ok bool, reason string) bool {
+	l := c.live[o.id]
 	r := &l.Readiness
 
-	if started.Before(r.ObservedAt) {
+	if o.started.Before(r.ObservedAt) {
 		return false
 	}
 
@@ -96,7 +92,7 @@ func (c *Controller) setReadinessLocked(ctx context.Context, id string, started 
 	if ok {
 		r.Failures = 0
 		r.Successes++
-		r.LastSuccessAt = started
+		r.LastSuccessAt = o.started
 
 		if r.Successes >= c.cfg.ReadinessProbe.SuccessThreshold {
 			r.Ready = true
@@ -114,9 +110,10 @@ func (c *Controller) setReadinessLocked(ctx context.Context, id string, started 
 		r.Since = now
 	}
 
-	r.ObservedAt, r.ProbedAt, r.Reason = started, now, reason
-	c.live[id] = l
-	_ = c.persist(ctx, c.store.SaveLive(ctx, id, &l))
+	r.ObservedAt, r.ProbedAt, r.Reason = o.started, now, reason
+	l.Definition = o.generation.definition
+	c.live[o.id] = l
+	_ = c.persist(ctx, c.store.SaveLive(ctx, o.id, &l))
 
 	return true
 }

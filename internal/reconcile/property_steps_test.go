@@ -383,8 +383,6 @@ func (s *sim) edit() string {
 		return "edit: nothing"
 	}
 
-	old := s.h.current()
-
 	set, err := targets.Parse([]byte(s.fleet.yaml()), &testRules)
 	if err != nil {
 		s.violation("the simulated targets file is invalid: %v", err)
@@ -392,18 +390,15 @@ func (s *sim) edit() string {
 		return what
 	}
 
-	s.h.swap(set)
+	if s.down {
+		s.h.swap(set)
+	} else {
+		s.h.c.ReplaceTargets(s.h.ctx, func() (old, current *targets.Set) {
+			old = s.h.current()
+			s.h.swap(set)
 
-	var gone []string
-
-	for i := range old.Targets {
-		if _, ok := set.Get(old.Targets[i].ID); !ok {
-			gone = append(gone, old.Targets[i].ID)
-		}
-	}
-
-	if len(gone) > 0 && !s.down {
-		s.h.c.Forget(s.h.ctx, gone)
+			return old, set
+		})
 	}
 
 	return "edit: " + what

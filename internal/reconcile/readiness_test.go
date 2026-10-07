@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/ethpandaops/rolloor/internal/targets"
 )
 
 func TestReadinessThresholdsSurviveRestart(t *testing.T) {
@@ -91,7 +93,7 @@ func TestLateAndRemovedProbeResultsAreForgotten(t *testing.T) {
 	h.prime()
 	before := h.view(tA1).Readiness
 	h.c.mu.Lock()
-	h.c.setReadinessLocked(h.ctx, tA1, before.ObservedAt.Add(-time.Second), false, boom)
+	h.c.setReadinessLocked(h.ctx, &observation{id: tA1, started: before.ObservedAt.Add(-time.Second)}, false, boom)
 	h.c.mu.Unlock()
 	require.Equal(t, before, h.view(tA1).Readiness)
 
@@ -474,4 +476,37 @@ func TestHookInputSaysWhenTheRunningDigestWasFirstSeen(t *testing.T) {
 
 	require.Equal(t, d2, h.view(tA1).Live)
 	require.True(t, in.DigestSince.After(first), "a new digest has a new since")
+}
+
+func TestReplacingTargetsForgetsWhatChangedOrLeft(t *testing.T) {
+	h := newHarness(t, testConfig, testTargets)
+	h.prime()
+	kept := h.view(tA2)
+	next := mustParse(t, h, dropLines(replaceLine(testTargets, b1Line, b1Moved), "id: a-1/cl,"))
+
+	h.c.ReplaceTargets(h.ctx, func() (old, current *targets.Set) {
+		old = h.current()
+		h.swap(next)
+
+		return old, next
+	})
+
+	require.Same(t, next, h.current())
+	v := h.view(tB1)
+	require.Empty(t, v.Live)
+	require.Zero(t, v.Readiness)
+	require.Empty(t, v.Hooks)
+	require.Equal(t, kept.Readiness, h.view(tA2).Readiness)
+	require.Equal(t, kept.Hooks, h.view(tA2).Hooks)
+	require.InDelta(t, 100, h.c.unavailableWeight(h.current()), 0.001)
+
+	snap, err := h.store.Load(h.ctx)
+	require.NoError(t, err)
+	require.NotContains(t, snap.Live, tA1)
+	require.NotContains(t, snap.Live, tB1)
+	require.Contains(t, snap.Live, tA2)
+
+	h.c.InspectAll(h.ctx)
+	h.c.ProbeAll(h.ctx)
+	require.Zero(t, h.c.unavailableWeight(h.current()), "observing the changed target again counts it available")
 }

@@ -81,6 +81,9 @@ type Live struct {
 	// inspect that returns after a newer one cannot overwrite it.
 	ObservedAt time.Time `json:"observedAt,omitzero"`
 	Readiness  Readiness `json:"readiness"`
+	// Definition stamps the target definition these observations describe;
+	// a restart forgets them when the target's definition no longer matches.
+	Definition string `json:"definition,omitempty"`
 }
 
 // Readiness is the thresholded result of a target's readiness probe.
@@ -130,12 +133,13 @@ type RolloutTarget struct {
 	Batch  int         `json:"batch"` // 0 = not yet batched
 	Phase  TargetPhase `json:"phase"`
 	Reason string      `json:"reason,omitempty"`
-	// UpdateDone is set once the update hook has returned success; Updated
-	// once inspect has seen the desired digest running. UpdateAttempts counts
-	// dispatched updates, each stored before its program runs.
+	// UpdateDone is set once the update hook has returned success; Updated once
+	// inspect has seen the desired digest. UpdateAttempts counts dispatches, each
+	// stored before its program runs; UpdatedAt is the first, DispatchedAt the last.
 	UpdateDone     bool      `json:"updateDone"`
 	Updated        bool      `json:"updated"`
 	UpdatedAt      time.Time `json:"updatedAt,omitzero"`
+	DispatchedAt   time.Time `json:"dispatchedAt,omitzero"`
 	DigestSeenAt   time.Time `json:"digestSeenAt,omitzero"`
 	UpdateAttempts int       `json:"updateAttempts"`
 	RetryAt        time.Time `json:"retryAt,omitzero"`
@@ -277,7 +281,10 @@ type Event struct {
 // ControllerActor is the actor recorded for the controller's own decisions.
 const ControllerActor = "controller"
 
-const eventRolloutCreated = "rollout.created"
+const (
+	eventRolloutCreated = "rollout.created"
+	eventRolloutHalted  = "rollout.halted"
+)
 
 // HookRun is the last result of one hook for one target, kept for display.
 type HookRun struct {

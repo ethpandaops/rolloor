@@ -22,6 +22,7 @@ const (
 	guaranteeEchoTarget = "node-5/tool"
 	updaterUnavailable  = "updater unavailable"
 	resumeAction        = "resume"
+	possiblyAccepted    = "possibly accepted update"
 )
 
 func TestGuaranteeDisruptionBudget(t *testing.T) {
@@ -637,6 +638,202 @@ func TestGuaranteeUpdaterExhaustionSkips(t *testing.T) {
 			for _, r := range h.rolloutsOf(clientBravo) {
 				require.NotContains(t, h.history(r.ID), "rollout.halted")
 			}
+		})
+	}
+
+	t.Run("a lost response that lands gates later batches", guaranteeLostResponseGatesLaterBatches)
+	t.Run("no digest skips a deadline after the last dispatch", guaranteeWatchEndsAfterLastDispatch)
+	t.Run("the first dispatch's deadline ends retries, not the watch", guaranteeFirstDeadlineEndsRetries)
+	t.Run("a restart past the retry limit keeps watching", guaranteeRestartKeepsWatching)
+	t.Run("a late build gets a full deadline to be ready", guaranteeLateBuildGetsFullDeadline)
+}
+
+// guaranteeLostResponseGatesLaterBatches: the updater accepted a weightless
+// canary's only attempt but its response was lost. The build lands later and
+// must be ready and soak before anything else moves.
+func guaranteeLostResponseGatesLaterBatches(t *testing.T) {
+	t.Helper()
+
+	h := newHarness(t, replaceLine(testConfig, "strategy: {batchSize: 2,", "strategy: {firstBatch: 1, batchSize: 2,"), testTargets)
+	h.prime()
+	h.world.set(func(w *world) { w.updateFail[tA1] = updaterUnavailable })
+	h.release(imgA, d2)
+	id := h.active("a").ID
+
+	r := h.rollout(id)
+	require.Equal(t, []string{tA1}, r.Batches[0].Targets)
+	require.Equal(t, PhaseUpdating, r.target(tA1).Phase, r.target(tA1).Reason)
+	require.Contains(t, r.target(tA1).Reason, possiblyAccepted)
+
+	h.clock.Advance(20 * time.Second)
+	h.world.set(func(w *world) {
+		delete(w.updateFail, tA1)
+		w.running[tA1] = d2
+		w.notReady[tA1] = true
+	})
+	h.ticks(3, 10*time.Second)
+
+	r = h.rollout(id)
+	require.Equal(t, Running, r.State, r.Reason)
+	require.Len(t, r.Batches, 1, "nothing moves past the canary before its build is ready")
+	require.True(t, r.target(tA1).Updated)
+	require.Equal(t, PhaseUpdating, r.target(tA1).Phase)
+
+	h.world.set(func(w *world) { delete(w.notReady, tA1) })
+	h.tick()
+	require.Equal(t, Soaking, h.rollout(id).State)
+	h.tick()
+
+	soak := h.lastSoakInput()
+	require.Len(t, soak.Updated, 1)
+	require.Equal(t, tA1, soak.Updated[0].ID, "the soak compares the late build")
+	require.Len(t, h.rollout(id).Batches, 1)
+	require.Empty(t, h.world.callsFor("update:"+tA2))
+
+	r = h.drive(id, 80, 20*time.Second)
+	require.Equal(t, Complete, r.State, r.Reason)
+	require.Equal(t, PhasePassed, r.target(tA1).Phase)
+	require.Len(t, h.world.callsFor("update:"+tA1), 1, "the accepted update is never sent again")
+	require.NotContains(t, h.history(id), "rollout.halted")
+}
+
+func guaranteeWatchEndsAfterLastDispatch(t *testing.T) {
+	t.Helper()
+
+	h := newHarness(t, replaceLine(testConfig, "retry: {limit: 1}", "retry: {limit: 2}"), retryFleet)
+	h.prime()
+	h.world.set(func(w *world) { w.updateFail[tN1A] = updaterUnavailable })
+	h.release(imgA, d2)
+	id := h.active("a").ID
+	h.clock.Advance(10 * time.Second)
+	h.tick()
+	require.Len(t, h.world.callsFor("update:"+tN1A), 2)
+
+	// The second and last attempt may have been accepted.
+	h.clock.Advance(h.cfg.Strategy.ProgressDeadline - time.Second)
+	h.tick()
+	rt := h.rolloutTarget(id, tN1A)
+	require.Equal(t, PhaseUpdating, rt.Phase, rt.Reason)
+	require.Contains(t, rt.Reason, "retry limit")
+	require.Equal(t, Running, h.rollout(id).State)
+
+	h.clock.Advance(time.Second)
+	h.tick()
+	rt = h.rolloutTarget(id, tN1A)
+	require.Equal(t, PhaseSkipped, rt.Phase, rt.Reason)
+	require.False(t, rt.HoldUntil.IsZero(), "the update could still land")
+	require.Equal(t, Complete, h.drive(id, 5, 0).State)
+	require.Len(t, h.world.callsFor("update:"+tN1A), 2)
+	require.NotContains(t, h.history(id), "rollout.halted")
+}
+
+func guaranteeFirstDeadlineEndsRetries(t *testing.T) {
+	t.Helper()
+
+	cfg := replaceLine(testConfig, "retry: {limit: 1}", "retry: {limit: 5, backoff: {duration: 20s, factor: 1, maxDuration: 20s}}")
+	h := newHarness(t, cfg, retryFleet)
+	h.prime()
+	h.world.set(func(w *world) { w.updateFail[tN1A] = updaterUnavailable })
+	h.release(imgA, d2)
+	id := h.active("a").ID
+
+	// Attempts at 0s, 20s and 40s; the one due at 60s is past the deadline.
+	for range 3 {
+		h.clock.Advance(20 * time.Second)
+		h.tick()
+	}
+
+	rt := h.rolloutTarget(id, tN1A)
+	require.Len(t, h.world.callsFor("update:"+tN1A), 3)
+	require.Equal(t, PhaseUpdating, rt.Phase, rt.Reason)
+	require.Contains(t, rt.Reason, possiblyAccepted)
+
+	// The third attempt was accepted after all and lands within its window.
+	h.world.set(func(w *world) {
+		delete(w.updateFail, tN1A)
+		w.running[tN1A] = d2
+	})
+	h.clock.Advance(20 * time.Second)
+	h.tick()
+	require.Equal(t, PhaseReady, h.rolloutTarget(id, tN1A).Phase)
+	require.Equal(t, Complete, h.drive(id, 20, 20*time.Second).State)
+	require.Len(t, h.world.callsFor("update:"+tN1A), 3)
+}
+
+func guaranteeRestartKeepsWatching(t *testing.T) {
+	t.Helper()
+
+	h := newHarness(t, testConfig, retryFleet)
+	h.prime()
+	h.world.set(func(w *world) { w.updateStuck[tN1A] = true })
+	h.release(imgA, d2)
+	id := h.active("a").ID
+
+	// The process stops while its only allowed update runs: the store holds
+	// the dispatch but no result.
+	h.store.mu.Lock()
+	h.store.rollouts[id].Targets[0].UpdateDone = false
+	h.store.mu.Unlock()
+	h.clock.Advance(30 * time.Second)
+	h.c = h.newController()
+
+	for range 2 {
+		h.tick()
+		rt := h.rolloutTarget(id, tN1A)
+		require.Equal(t, PhaseUpdating, rt.Phase, rt.Reason)
+		require.Contains(t, rt.Reason, possiblyAccepted)
+		h.clock.Advance(15 * time.Second)
+	}
+
+	// A deadline after the stored dispatch, not after the restart.
+	h.tick()
+	rt := h.rolloutTarget(id, tN1A)
+	require.Equal(t, PhaseSkipped, rt.Phase, rt.Reason)
+	require.Len(t, h.world.callsFor("update:"+tN1A), 1, "the interrupted update is never sent again")
+}
+
+func guaranteeLateBuildGetsFullDeadline(t *testing.T) {
+	t.Helper()
+
+	for _, tc := range []struct {
+		name string
+		fail func(w *world)
+	}{
+		{name: "accepted update", fail: func(w *world) { w.updateStuck[tN1A] = true }},
+		{name: "lost response", fail: func(w *world) { w.updateFail[tN1A] = updaterUnavailable }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, testConfig, retryFleet)
+			h.prime()
+			h.world.set(tc.fail)
+			h.release(imgA, d2)
+			id := h.active("a").ID
+
+			// The build lands 40s after its dispatch and never becomes ready.
+			h.clock.Advance(40 * time.Second)
+			h.world.set(func(w *world) {
+				clear(w.updateFail)
+				w.running[tN1A] = d2
+				w.notReady[tN1A] = true
+			})
+			h.tick()
+
+			seen := h.rolloutTarget(id, tN1A).DigestSeenAt
+			require.False(t, seen.IsZero())
+
+			for range 9 {
+				h.clock.Advance(5 * time.Second)
+				h.tick()
+				require.Equal(t, Running, h.rollout(id).State, "conclusively not ready, but within a deadline of the build appearing")
+			}
+
+			h.clock.Advance(5 * time.Second)
+			h.tick()
+
+			r := h.rollout(id)
+			require.Equal(t, Halted, r.State, r.Reason)
+			require.False(t, r.Batches[0].EndedAt.Before(seen.Add(h.cfg.Strategy.ProgressDeadline)))
+			require.Len(t, h.world.callsFor("update:"+tN1A), 1)
 		})
 	}
 }

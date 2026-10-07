@@ -119,8 +119,7 @@ func (c *Controller) planBatch(ctx context.Context, now time.Time, r *Rollout, s
 
 	var jobs []job
 
-	allReady, skipped := true, false
-	changed := false
+	allReady, changed := true, false
 
 	for _, id := range b.Targets {
 		rt := r.target(id)
@@ -129,7 +128,7 @@ func (c *Controller) planBatch(ctx context.Context, now time.Time, r *Rollout, s
 		if reason, skip := c.skipReason(r, set, &t, ok); skip && (rt.Phase == PhasePending || rt.Phase == PhaseUpdating) {
 			c.leave(now, r, rt, PhaseSkipped, reason)
 
-			skipped = true
+			changed = true
 
 			continue
 		}
@@ -150,9 +149,9 @@ func (c *Controller) planBatch(ctx context.Context, now time.Time, r *Rollout, s
 					rt.UpdateDone, rt.UpdateError, rt.RetryAt = true, "", time.Time{}
 				}
 
-				if !rt.Updated {
+				if since := c.live[id].DigestSince; sightingChanged(rt, since) {
 					changed = true
-					rt.Updated, rt.DigestSeenAt = true, c.live[id].DigestSince
+					rt.Updated, rt.DigestSeenAt = true, since
 
 					if rt.UpdatedAt.IsZero() {
 						rt.UpdatedAt = rt.DigestSeenAt
@@ -175,6 +174,8 @@ func (c *Controller) planBatch(ctx context.Context, now time.Time, r *Rollout, s
 
 			allReady = false
 
+			changed = recoverDispatch(now, rt) || changed
+
 			if why := updateDeadlineReason(now, rt, &st, r.Desired[t.Image]); why != "" {
 				changed = true
 
@@ -194,6 +195,12 @@ func (c *Controller) planBatch(ctx context.Context, now time.Time, r *Rollout, s
 				c.halt(ctx, now, r, id, why)
 
 				return nil
+			}
+
+			if watchUpdate(now, rt, &st) {
+				changed = true
+
+				continue
 			}
 
 			if paused && !rt.UpdateDone {
@@ -228,9 +235,9 @@ func (c *Controller) planBatch(ctx context.Context, now time.Time, r *Rollout, s
 		}
 	}
 
-	c.saveSkips(ctx, r, skipped || changed)
+	c.saveSkips(ctx, r, changed)
 
-	if allReady && len(jobs) == 0 {
+	if allReady {
 		c.batchReady(ctx, now, r, set)
 	}
 
@@ -259,15 +266,15 @@ func (c *Controller) pendingUpdate(now time.Time, r *Rollout, rt *RolloutTarget,
 		return false
 	}
 
+	recoverDispatch(now, rt)
+
 	if why := updateDeadlineReason(now, rt, st, desired); why != "" {
 		c.leave(now, r, rt, PhaseSkipped, "update skipped: "+why)
 
 		return false
 	}
 
-	if rt.UpdateAttempts >= max(st.Retry.Limit, 1) {
-		c.leave(now, r, rt, PhaseSkipped, "update skipped: retry limit reached after an interrupted update")
-
+	if watchUpdate(now, rt, st) {
 		return false
 	}
 
@@ -278,6 +285,12 @@ func (c *Controller) pendingUpdate(now time.Time, r *Rollout, rt *RolloutTarget,
 	}
 
 	return true
+}
+
+// sightingChanged reports whether the desired digest observed since `since` is
+// new to rt: not yet adopted, or replaced and back, so earlier readiness is void.
+func sightingChanged(rt *RolloutTarget, since time.Time) bool {
+	return !rt.Updated || !rt.DigestSeenAt.Equal(since)
 }
 
 // skipReason says why a rollout target can no longer be worked on, if so.
@@ -575,9 +588,9 @@ func (c *Controller) dispatch(ctx context.Context, j *job) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	set := c.targets()
+	set, now := c.targets(), c.clock.Now()
 
-	why := c.staleUpdate(set, j)
+	why := c.staleUpdate(now, set, j)
 	if why == "" && c.dirty {
 		why = storeWait
 	}
@@ -586,12 +599,14 @@ func (c *Controller) dispatch(ctx context.Context, j *job) bool {
 		r := c.rollouts[j.rollout]
 		rt := r.target(j.target)
 		t, _ := set.Get(j.target)
+		dispatched, failure := rt.DispatchedAt, rt.UpdateError
 
 		if rt.UpdateAttempts == 0 {
-			rt.UpdatedAt = c.clock.Now()
+			rt.UpdatedAt = now
 		}
 
 		rt.UpdateAttempts++
+		rt.DispatchedAt, rt.UpdateError = now, ""
 
 		if c.saveRollout(ctx, r) == nil {
 			j.program, j.input = c.programFor(&t, config.HookUpdate), c.hookInput(&t)
@@ -600,6 +615,7 @@ func (c *Controller) dispatch(ctx context.Context, j *job) bool {
 		}
 
 		rt.UpdateAttempts--
+		rt.DispatchedAt, rt.UpdateError = dispatched, failure
 		why = storeWait
 	}
 
@@ -612,7 +628,7 @@ func (c *Controller) dispatch(ctx context.Context, j *job) bool {
 
 // staleUpdate says why a planned update no longer belongs to its rollout's
 // open batch, or "" while it does.
-func (c *Controller) staleUpdate(set *targets.Set, j *job) string {
+func (c *Controller) staleUpdate(now time.Time, set *targets.Set, j *job) string {
 	r := c.rollouts[j.rollout]
 	if r.State != Running {
 		return "update withdrawn: the rollout stopped running"
@@ -626,6 +642,11 @@ func (c *Controller) staleUpdate(set *targets.Set, j *job) string {
 	b, rt := r.CurrentBatch(), r.target(j.target)
 	if b == nil || b.Number != j.batch || rt.Phase != PhaseUpdating || rt.UpdateDone || rt.UpdateAttempts != j.attempts {
 		return "update withdrawn: no longer waiting for it"
+	}
+
+	// A retry queued for a worker past the first dispatch's deadline is not sent.
+	if st := c.strategy(r.Strategy); retriesOver(now, rt, &st) {
+		return "update withdrawn: no more attempts allowed"
 	}
 
 	t, present := set.Get(j.target)

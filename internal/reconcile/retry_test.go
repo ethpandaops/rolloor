@@ -50,6 +50,44 @@ func TestAObservedBuildLostBeforeReadinessMustBeSeenAgain(t *testing.T) {
 	require.Len(t, h.world.callsFor("update:"+tN1A), 1)
 }
 
+func TestABuildReplacedBetweenPlansMustBeSeenReadyAgain(t *testing.T) {
+	h := newHarness(t, testConfig, retryFleet)
+	h.prime()
+	h.world.set(func(w *world) { w.breakOnUpdate[tN1A] = true })
+	h.release(imgA, d2)
+	id := h.active("a").ID
+	h.tick()
+
+	first := h.rolloutTarget(id, tN1A)
+	require.True(t, first.Updated)
+	require.Equal(t, PhaseUpdating, first.Phase)
+
+	// Ready on the build, which is then replaced and back before any plan.
+	h.world.set(func(w *world) {
+		delete(w.breakOnUpdate, tN1A)
+		delete(w.notReady, tN1A)
+	})
+	h.clock.Advance(time.Second)
+	h.c.ProbeAll(h.ctx)
+	h.clock.Advance(time.Second)
+	h.world.set(func(w *world) { w.running[tN1A] = d1 })
+	h.c.InspectAll(h.ctx)
+	h.clock.Advance(time.Second)
+	h.world.set(func(w *world) { w.running[tN1A] = d2 })
+	h.c.InspectAll(h.ctx)
+	require.NoError(t, h.c.Tick(h.ctx))
+
+	back := h.rolloutTarget(id, tN1A)
+	require.Equal(t, PhaseUpdating, back.Phase, "readiness before the build returned cannot pass it")
+	require.True(t, back.DigestSeenAt.After(first.DigestSeenAt))
+
+	h.clock.Advance(time.Nanosecond)
+	h.c.ProbeAll(h.ctx)
+	require.NoError(t, h.c.Tick(h.ctx))
+	require.Equal(t, PhaseReady, h.rolloutTarget(id, tN1A).Phase)
+	require.Len(t, h.world.callsFor("update:"+tN1A), 1)
+}
+
 func TestUpdateProgressDeadlineSurvivesRestartAndStopsRetries(t *testing.T) {
 	cfg := replaceLine(testConfig, "retry: {limit: 1}", "retry: {limit: 5}")
 	cfg = replaceLine(cfg, "progressDeadline: 50s", "progressDeadline: 15s")
@@ -65,6 +103,14 @@ func TestUpdateProgressDeadlineSurvivesRestartAndStopsRetries(t *testing.T) {
 	h.clock.Advance(5 * time.Second)
 	h.tick()
 	rt := h.rolloutTarget(id, tN1A)
+	require.Equal(t, PhaseUpdating, rt.Phase, "the last attempt may still land")
+	require.Contains(t, rt.Reason, "progress deadline passed")
+	require.Len(t, h.world.callsFor("update:"+tN1A), 2)
+
+	// The second attempt's window ends a deadline after it was dispatched.
+	h.clock.Advance(10 * time.Second)
+	h.tick()
+	rt = h.rolloutTarget(id, tN1A)
 	require.NotEqual(t, Halted, h.rollout(id).State)
 	require.Equal(t, PhaseSkipped, rt.Phase, rt.Reason)
 	require.False(t, rt.HoldUntil.IsZero())
@@ -114,6 +160,59 @@ func TestUpdateFailureAtTheProgressDeadlineDoesNotScheduleAnotherAttempt(t *test
 	require.Len(t, h.world.callsFor("update:"+tN1A), 1)
 }
 
+func TestAFailureReportedAfterTheWindowAdoptsABuildAlreadySeen(t *testing.T) {
+	h := newHarness(t, testConfig, retryFleet)
+	h.prime()
+	h.world.set(func(w *world) {
+		w.registry[imgA] = d2
+		w.updateFail[tN1A] = boom
+	})
+	h.c.Refresh(h.ctx, actor)
+	entered, release := h.world.gate("update:" + tN1A)
+
+	var once sync.Once
+
+	unblock := func() { once.Do(release) }
+	defer unblock()
+
+	done := make(chan error, 1)
+	go func() { done <- h.c.Tick(h.ctx) }()
+
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("update did not start")
+	}
+
+	// The updater deployed the build, which inspection sees within the window;
+	// its failure report only arrives once the window has closed.
+	h.clock.Advance(10 * time.Second)
+	h.world.set(func(w *world) { w.running[tN1A] = d2 })
+	h.c.InspectAll(h.ctx)
+	h.clock.Advance(h.cfg.Strategy.ProgressDeadline)
+	unblock()
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("update did not finish")
+	}
+
+	id := h.active("a").ID
+	rt := h.rolloutTarget(id, tN1A)
+	require.Equal(t, PhaseUpdating, rt.Phase, "the build is verified, not skipped")
+	require.True(t, rt.RetryAt.IsZero())
+
+	h.tick()
+	require.Equal(t, PhaseReady, h.rolloutTarget(id, tN1A).Phase)
+	require.Equal(t, Soaking, h.rollout(id).State)
+	h.tick()
+	require.Equal(t, tN1A, h.lastSoakInput().Updated[0].ID)
+	require.Equal(t, Complete, h.drive(id, 20, 20*time.Second).State)
+	require.Len(t, h.world.callsFor("update:"+tN1A), 1)
+}
+
 func TestZeroRetryLimitAllowsOnlyTheInitialUpdateAttempt(t *testing.T) {
 	h := newHarness(t, replaceLine(testConfig, "retry: {limit: 1}", "retry: {limit: 0}"), retryFleet)
 	h.prime()
@@ -121,10 +220,13 @@ func TestZeroRetryLimitAllowsOnlyTheInitialUpdateAttempt(t *testing.T) {
 	h.release(imgA, d2)
 	r := h.active("a")
 	rt := r.target(tN1A)
-	require.Equal(t, PhaseSkipped, rt.Phase, rt.Reason)
+	require.Equal(t, PhaseUpdating, rt.Phase, rt.Reason)
+	require.Contains(t, rt.Reason, "retry limit reached")
 	require.Equal(t, 1, rt.UpdateAttempts)
-	h.ticks(3, 20*time.Second)
-	require.Equal(t, 1, h.rolloutTarget(r.ID, tN1A).UpdateAttempts, "the rollout never tries again")
+	h.ticks(4, 20*time.Second)
+	rt = h.rolloutTarget(r.ID, tN1A)
+	require.Equal(t, PhaseSkipped, rt.Phase, rt.Reason)
+	require.Equal(t, 1, rt.UpdateAttempts, "the rollout never tries again")
 	require.NotEqual(t, Halted, h.rollout(r.ID).State)
 }
 
@@ -210,32 +312,25 @@ func TestManualRetryStartsANewUpdateAttemptWindow(t *testing.T) {
 	require.Nil(t, h.view(tN1A).Quarantine)
 }
 
-func TestInterruptedUpdateCannotBypassItsLimitOrDeadline(t *testing.T) {
-	for _, expired := range []bool{false, true} {
-		t.Run(fmt.Sprintf("expired-%t", expired), func(t *testing.T) {
-			h := newHarness(t, testConfig, retryFleet)
-			h.prime()
-			h.world.set(func(w *world) { w.updateStuck[tN1A] = true })
-			h.release(imgA, d2)
-			id := h.active("a").ID
-			h.store.mu.Lock()
-			h.store.rollouts[id].Targets[0].UpdateDone = false
-			h.store.mu.Unlock()
-			h.c = h.newController()
+func TestInterruptedUpdatePastItsWindowIsSkippedWithoutAnotherAttempt(t *testing.T) {
+	h := newHarness(t, replaceLine(testConfig, "retry: {limit: 1}", "retry: {limit: 5}"), retryFleet)
+	h.prime()
+	h.world.set(func(w *world) { w.updateStuck[tN1A] = true })
+	h.release(imgA, d2)
+	id := h.active("a").ID
+	h.store.mu.Lock()
+	h.store.rollouts[id].Targets[0].UpdateDone = false
+	h.store.mu.Unlock()
+	h.c = h.newController()
+	h.clock.Advance(h.cfg.Strategy.ProgressDeadline)
+	h.tick()
 
-			if expired {
-				h.clock.Advance(h.cfg.Strategy.ProgressDeadline)
-			}
-
-			h.tick()
-			r := h.rollout(id)
-			rt := r.target(tN1A)
-			require.NotEqual(t, Halted, r.State)
-			require.Equal(t, PhaseSkipped, rt.Phase, rt.Reason)
-			require.False(t, rt.HoldUntil.IsZero(), "the interrupted update may still land")
-			require.Len(t, h.world.callsFor("update:"+tN1A), 1)
-		})
-	}
+	r := h.rollout(id)
+	rt := r.target(tN1A)
+	require.NotEqual(t, Halted, r.State)
+	require.Equal(t, PhaseSkipped, rt.Phase, rt.Reason)
+	require.False(t, rt.HoldUntil.IsZero(), "the interrupted update may still land")
+	require.Len(t, h.world.callsFor("update:"+tN1A), 1, "attempts remain, but not time")
 }
 
 func TestSoakExecutionErrorsAreNeutralAndResetAfterAnExecutedCheck(t *testing.T) {

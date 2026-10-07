@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"slices"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -304,14 +305,23 @@ func serve(ctx context.Context, configPath string) error {
 
 	events := api.NewBroadcaster()
 
-	var controller *reconcile.Controller
+	var (
+		controller *reconcile.Controller
+		published  atomic.Pointer[targets.Set]
+	)
 
 	watcher, err := targets.NewWatcher(cfg.TargetsDir, rulesFor(cfg), watchEvery, log,
-		func(old, current *targets.Set) {
-			if controller != nil {
-				controller.ReportTargetsError(ctx, nil)
-				forgetRemoved(ctx, controller, old, current)
+		func(_ *targets.Set, current *targets.Set) {
+			if controller == nil {
+				published.Store(current)
+
+				return
 			}
+
+			controller.ReplaceTargets(ctx, func() (*targets.Set, *targets.Set) {
+				return published.Swap(current), current
+			})
+			controller.ReportTargetsError(ctx, nil)
 		},
 		func(err error) {
 			if controller != nil {
@@ -322,8 +332,10 @@ func serve(ctx context.Context, configPath string) error {
 		return err
 	}
 
+	published.Store(watcher.Current())
+
 	controller, err = reconcile.New(ctx, &reconcile.Options{
-		Config: cfg, Targets: watcher.Current, Resolver: resolver, Runner: metrics.NewHookRunner(runner, reg),
+		Config: cfg, Targets: published.Load, Resolver: resolver, Runner: metrics.NewHookRunner(runner, reg),
 		Store: db, Notifier: events, Log: log, Concurrency: cfg.Inspect.Concurrency,
 	})
 	if err != nil {
@@ -332,14 +344,14 @@ func serve(ctx context.Context, configPath string) error {
 
 	reg.MustRegister(metrics.NewCollector(controller))
 
-	server := api.New(cfg, controller, watcher.Current, authorizer, events, version, log)
+	server := api.New(cfg, controller, published.Load, authorizer, events, version, log)
 
 	var loginURL func(string) string
 	if cfg.Auth.Mode != "none" {
 		loginURL = auth.LoginURL
 	}
 
-	pages, err := ui.New(cfg, controller, watcher.Current, authorizer, loginURL, version, log)
+	pages, err := ui.New(cfg, controller, published.Load, authorizer, loginURL, version, log)
 	if err != nil {
 		return err
 	}
@@ -477,20 +489,4 @@ func buildAuthorizer(ctx context.Context, cfg *config.Config, log observability.
 
 func registryOptions(cfg *config.Config) *registry.Options {
 	return &registry.Options{AuthFile: cfg.Registry.AuthFile, PlainHTTP: cfg.Registry.PlainHTTP, CAFile: cfg.Registry.CAFile, Timeout: cfg.Registry.Timeout}
-}
-
-// forgetRemoved drops live state for targets that were in the old set and
-// are not in the new one.
-func forgetRemoved(ctx context.Context, c *reconcile.Controller, old, current *targets.Set) {
-	var gone []string
-
-	for i := range old.Targets {
-		if _, ok := current.Get(old.Targets[i].ID); !ok {
-			gone = append(gone, old.Targets[i].ID)
-		}
-	}
-
-	if len(gone) > 0 {
-		c.Forget(ctx, gone)
-	}
 }

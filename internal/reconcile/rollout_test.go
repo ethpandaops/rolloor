@@ -210,9 +210,14 @@ func TestExhaustedOrUnlandedUpdatesSkipOnlyTheirTarget(t *testing.T) {
 	h.world.set(func(w *world) { w.updateFail[tA2] = "watcher said no" })
 	h.release(imgA, d2)
 	h.tick()
+	require.Equal(t, PhaseUpdating, h.phases(h.active("a"))[tA2], "the refused update may still have been accepted")
+	require.Equal(t, Running, h.active("a").State)
 
-	r := h.active("a")
-	require.Equal(t, Soaking, r.State, "the rest of the batch goes on")
+	// Once that update could no longer land, the rest of the batch goes on.
+	h.clock.Advance(h.cfg.Strategy.ProgressDeadline)
+	h.tick()
+
+	r := h.until(h.active("a").ID, Soaking, 3)
 	require.Equal(t, PhaseReady, h.phases(r)[tA1])
 	require.Equal(t, PhaseSkipped, h.phases(r)[tA2])
 	require.Equal(t, 1, r.target(tA2).UpdateAttempts)
@@ -1038,7 +1043,7 @@ func TestRetryWaitsForTheBudgetWhenItsQuarantineWasLifted(t *testing.T) {
 	// budget like any batch and the halted batch stays closed.
 	require.NoError(t, h.c.Retry(h.ctx, actor, ra.ID, "fixed"))
 
-	halts := len(slices.DeleteFunc(h.notes.actions(), func(a string) bool { return a != "rollout.halted" }))
+	halts := len(slices.DeleteFunc(h.notes.actions(), func(a string) bool { return a != eventRolloutHalted }))
 	updates := len(h.world.callsFor("update:" + tN1A))
 
 	h.ticks(2, 0)
@@ -1046,7 +1051,7 @@ func TestRetryWaitsForTheBudgetWhenItsQuarantineWasLifted(t *testing.T) {
 	require.Equal(t, WaitingForBudget, waiting.State)
 	require.Equal(t, ra.Batches, waiting.Batches)
 	require.Len(t, h.world.callsFor("update:"+tN1A), updates)
-	require.Len(t, slices.DeleteFunc(h.notes.actions(), func(a string) bool { return a != "rollout.halted" }), halts,
+	require.Len(t, slices.DeleteFunc(h.notes.actions(), func(a string) bool { return a != eventRolloutHalted }), halts,
 		"waiting is not announced as another halt")
 
 	h.world.set(func(w *world) { w.notReady["n2/b"] = false })
