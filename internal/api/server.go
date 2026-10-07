@@ -302,8 +302,11 @@ func (s *Server) history(w http.ResponseWriter, r *http.Request) {
 		about = s.targets().Select(sel)
 	}
 
+	// Any after, zero included, asks for history oldest first from that id;
+	// without it the newest events come first.
 	after, _ := strconv.ParseInt(q.Get("after"), 10, 64)
-	query := reconcile.EventQuery{Group: q.Get("group"), Rollout: q.Get("rollout"), Target: q.Get("target"), Limit: limit, After: max(after, 0)}
+	_, oldest := q["after"]
+	query := reconcile.EventQuery{Group: q.Get("group"), Rollout: q.Get("rollout"), Target: q.Get("target"), Limit: limit, After: max(after, 0), Oldest: oldest}
 
 	var (
 		events []reconcile.Event
@@ -311,9 +314,9 @@ func (s *Server) history(w http.ResponseWriter, r *http.Request) {
 	)
 
 	if about != nil {
-		events, err = s.c.EventsAbout(r.Context(), about, query)
+		events, err = s.c.EventsAbout(r.Context(), about, &query)
 	} else {
-		events, err = s.c.Events(r.Context(), query)
+		events, err = s.c.Events(r.Context(), &query)
 	}
 
 	if err != nil {
@@ -360,7 +363,7 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 	var replay []reconcile.Event
 
 	if last > 0 {
-		missed, err := s.c.Events(r.Context(), reconcile.EventQuery{After: last})
+		missed, err := s.c.Events(r.Context(), &reconcile.EventQuery{After: last})
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 

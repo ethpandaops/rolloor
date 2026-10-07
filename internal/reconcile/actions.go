@@ -431,7 +431,7 @@ func (c *Controller) Retry(ctx context.Context, actor, rolloutID, reason string)
 }
 
 // Events returns history from the store.
-func (c *Controller) Events(ctx context.Context, q EventQuery) ([]Event, error) {
+func (c *Controller) Events(ctx context.Context, q *EventQuery) ([]Event, error) {
 	return c.store.Events(ctx, q)
 }
 
@@ -439,7 +439,7 @@ func (c *Controller) Events(ctx context.Context, q EventQuery) ([]Event, error) 
 // one of them, events whose selector matches one, and group or rollout
 // events for the groups they belong to. It filters before it cuts to the
 // limit, so an old match is not hidden by unrelated recent events.
-func (c *Controller) EventsAbout(ctx context.Context, about []targets.Target, q EventQuery) ([]Event, error) {
+func (c *Controller) EventsAbout(ctx context.Context, about []targets.Target, q *EventQuery) ([]Event, error) {
 	limit := q.Limit
 	if limit <= 0 {
 		limit = 200
@@ -464,10 +464,11 @@ func (c *Controller) EventsAbout(ctx context.Context, about []targets.Target, q 
 	c.mu.RUnlock()
 
 	out := make([]Event, 0, limit)
-	q.Limit = eventPage
+	scan := *q
+	scan.Limit = eventPage
 
 	for scanned := 0; scanned < eventScanLimit; {
-		page, err := c.store.Events(ctx, q)
+		page, err := c.store.Events(ctx, &scan)
 		if err != nil {
 			return nil, err
 		}
@@ -489,7 +490,7 @@ func (c *Controller) EventsAbout(ctx context.Context, about []targets.Target, q 
 			break
 		}
 
-		q.Before = page[len(page)-1].ID
+		scan.Before = page[len(page)-1].ID
 	}
 
 	return out, nil

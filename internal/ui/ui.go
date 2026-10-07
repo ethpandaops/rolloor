@@ -440,9 +440,9 @@ func (s *Server) history(w http.ResponseWriter, r *http.Request) {
 	)
 
 	if data.Node != "" {
-		events, err = s.c.EventsAbout(r.Context(), s.targets().Node(data.Node), query)
+		events, err = s.c.EventsAbout(r.Context(), s.targets().Node(data.Node), &query)
 	} else {
-		events, err = s.c.Events(r.Context(), query)
+		events, err = s.c.Events(r.Context(), &query)
 	}
 
 	if err != nil {

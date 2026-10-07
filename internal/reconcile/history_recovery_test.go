@@ -58,7 +58,7 @@ func TestGuaranteeHistorySurvivesStoreFailures(t *testing.T) {
 	require.Equal(t, []string{"refresh", "targets.invalid", "save.suspension", "suspend"}, disk.written)
 	require.False(t, h.c.Fleet().StoreWritesOwed)
 
-	events, err := h.c.Events(h.ctx, EventQuery{})
+	events, err := h.c.Events(h.ctx, &EventQuery{})
 	require.NoError(t, err)
 	require.Equal(t, "suspend", events[0].Action)
 	require.Equal(t, "targets.invalid", events[1].Action)
@@ -90,7 +90,7 @@ func TestHaltHistorySurvivesWriteFailure(t *testing.T) {
 
 	h.tick()
 
-	events, err := h.c.Events(h.ctx, EventQuery{Rollout: r.ID})
+	events, err := h.c.Events(h.ctx, &EventQuery{Rollout: r.ID})
 	require.NoError(t, err)
 	require.Equal(t, "rollout.halted", events[0].Action)
 	require.Contains(t, events[0].Reason, "bad comparison")

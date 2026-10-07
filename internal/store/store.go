@@ -464,7 +464,7 @@ func (s *SQLite) AppendEvent(ctx context.Context, e *reconcile.Event) error {
 }
 
 // Events returns history newest first, filtered.
-func (s *SQLite) Events(ctx context.Context, q reconcile.EventQuery) ([]reconcile.Event, error) {
+func (s *SQLite) Events(ctx context.Context, q *reconcile.EventQuery) ([]reconcile.Event, error) {
 	var (
 		where []string
 		args  []any
@@ -492,7 +492,7 @@ func (s *SQLite) Events(ctx context.Context, q reconcile.EventQuery) ([]reconcil
 
 	order := "DESC"
 
-	if q.After > 0 {
+	if q.After > 0 || q.Oldest {
 		where = append(where, "id > ?")
 		args = append(args, q.After)
 		order = "ASC"

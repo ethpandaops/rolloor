@@ -109,7 +109,7 @@ func TestRoundTrip(t *testing.T) {
 	require.NotContains(t, snap.HookRuns, "t2")
 
 	// Replay: everything after an id, oldest first.
-	after, err := s.Events(ctx, reconcile.EventQuery{After: 1})
+	after, err := s.Events(ctx, &reconcile.EventQuery{After: 1})
 	require.NoError(t, err)
 	require.NotEmpty(t, after)
 	require.Greater(t, after[0].ID, int64(1))
@@ -121,18 +121,18 @@ func TestRoundTrip(t *testing.T) {
 	require.Equal(t, map[string]string{"a": "img=sha256:2"}, snap.Aborted)
 	require.Equal(t, int64(4), snap.NextEventID)
 
-	events, err := s.Events(ctx, reconcile.EventQuery{})
+	events, err := s.Events(ctx, &reconcile.EventQuery{})
 	require.NoError(t, err)
 	require.Len(t, events, 3)
 	require.Equal(t, int64(3), events[0].ID)
 	require.Equal(t, now.Add(3*time.Second), events[0].At)
 
-	events, err = s.Events(ctx, reconcile.EventQuery{Group: "a", Rollout: r1, Target: t1, Limit: 1})
+	events, err = s.Events(ctx, &reconcile.EventQuery{Group: "a", Rollout: r1, Target: t1, Limit: 1})
 	require.NoError(t, err)
 	require.Len(t, events, 1)
 	require.Equal(t, int64(3), events[0].ID)
 
-	events, err = s.Events(ctx, reconcile.EventQuery{Group: "b"})
+	events, err = s.Events(ctx, &reconcile.EventQuery{Group: "b"})
 	require.NoError(t, err)
 	require.Len(t, events, 1)
 	require.Equal(t, "r0", events[0].Rollout)
@@ -196,7 +196,7 @@ func TestClosedStoreFailsEveryCall(t *testing.T) {
 	require.Error(t, s.DeleteHookRuns(ctx, "x"))
 	require.Error(t, s.AppendEvent(ctx, &reconcile.Event{ID: 1}))
 
-	_, err := s.Events(ctx, reconcile.EventQuery{})
+	_, err := s.Events(ctx, &reconcile.EventQuery{})
 	require.Error(t, err)
 	_, err = s.Load(ctx)
 	require.Error(t, err)
@@ -236,7 +236,7 @@ func TestCorruptRowsAreErrors(t *testing.T) {
 
 	_, err = s.db.ExecContext(ctx, `INSERT INTO events (id, at, actor, action) VALUES (1, 'not a time', 'a', 'b')`)
 	require.NoError(t, err)
-	_, err = s.Events(ctx, reconcile.EventQuery{})
+	_, err = s.Events(ctx, &reconcile.EventQuery{})
 	require.ErrorContains(t, err, "bad timestamp")
 }
 
@@ -302,8 +302,12 @@ func TestEventsPageBackWithBefore(t *testing.T) {
 		require.NoError(t, s.AppendEvent(ctx, &reconcile.Event{ID: i, At: time.Now(), Actor: "a", Action: "x"}))
 	}
 
-	got, err := s.Events(ctx, reconcile.EventQuery{Before: 3})
+	got, err := s.Events(ctx, &reconcile.EventQuery{Before: 3})
 	require.NoError(t, err)
 	require.Len(t, got, 2)
 	require.Equal(t, int64(2), got[0].ID)
+
+	got, err = s.Events(ctx, &reconcile.EventQuery{Oldest: true, Limit: 2})
+	require.NoError(t, err)
+	require.Equal(t, []int64{1, 2}, []int64{got[0].ID, got[1].ID}, "oldest first from the start")
 }

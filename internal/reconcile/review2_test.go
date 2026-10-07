@@ -342,7 +342,7 @@ func TestEventsAboutTargets(t *testing.T) {
 	// Everything about node a-3: the halt (a group event), the suspension
 	// (a selector event) and its own target events; nothing about group a's
 	// image alone.
-	events, err := h.c.EventsAbout(h.ctx, h.set.Node("a-3"), EventQuery{Limit: 50})
+	events, err := h.c.EventsAbout(h.ctx, h.set.Node("a-3"), &EventQuery{Limit: 50})
 	require.NoError(t, err)
 
 	acts := map[string]bool{}
@@ -355,7 +355,7 @@ func TestEventsAboutTargets(t *testing.T) {
 	require.True(t, acts["rollout.created"], "%v", acts)
 
 	// Node b-1 is only in group b: the digest change for org/a is not its business.
-	events, err = h.c.EventsAbout(h.ctx, h.set.Node("b-1"), EventQuery{Limit: 2})
+	events, err = h.c.EventsAbout(h.ctx, h.set.Node("b-1"), &EventQuery{Limit: 2})
 	require.NoError(t, err)
 	require.Len(t, events, 2, "the limit applies after filtering")
 
@@ -369,7 +369,7 @@ func TestEventsAboutTargets(t *testing.T) {
 	require.True(t, eventConcerns(&Event{Rollout: "r"}, nil, nil, map[string]struct{}{"g": {}}, map[string]string{"r": "g"}))
 
 	h.store.Fail = errFake
-	_, err = h.c.EventsAbout(h.ctx, nil, EventQuery{})
+	_, err = h.c.EventsAbout(h.ctx, nil, &EventQuery{})
 	require.ErrorIs(t, err, errFake)
 }
 

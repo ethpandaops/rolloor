@@ -39,7 +39,7 @@ type Store interface {
 	// deletions, in one step after a store failure.
 	ReplaceDecisions(ctx context.Context, snap *Snapshot) error
 	AppendEvent(ctx context.Context, e *Event) error
-	Events(ctx context.Context, q EventQuery) ([]Event, error)
+	Events(ctx context.Context, q *EventQuery) ([]Event, error)
 }
 
 // EventQuery filters history.
@@ -49,6 +49,9 @@ type EventQuery struct {
 	Target  string
 	// After returns only events with a greater id, oldest first, for replay.
 	After int64
+	// Oldest returns events oldest first even when After is zero, so a
+	// follower can read a history from its very first event.
+	Oldest bool
 	// Before returns only events with a smaller id, for paging back.
 	Before int64
 	Limit  int
@@ -391,7 +394,7 @@ func (m *MemoryStore) AppendEvent(_ context.Context, e *Event) error {
 }
 
 // Events returns history newest first.
-func (m *MemoryStore) Events(_ context.Context, q EventQuery) ([]Event, error) {
+func (m *MemoryStore) Events(_ context.Context, q *EventQuery) ([]Event, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -401,10 +404,14 @@ func (m *MemoryStore) Events(_ context.Context, q EventQuery) ([]Event, error) {
 
 	var out []Event
 
-	if q.After > 0 {
+	if q.After > 0 || q.Oldest {
 		for i := range m.events {
 			if m.events[i].ID > q.After {
 				out = append(out, m.events[i])
+			}
+
+			if q.Limit > 0 && len(out) == q.Limit {
+				break
 			}
 		}
 

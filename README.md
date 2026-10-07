@@ -149,7 +149,7 @@ Behind a TLS-terminating proxy, preserve `Host` and set `X-Forwarded-Proto: http
 
 Admitted node weights remain charged while held, even if their targets move or disappear. Ratios can exceed 1 after the configured fleet shrinks; they are not clamped.
 
-History writes that fail are retried in order before new decisions; live history listeners receive events only once they are stored. Background inspection, background readiness probes and early batch observations share ten-second spacing per target and hook. An update that returns success earns one immediate inspect and readiness observation.
+`GET /api/v1/history` returns the newest events first; with `after=<id>` it returns the events after that id oldest first, and `after=0` reads a history from its first event, which is how a follower starts. History writes that fail are retried in order before new decisions; live history listeners receive events only once they are stored. Background inspection, background readiness probes and early batch observations share ten-second spacing per target and hook. An update that returns success earns one immediate inspect and readiness observation.
 
 ## Example
 

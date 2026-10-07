@@ -97,7 +97,7 @@ func TestStoreFailureStopsNewWorkUntilFlushed(t *testing.T) {
 	h.ticks(3, 0)
 	require.Equal(t, updates, len(h.world.callsFor("update")))
 
-	_, err := h.c.Events(h.ctx, EventQuery{})
+	_, err := h.c.Events(h.ctx, &EventQuery{})
 	require.ErrorIs(t, err, errFake)
 
 	// Once the store is back, everything is rewritten and work resumes.
@@ -220,25 +220,30 @@ func TestMemoryStoreEventsFilterAndFail(t *testing.T) {
 		require.NoError(t, m.AppendEvent(ctx, &e), i)
 	}
 
-	got, err := m.Events(ctx, EventQuery{Group: "a"})
+	got, err := m.Events(ctx, &EventQuery{Group: "a"})
 	require.NoError(t, err)
 	require.Len(t, got, 2)
 	require.Equal(t, int64(3), got[0].ID)
 
-	got, err = m.Events(ctx, EventQuery{Rollout: "r2"})
+	got, err = m.Events(ctx, &EventQuery{Rollout: "r2"})
 	require.NoError(t, err)
 	require.Len(t, got, 1)
 
-	got, err = m.Events(ctx, EventQuery{Target: "t1", Limit: 1})
+	got, err = m.Events(ctx, &EventQuery{Target: "t1", Limit: 1})
 	require.NoError(t, err)
 	require.Len(t, got, 1)
 
-	got, err = m.Events(ctx, EventQuery{Limit: 2})
+	got, err = m.Events(ctx, &EventQuery{Limit: 2})
 	require.NoError(t, err)
 	require.Len(t, got, 2)
 
+	// A follower reads from the first event, a page at a time.
+	got, err = m.Events(ctx, &EventQuery{Oldest: true, Limit: 2})
+	require.NoError(t, err)
+	require.Equal(t, []int64{1, 2}, []int64{got[0].ID, got[1].ID})
+
 	// Replay after an id is oldest first.
-	got, err = m.Events(ctx, EventQuery{After: 1})
+	got, err = m.Events(ctx, &EventQuery{After: 1})
 	require.NoError(t, err)
 	require.Len(t, got, 2)
 	require.Equal(t, int64(2), got[0].ID)
@@ -269,7 +274,7 @@ func TestMemoryStoreEventsFilterAndFail(t *testing.T) {
 	require.ErrorIs(t, m.ClearAborted(ctx, "g"), errFake)
 	require.ErrorIs(t, m.SaveHookRun(ctx, "t", &HookRun{Hook: "h"}), errFake)
 	require.ErrorIs(t, m.DeleteHookRuns(ctx, "t"), errFake)
-	_, err = m.Events(ctx, EventQuery{})
+	_, err = m.Events(ctx, &EventQuery{})
 	require.ErrorIs(t, err, errFake)
 	_, err = m.Load(ctx)
 	require.ErrorIs(t, err, errFake)
@@ -280,7 +285,7 @@ func TestHistoryThroughController(t *testing.T) {
 	h.prime()
 	h.release(imgA, d2)
 
-	events, err := h.c.Events(h.ctx, EventQuery{Group: "a"})
+	events, err := h.c.Events(h.ctx, &EventQuery{Group: "a"})
 	require.NoError(t, err)
 	require.NotEmpty(t, events)
 	require.Equal(t, "batch.started", events[0].Action)

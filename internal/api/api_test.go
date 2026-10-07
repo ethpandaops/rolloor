@@ -901,4 +901,13 @@ func TestHistoryAfterAnID(t *testing.T) {
 	require.Len(t, later, want)
 	require.Equal(t, cut+1, later[0].ID, "oldest first, starting right after the id")
 	require.Greater(t, later[len(later)-1].ID, later[0].ID)
+
+	// after=0 reads a history from its first event, as a new follower must.
+	_, _, raw = f.do(http.MethodGet, "/api/v1/history?after=0&limit=2", "")
+
+	var first []reconcile.Event
+	require.NoError(t, json.Unmarshal([]byte(raw), &first))
+	require.Len(t, first, 2)
+	require.Equal(t, int64(1), first[0].ID)
+	require.Equal(t, int64(2), first[1].ID)
 }

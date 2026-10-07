@@ -107,7 +107,7 @@ func TestEventsAboutPagesBackPastOnePage(t *testing.T) {
 		require.NoError(t, h.store.AppendEvent(h.ctx, &Event{ID: i, Action: "noise", Target: "elsewhere"}))
 	}
 
-	got, err := h.c.EventsAbout(h.ctx, about, EventQuery{Limit: 5})
+	got, err := h.c.EventsAbout(h.ctx, about, &EventQuery{Limit: 5})
 	require.NoError(t, err)
 	require.Len(t, got, 1)
 	require.Equal(t, "old", got[0].Action)
@@ -117,7 +117,7 @@ func TestEventsAboutPagesBackPastOnePage(t *testing.T) {
 		require.NoError(t, h.store.AppendEvent(h.ctx, &Event{ID: i, Action: "noise", Target: "elsewhere"}))
 	}
 
-	got, err = h.c.EventsAbout(h.ctx, about, EventQuery{})
+	got, err = h.c.EventsAbout(h.ctx, about, &EventQuery{})
 	require.NoError(t, err)
 	require.Empty(t, got)
 }
