@@ -99,6 +99,7 @@ type Controller struct {
 	nextEventID   int64
 	pendingEvents []Event
 	historyID     string
+	configError   bool
 	lastInspect   time.Time
 	lastProbe     time.Time
 	probes        probePacer

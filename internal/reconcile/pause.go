@@ -31,6 +31,31 @@ func (c *Controller) ConfigureGroups(ctx context.Context, paused bool, groups ma
 	return nil
 }
 
+// ReportConfigError records the latest failed reload without changing config.
+func (c *Controller) ReportConfigError(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.configError = err != nil
+}
+
+// AutomationStatus returns the effective config holds and reload health.
+func (c *Controller) AutomationStatus() (paused, failed bool, groups map[string]bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	groups = make(map[string]bool, len(c.groups))
+	for _, name := range c.targets().Groups() {
+		groups[name] = c.groupPaused(name)
+	}
+
+	for name := range c.groups {
+		groups[name] = c.groupPaused(name)
+	}
+
+	return c.paused, c.configError, groups
+}
+
 // GroupPaused reports whether config disables updates for this group.
 func (c *Controller) GroupPaused(group string) bool {
 	c.mu.RLock()

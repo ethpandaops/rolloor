@@ -416,25 +416,11 @@ func watchAutomation(ctx context.Context, path string, c *reconcile.Controller, 
 	ticker := time.NewTicker(watchEvery)
 	defer ticker.Stop()
 
-	var modified time.Time
-
-	size := int64(-1)
+	reload := automationReload{}
 
 	for {
-		info, err := os.Stat(path)
-		if err != nil {
-			log.WithContext(ctx).WithError(err).Warn("config reload failed")
-		} else if !info.ModTime().Equal(modified) || info.Size() != size {
-			modified, size = info.ModTime(), info.Size()
-
-			cfg, loadErr := config.Load(path)
-			if loadErr == nil {
-				loadErr = c.ConfigureGroups(ctx, cfg.Paused, cfg.Groups)
-			}
-
-			if loadErr != nil {
-				log.WithContext(ctx).WithError(loadErr).Warn("config reload failed; keeping previous pause and group settings")
-			}
+		if err := reload.apply(ctx, path, c); err != nil {
+			log.WithContext(ctx).WithError(err).Warn("config reload failed; keeping previous pause and group settings")
 		}
 
 		select {
@@ -443,6 +429,38 @@ func watchAutomation(ctx context.Context, path string, c *reconcile.Controller, 
 		case <-ticker.C:
 		}
 	}
+}
+
+type automationReload struct {
+	modified time.Time
+	size     int64
+	applied  bool
+	failed   bool
+}
+
+func (r *automationReload) apply(ctx context.Context, path string, c *reconcile.Controller) error {
+	info, err := os.Stat(path)
+	if err == nil && r.applied && !r.failed && info.ModTime().Equal(r.modified) && info.Size() == r.size {
+		return nil
+	}
+
+	if err == nil {
+		var cfg *config.Config
+
+		cfg, err = config.Load(path)
+		if err == nil {
+			err = c.ConfigureGroups(ctx, cfg.Paused, cfg.Groups)
+		}
+	}
+
+	r.failed = err != nil
+	c.ReportConfigError(err)
+
+	if err == nil {
+		r.modified, r.size, r.applied = info.ModTime(), info.Size(), true
+	}
+
+	return err
 }
 
 // buildAuthorizer picks open access or OIDC from the config. The OIDC client

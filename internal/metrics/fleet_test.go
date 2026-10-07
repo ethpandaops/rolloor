@@ -119,3 +119,34 @@ func TestFleetMetricsWithoutRollouts(t *testing.T) {
 	require.Zero(t, metricGauge(t, reg, "rolloor_fleet_unavailable_weight_ratio"))
 	require.Empty(t, c.Fleet().Resolve)
 }
+
+func TestConfigReloadAndEffectivePauseMetrics(t *testing.T) {
+	ctx := context.Background()
+	cfg, err := config.Parse([]byte("environment: t\nhooks: {dir: /tmp}\nlabels: {group: client}\n"))
+	require.NoError(t, err)
+	set, err := targets.Parse([]byte("- {id: a, node: n1, weight: 1, image: org/a:t, labels: {client: a}}\n"), &targets.Rules{GroupLabel: "client", KnownHooks: config.TargetHooks})
+	require.NoError(t, err)
+
+	world := &metricWorld{fake: fake{digest: "sha256:paused"}}
+	c, err := reconcile.New(ctx, &reconcile.Options{Config: cfg, Targets: func() *targets.Set { return set }, Resolver: world, Runner: world, Store: reconcile.NewMemoryStore(), Log: logrus.New()})
+	require.NoError(t, err)
+
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(NewCollector(c))
+
+	c.ReportConfigError(errors.New("load failed"))
+	require.Equal(t, float64(1), metricGauge(t, reg, "rolloor_config_reload_failed"))
+	require.Zero(t, metricGauge(t, reg, "rolloor_config_paused"))
+	require.Zero(t, metricGauge(t, reg, "rolloor_group_paused"))
+	require.NoError(t, c.ConfigureGroups(ctx, false, map[string]config.Group{"a": {Paused: true}}))
+	require.Zero(t, metricGauge(t, reg, "rolloor_config_paused"))
+	require.Equal(t, float64(1), metricGauge(t, reg, "rolloor_group_paused"))
+	require.NoError(t, c.ConfigureGroups(ctx, true, nil))
+	c.ReportConfigError(nil)
+	require.Zero(t, metricGauge(t, reg, "rolloor_config_reload_failed"))
+	require.Equal(t, float64(1), metricGauge(t, reg, "rolloor_config_paused"))
+	require.Equal(t, float64(1), metricGauge(t, reg, "rolloor_group_paused"))
+	require.NoError(t, c.ConfigureGroups(ctx, false, nil))
+	require.Zero(t, metricGauge(t, reg, "rolloor_config_paused"))
+	require.Zero(t, metricGauge(t, reg, "rolloor_group_paused"))
+}

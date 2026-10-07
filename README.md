@@ -31,15 +31,15 @@ Each `updated` soak entry includes `updatedAt` in RFC 3339, when inspect first o
 - [`TestGuaranteeDisruptionBudget`](internal/reconcile/guarantees_test.go): admission respects `maxUnavailable`, counting unrelated outages once per node; unavailable nodes cost nothing. With zero unavailable weight and a positive budget, one weighted node may go alone.
 - [`TestGuaranteeOneRolloutPerGroup`](internal/reconcile/guarantees_test.go): one active rollout per group; any of its images changing supersedes it.
 - [`TestGuaranteeDurableUpdates`](internal/reconcile/guarantees_test.go): admission and each dispatched attempt are stored with full SQLite durability before updates; restart/crash recovery preserves the budget without repeating landed updates. Dispatched updates keep their reservation after a skip or end until observed ready on the new build at the admitted node and image, or `progressDeadline` after leaving the batch. Held nodes count at no less than their admitted weight, including after removal from the target files.
-- [`TestGuaranteeHistorySurvivesStoreFailures`](internal/reconcile/history_recovery_test.go): owed events are stored in order before new decisions, then delivered to history listeners.
+- [`TestGuaranteeHistorySurvivesStoreFailures`](internal/reconcile/history_recovery_test.go): decisions and the history they cause commit atomically; owed decisions and ordered events replay together before new decisions. History listeners receive only durable events.
 - [`TestGuaranteeHaltStopsOpenBatch`](internal/reconcile/guarantees_test.go): a halt stops the open batch and the rest until a newer build or a retry.
 - [`TestGuaranteeSuspendedTargetsNeverUpdate`](internal/reconcile/guarantees_test.go): no update is dispatched to a suspended target; an already-dispatched update may still land and keeps its budget reservation.
 - [`TestGuaranteeObservedHealth`](internal/reconcile/guarantees_test.go): health follows observed readiness, including recovery outside rollouts.
 - [`TestGuaranteeTransientFailuresRecover`](internal/reconcile/guarantees_test.go): failed update attempts retry with backoff; indeterminate observations are not evidence of a bad build.
-- [`TestGuaranteeUpdaterExhaustionSkips`](internal/reconcile/guarantees_test.go): exhausted updater retries or a digest that never arrives skip that target, retaining its dispatched reservation for the progress deadline; the rest proceeds and a later automatic rollout retries drift.
+- [`TestGuaranteeUpdaterExhaustionSkips`](internal/reconcile/guarantees_test.go): retries bound update dispatches, not observation. After retries or the first-dispatch deadline are exhausted, the target stays held in its batch until `progressDeadline` after its last dispatch. A build that lands in that window must pass readiness and soak; only an absent build is skipped when the window ends. A later automatic rollout retries remaining drift.
 - [`TestGuaranteeSoakErrorsRecover`](internal/reconcile/guarantees_test.go): indeterminate soak checks never halt or pass a batch; fresh successful checks resume it automatically, however long the outage lasted.
 - [`TestGuaranteeConfigPause`](internal/reconcile/guarantees_test.go): top-level and group config pauses block every admission and update, including forced sync, without stopping observation or releasing open reservations; clearing config resumes automatically.
-- [`TestGuaranteeAutonomousConvergence`](internal/reconcile/guarantees_test.go): once failures heal, every target converges unattended, except as below.
+- [`TestGuaranteeAutonomousConvergence`](internal/reconcile/guarantees_test.go): once failures heal, every target converges unattended, except as below. This assumes working storage, registry, hooks and the services hooks ask; repairing those dependencies is not routine approval.
 
 ## When a person is needed
 
@@ -51,6 +51,8 @@ Only a bad build or an explicitly chosen hold can need intervention. Operator pa
 | `Aborted` | a person stopped the operation; the group holds that build | newer build automatically, or Sync | `TestGuaranteeAbortKeepsBuild` |
 | `Paused` | a person explicitly paused the operation | expiry automatically, or Promote | `TestGuaranteeOperatorPauseExpires` |
 | suspended target | a person explicitly suspended it | expiry automatically, or Resume | `TestGuaranteeSuspensionExpires` |
+| config `paused: true`, top-level or group | an explicitly configured indefinite hold | change config; reloaded within five seconds | `TestGuaranteeConfigPause` |
+| disruption budget of zero | config permits no new disruption | change the budget in config and restart | `TestGuaranteeDisruptionBudget` |
 
 Retry keeps the failed batch in history and admits its failed targets before untried targets, as many at a time as the budget permits.
 
@@ -96,7 +98,7 @@ hooks:
 strategy:
   # Nodes per batch, count or share.
   batchSize: 25%
-  # Time allowed from update to readiness.
+  # Time allowed after dispatch for the digest, then after observation for readiness.
   progressDeadline: 10m
   # Watching each ready batch.
   soak:
@@ -113,9 +115,13 @@ groups:
 
 More settings: [`examples/generic/config.yaml`](examples/generic/config.yaml).
 
-`paused` and `groups` are reloaded from the config file every five seconds; invalid changes keep the previous settings. All other settings require a restart. An active rollout keeps its selected strategy unless Sync explicitly changes it; a group strategy change applies to later rollouts. A config pause prevents new batches and queued updates, while open reservations remain charged, observations continue and an already-soaking batch can finish.
+`paused` and `groups` are reloaded from the config file every five seconds; invalid or failed reloads keep the previous effective settings and retry every tick without requiring another file change. Replace config atomically: write a complete new file, then rename it over the configured path. All other settings require a restart. An active rollout keeps its selected strategy unless Sync explicitly changes it; a group strategy change applies to later rollouts. A config pause prevents new batches and queued updates, while open reservations remain charged, observations continue and an already-soaking batch can finish.
 
-The progress deadline starts at the first durable update dispatch, not while waiting for a worker. A queued target whose build lands another way starts that clock from the first observation of the new digest.
+The dispatch deadline starts at the first durable update dispatch, not while waiting for a worker. Retries stop at their limit or that deadline, but a possibly accepted update remains watched in its batch until `progressDeadline` after the last durable dispatch, including across restarts. During that window the target remains reserved and later batches cannot bypass its verification. If inspect sees the desired digest, it gets a full `progressDeadline` from that first observation to become ready, followed by the normal soak. Missing or indeterminate readiness observations continue waiting rather than conclusively halting. Only a digest still absent when the last-dispatch window ends is skipped automatically; its dispatched reservation then follows the usual post-batch hold. A queued target whose build lands another way needs no dispatch and starts verification from the first observation.
+
+For rollouts restored from older data without a last-dispatch timestamp, one recorded attempt uses its first-dispatch time; multiple attempts get a fresh watch window at their first reconcile, persisted before further work. Readiness deadlines are never earlier than the first-dispatch deadline. A failure report arriving after inspect has already seen the desired build still verifies it rather than retrying or skipping it. If the desired digest leaves and returns, readiness must acknowledge the new first-observed time.
+
+Changing any target definition field, including hook programs or their input, discards that target's digest, readiness and hook observations in memory and storage. Inspect and readiness results dispatched against the old definition are ignored. The replacement counts as unavailable until freshly observed ready. Definition stamps also detect changes made while the process was down, including the hook environment, directory and selected programs. Observations from older databases without stamps are discarded once on upgrade and refreshed by the startup inspect and readiness passes.
 
 ## Run
 
@@ -138,6 +144,9 @@ Behind a TLS-terminating proxy, preserve `Host` and set `X-Forwarded-Proto: http
 | `rolloor_disruption_budget_ratio` | unavailable node weight / allowed unavailable weight, even with no rollout; 0 for a zero budget |
 | `rolloor_store_writes_owed` | 1 while decisions or ordered history await durable storage |
 | `rolloor_targets_load_failed` | 1 while targets files fail to load; the last valid set remains observed |
+| `rolloor_config_reload_failed` | 1 while the latest config reload attempt failed; previous effective settings remain in force |
+| `rolloor_config_paused` | 1 while the effective top-level config pauses updates |
+| `rolloor_group_paused{group}` | 1 while effective config pauses a group, including a top-level pause |
 | `rolloor_last_inspect_timestamp_seconds` | last completed inspect pass, or 0 before the first |
 | `rolloor_last_probe_timestamp_seconds` | last completed readiness probe pass, or 0 before the first |
 | `rolloor_registry_resolve_failed{image}` | 1 for images whose most recent registry resolution failed |
@@ -149,7 +158,11 @@ Behind a TLS-terminating proxy, preserve `Host` and set `X-Forwarded-Proto: http
 
 Admitted node weights remain charged while held, even if their targets move or disappear. Ratios can exceed 1 after the configured fleet shrinks; they are not clamped.
 
-`GET /api/v1/history` returns the newest events first; with `after=<id>` it returns the events after that id oldest first, and `after=0` reads a history from its first event, which is how a follower starts. History writes that fail are retried in order before new decisions; live history listeners receive events only once they are stored. Background inspection, background readiness probes and early batch observations share ten-second spacing per target and hook. An update that returns success earns one immediate inspect and readiness observation.
+### History API
+
+`GET /api/v1/history` returns the newest events first; with `after=<id>` it returns the events after that id oldest first, and `after=0` reads a history from its first event. The JSON body remains an event array. The `Rolloor-History` response header identifies the history with a durable random identity, unchanged by restart and changed when the database is replaced. A follower stores that identity beside its cursor; when it changes, discard the cursor and read from `after=0`, even if the replacement history already has higher event ids.
+
+Persisted decisions and their history events are stored in one transaction. Failed writes retry decisions and ordered events together before new decisions; live history listeners receive events only once they are stored. Older partial abort records are repaired with a recovery event in the same replay. Background inspection, background readiness probes and early batch observations share ten-second spacing per target and hook. An update that returns success earns one immediate inspect and readiness observation. Readiness input and its evidence timestamp are captured together when the probe dispatches, so a queued probe uses the current digest's first-observed time.
 
 ## Example
 
