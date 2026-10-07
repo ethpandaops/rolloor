@@ -141,12 +141,14 @@ const (
 type RolloutTarget struct {
 	ID     string      `json:"id"`
 	Node   string      `json:"node"`
+	Image  string      `json:"image"`
 	Wave   int         `json:"wave"`
 	Batch  int         `json:"batch"` // 0 = not yet batched
 	Phase  TargetPhase `json:"phase"`
 	Reason string      `json:"reason,omitempty"`
 	// UpdateDone is set once the update hook has returned success; Updated
-	// once inspect has seen the desired digest running.
+	// once inspect has seen the desired digest running. UpdateAttempts counts
+	// dispatched updates, each stored before its program runs.
 	UpdateDone     bool      `json:"updateDone"`
 	Updated        bool      `json:"updated"`
 	UpdatedAt      time.Time `json:"updatedAt,omitzero"`
@@ -158,8 +160,11 @@ type RolloutTarget struct {
 	NotReadyBefore bool `json:"notReadyBefore,omitempty"`
 	// Free records that admission added no unavailable node.
 	Free bool `json:"free,omitempty"`
-	// HoldUntil keeps the node counted against the budget after the rollout
-	// ended while this target's update may still be landing.
+	// NodeWeight is the node's weight at admission; while the rollout keeps
+	// the node unavailable it counts at least this, even once the node is gone.
+	NodeWeight float64 `json:"nodeWeight,omitempty"`
+	// HoldUntil keeps the node counted against the budget after the target
+	// left its batch while an update dispatched to it may still be landing.
 	HoldUntil time.Time `json:"holdUntil,omitzero"`
 	// Retried marks a target a person sent back after a halt; it goes before
 	// untried targets and passes a batch even when already on the build.
@@ -286,6 +291,8 @@ type Event struct {
 
 // ControllerActor is the actor recorded for the controller's own decisions.
 const ControllerActor = "controller"
+
+const eventRolloutCreated = "rollout.created"
 
 // HookRun is the last result of one hook for one target, kept for display.
 type HookRun struct {

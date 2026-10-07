@@ -4,6 +4,7 @@ import (
 	"context"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
@@ -15,19 +16,17 @@ func TestAnActionWritesTheDecisionsItFindsOwedFirst(t *testing.T) {
 	h.release(imgA, d2)
 	first := h.active("a").ID
 
-	// d3 supersedes the rollout and opens another while rollout saves fail;
-	// both exist only in memory.
+	// The old rollout's end is owed before the newer build can open a rollout.
 	h.store.FailRollouts = errFake
 	h.release(imgA, d3)
-	second := h.active("a").ID
-	require.NotEqual(t, first, second)
 
 	h.store.FailRollouts = nil
 
-	// A sync saves the second rollout. The first's end must reach the store
-	// before it, or a restart would find two active rollouts for a.
-	_, err := h.c.Sync(h.ctx, SyncRequest{Actor: actor, Selector: mustSel("client=a")})
+	// Sync must store the old end before creating another active rollout.
+	started, err := h.c.Sync(h.ctx, SyncRequest{Actor: actor, Selector: mustSel("client=a")})
 	require.NoError(t, err)
+	require.Len(t, started, 1)
+	require.NotEqual(t, first, started[0])
 
 	restarted := h.newController()
 
@@ -39,7 +38,7 @@ func TestAnActionWritesTheDecisionsItFindsOwedFirst(t *testing.T) {
 		}
 	}
 
-	require.Equal(t, []string{second}, active)
+	require.Equal(t, started, active)
 }
 
 // saveOrder records the order rollout saves reach the store in.
@@ -56,51 +55,75 @@ func (s *saveOrder) SaveRollout(ctx context.Context, r *Rollout) error {
 }
 
 func TestASkipReachesTheStoreBeforeTheBudgetItFreesIsSpent(t *testing.T) {
-	h := newHarness(t, oneNodeConfig, `
+	for _, tc := range []struct {
+		name  string
+		lands bool
+	}{
+		{name: "the hold ends at the progress deadline"},
+		{name: "the hold ends once the target is seen ready on the build", lands: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, oneNodeConfig, `
 - {id: n0/a, node: n0, weight: 0,   image: org/a:t, labels: {client: a, owner: a}}
 - {id: n1/a, node: n1, weight: 100, image: org/a:t, labels: {client: a, owner: a}}
 - {id: n2/b, node: n2, weight: 100, image: org/b:t, labels: {client: b, owner: b}}
 `)
-	disk := &saveOrder{MemoryStore: h.store}
+			disk := &saveOrder{MemoryStore: h.store}
 
-	c, err := New(h.ctx, &Options{
-		Config: h.cfg, Targets: h.current, Resolver: h.world, Runner: h.world, Store: disk,
-		Notifier: h.notes, Clock: h.clock, Log: logrus.New(), NewID: h.nextID,
-	})
-	require.NoError(t, err)
+			c, err := New(h.ctx, &Options{
+				Config: h.cfg, Targets: h.current, Resolver: h.world, Runner: h.world, Store: disk,
+				Notifier: h.notes, Clock: h.clock, Log: logrus.New(), NewID: h.nextID,
+			})
+			require.NoError(t, err)
 
-	h.c = c
-	h.prime()
+			h.c = c
+			h.prime()
 
-	// a moves n0 and n1, with n1's update never landing and n0 never ready;
-	// b waits for n1's share of the budget.
-	h.world.set(func(w *world) {
-		w.updateStuck["n1/a"] = true
-		w.notReady[tN0A] = true
-		w.registry[imgB] = d2
-	})
-	h.release(imgA, d2)
-	h.tick()
-	ra, rb := h.active("a"), h.active("b")
-	require.Equal(t, WaitingForBudget, rb.State)
+			// a moves n0 and n1, with n1's update never landing and n0 never
+			// ready; b waits for n1's share of the budget.
+			h.world.set(func(w *world) {
+				w.updateStuck[tN1A] = true
+				w.notReady[tN0A] = true
+				w.registry[imgB] = d2
+			})
+			h.release(imgA, d2)
+			h.tick()
+			ra, rb := h.active("a"), h.active("b")
+			require.Equal(t, WaitingForBudget, rb.State)
 
-	// Suspending n1/a skips it, which frees n1 for b in the same tick. The
-	// skip must be saved first: a crash between the two writes would
-	// otherwise restart with both nodes counted.
-	_, err = h.c.Suspend(h.ctx, SuspendRequest{Actor: actor, Selector: mustSel("id=n1/a"), Reason: "debugging"})
-	require.NoError(t, err)
+			// Suspending n1/a skips it after its update was dispatched. That
+			// update may still land, so n1 stays held and b keeps waiting.
+			_, err = h.c.Suspend(h.ctx, SuspendRequest{Actor: actor, Selector: mustSel("id=n1/a"), Reason: debugReason})
+			require.NoError(t, err)
 
-	disk.saves = nil
+			disk.saves = nil
 
-	h.tick()
+			h.tick()
 
-	skipped := slices.IndexFunc(disk.saves, func(r Rollout) bool {
-		return r.ID == ra.ID && r.target("n1/a").Phase == PhaseSkipped
-	})
-	started := slices.IndexFunc(disk.saves, func(r Rollout) bool { return r.ID == rb.ID && len(r.Batches) == 1 })
+			held := h.clock.Now().Add(h.cfg.Strategy.ProgressDeadline)
+			skipped := slices.IndexFunc(disk.saves, func(r Rollout) bool {
+				rt := r.target(tN1A)
 
-	require.GreaterOrEqual(t, skipped, 0)
-	require.Greater(t, started, skipped)
+				return r.ID == ra.ID && rt.Phase == PhaseSkipped && rt.HoldUntil.Equal(held)
+			})
+			require.GreaterOrEqual(t, skipped, 0, "the skip and its hold are stored")
+			require.Equal(t, WaitingForBudget, h.rollout(rb.ID).State)
+
+			if tc.lands {
+				h.world.set(func(w *world) { w.running[tN1A] = d2 })
+			} else {
+				h.clock.Advance(h.cfg.Strategy.ProgressDeadline - time.Second)
+				h.tick()
+				require.Equal(t, WaitingForBudget, h.rollout(rb.ID).State)
+				h.clock.Advance(time.Second)
+			}
+
+			h.tick()
+
+			started := slices.IndexFunc(disk.saves, func(r Rollout) bool { return r.ID == rb.ID && len(r.Batches) == 1 })
+			require.Greater(t, started, skipped)
+		})
+	}
 }
 
 func TestAPauseTheStoreRefusesLeavesNothingBehind(t *testing.T) {

@@ -204,7 +204,7 @@ func guaranteeAllowedHolds(t *testing.T) {
 	h := s.h
 	require.NoError(t, h.c.SetPolicy(h.ctx, actor, clientCharlie, Policy{Mode: ModeManual, Strategy: careful}))
 	require.NoError(t, h.c.SetPolicy(h.ctx, actor, clientBravo, Policy{Mode: ModeAutomated, Strategy: careful}))
-	sp, err := h.c.Suspend(h.ctx, SuspendRequest{Actor: actor, Selector: mustSel("node=node-2"), Reason: "maintenance", Expires: time.Hour})
+	sp, err := h.c.Suspend(h.ctx, SuspendRequest{Actor: actor, Selector: mustSel("node=node-2"), Reason: maintenanceReason, Expires: time.Hour})
 	require.NoError(t, err)
 
 	s.suspended = append(s.suspended, propSuspension{sel: sp.Selector, expires: sp.ExpiresAt})
@@ -362,6 +362,8 @@ func guaranteeUnrelatedOutage(t *testing.T) {
 	for range h.cfg.ReadinessProbe.FailureThreshold {
 		h.c.ProbeAll(h.ctx)
 	}
+
+	require.InDelta(t, 100, h.c.FleetStatus().UnavailableWeight, 0, "unrelated outages count before any rollout exists")
 
 	h.release(imgEcho, d2)
 	r := h.active("echo")

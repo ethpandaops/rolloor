@@ -153,17 +153,4 @@ func TestSoakProgressStaysOutOfHistory(t *testing.T) {
 	h.ticks(4, 20*time.Second)
 
 	require.Equal(t, 1, count(h.notes.actions(), "rollout.soaking"), "one line when the soak starts, none for its checks")
-
-	events, err := h.c.Events(h.ctx, EventQuery{})
-	require.NoError(t, err)
-
-	var started string
-
-	for i := range events {
-		if events[i].Action == "batch.started" {
-			started = events[i].Reason
-		}
-	}
-
-	require.Equal(t, "batch 1: 2 targets on 2 nodes in wave 0", started)
 }

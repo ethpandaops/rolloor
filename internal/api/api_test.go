@@ -29,6 +29,11 @@ const (
 	d2 = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
 )
 
+const (
+	foreignOrigin = "https://evil.example"
+	mediaText     = "text/plain"
+)
+
 var errFake = errors.New("fake")
 
 const admin = "sam"
@@ -395,6 +400,110 @@ func TestAuthorization(t *testing.T) {
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, "yes", resp.Header.Get("X-Middleware"))
+}
+
+// act posts a verb with extra headers and returns the status and body.
+func (f *fixture) act(verb, body string, header map[string]string) (int, map[string]any) {
+	f.t.Helper()
+
+	req, err := http.NewRequestWithContext(f.ctx, http.MethodPost, f.srv.URL+"/api/v1/actions/"+verb, strings.NewReader(body))
+	require.NoError(f.t, err)
+
+	for k, v := range header {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(f.t, err)
+
+	defer resp.Body.Close()
+
+	out := map[string]any{}
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+
+	return resp.StatusCode, out
+}
+
+func TestSessionActionsMustComeFromThisSiteAsJSON(t *testing.T) {
+	f := newFixture(t)
+	f.release()
+
+	f.auth.id = Identity{Name: admin, Admin: true, Session: true}
+
+	// Every verb refuses a cookie session from elsewhere, or one that does not
+	// declare JSON, before reading the body, and nothing happens.
+	body := `{"selector": "client=a", "rollout": "r-1", "reason": "x"}`
+
+	for _, verb := range []string{"sync", "refresh", "suspend", "resume", "pause", "promote", "abort", "retry"} {
+		code, _ := f.act(verb, body, map[string]string{headerOrigin: foreignOrigin, headerContentType: mediaJSON})
+		require.Equal(t, http.StatusForbidden, code, verb)
+
+		code, _ = f.act(verb, body, map[string]string{headerOrigin: f.srv.URL, headerContentType: mediaText})
+		require.Equal(t, http.StatusUnsupportedMediaType, code, verb)
+	}
+
+	r1, ok := f.c.Rollout("r-1")
+	require.True(t, ok)
+	require.False(t, r1.PausePending)
+	require.Empty(t, f.c.Suspensions())
+
+	for name, h := range map[string]map[string]string{
+		"no origin at all":            {headerContentType: mediaJSON},
+		"a script without an origin":  {headerContentType: mediaJSON, "Authorization": "Basic c2FtOng="},
+		"another site's referer":      {headerReferer: foreignOrigin + "/page", headerContentType: mediaJSON},
+		"cross-site despite origin":   {headerFetchSite: fetchCrossSite, headerOrigin: f.srv.URL, headerContentType: mediaJSON},
+		"a sibling subdomain":         {headerFetchSite: "same-site", headerContentType: mediaJSON},
+		"this site, another origin":   {headerFetchSite: fetchSameOrigin, headerOrigin: foreignOrigin, headerContentType: mediaJSON},
+		"an origin that is not a URL": {headerOrigin: "http://[::1", headerContentType: mediaJSON},
+	} {
+		code, _ := f.act("refresh", "", h)
+		require.Equal(t, http.StatusForbidden, code, name)
+	}
+
+	// From this site, the body must be declared JSON: a form or text post is
+	// what a page elsewhere could send without asking first.
+	for name, h := range map[string]map[string]string{
+		"no content type":    {headerOrigin: f.srv.URL},
+		"a form":             {headerFetchSite: fetchSameOrigin, headerContentType: "application/x-www-form-urlencoded"},
+		"a multipart form":   {headerFetchSite: fetchSameOrigin, headerContentType: "multipart/form-data; boundary=x"},
+		"json-ish but not":   {headerFetchSite: fetchSameOrigin, headerContentType: "application/json-seq"},
+		"a broken parameter": {headerFetchSite: fetchSameOrigin, headerContentType: "application/json; ="},
+	} {
+		code, _ := f.act("refresh", "{}", h)
+		require.Equal(t, http.StatusUnsupportedMediaType, code, name)
+	}
+
+	// Same-origin JSON, with parameters, from any of the signals, acts.
+	for name, h := range map[string]map[string]string{
+		"fetch metadata":       {headerFetchSite: fetchSameOrigin, headerContentType: mediaJSON},
+		"typed into the bar":   {headerFetchSite: fetchUserInitiated, headerContentType: "Application/JSON"},
+		"origin with charset":  {headerOrigin: f.srv.URL, headerContentType: "application/json; charset=utf-8"},
+		"referer on this host": {headerReferer: f.srv.URL + "/rollouts/r-1", headerContentType: mediaJSON},
+	} {
+		code, out := f.act("refresh", "", h)
+		require.Equal(t, http.StatusOK, code, name)
+		require.Equal(t, "refreshing", out["status"], name)
+	}
+
+	code, out := f.act("pause", `{"rollout": "r-1"}`, map[string]string{headerFetchSite: fetchSameOrigin, headerContentType: mediaJSON})
+	require.Equal(t, http.StatusOK, code)
+	require.Equal(t, true, out["pausePending"])
+
+	// A caller the authorizer turned away is a 401 whatever it sent.
+	f.auth.err = errFake
+	code, _ = f.act("refresh", "", map[string]string{headerOrigin: foreignOrigin})
+	require.Equal(t, http.StatusUnauthorized, code)
+
+	// A verified token is not a browser session: it acts from anywhere, with
+	// any declared type.
+	f.auth.err = nil
+	f.auth.id = Identity{Name: admin, Admin: true}
+	code, _ = f.act("suspend", `{"selector": "client=b", "reason": "x"}`, map[string]string{headerOrigin: foreignOrigin, headerContentType: mediaText})
+	require.Equal(t, http.StatusOK, code)
+	require.Len(t, f.c.Suspensions(), 1)
+
+	code, _ = f.act("refresh", "", nil)
+	require.Equal(t, http.StatusOK, code)
 }
 
 func TestMayActAndOpenAccess(t *testing.T) {

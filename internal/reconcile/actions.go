@@ -63,6 +63,10 @@ func (c *Controller) Sync(ctx context.Context, req SyncRequest) ([]string, error
 	var started []string
 
 	for group := range groups {
+		if err := c.writeOwed(ctx); err != nil {
+			return started, err
+		}
+
 		if _, aborted := c.aborted[group]; aborted {
 			delete(c.aborted, group)
 
@@ -107,7 +111,7 @@ func (c *Controller) Sync(ctx context.Context, req SyncRequest) ([]string, error
 
 		if created {
 			c.rollouts[r.ID] = r
-			c.event(ctx, now, &Event{Actor: req.Actor, Action: "rollout.created", Group: group, Rollout: r.ID,
+			c.event(ctx, now, &Event{Actor: req.Actor, Action: eventRolloutCreated, Group: group, Rollout: r.ID,
 				Reason: fmt.Sprintf("%d targets to %s (%s)", len(r.Targets), r.DigestShort(), strategyLabel(r.Strategy))})
 		}
 
@@ -399,8 +403,8 @@ func (c *Controller) Retry(ctx context.Context, actor, rolloutID, reason string)
 			}
 
 			*rt = RolloutTarget{
-				ID: rt.ID, Node: rt.Node, Wave: rt.Wave, Phase: PhasePending, Reason: "waiting to be retried",
-				NotReadyBefore: rt.NotReadyBefore, HoldUntil: hold, Retried: true,
+				ID: rt.ID, Node: rt.Node, Image: rt.Image, Wave: rt.Wave, Phase: PhasePending, Reason: "waiting to be retried",
+				NotReadyBefore: rt.NotReadyBefore, NodeWeight: rt.NodeWeight, HoldUntil: hold, Retried: true,
 			}
 		}
 

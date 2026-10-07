@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/ethpandaops/rolloor/internal/api"
 )
 
 const (
@@ -31,8 +33,9 @@ type codec struct {
 	key []byte
 }
 
-// encode returns base64(payload).base64(mac).
-func (c codec) encode(v any) (string, error) {
+// encode returns base64(payload).base64(mac). The mac covers the cookie's name,
+// so a value signed for one cookie is never accepted as another.
+func (c codec) encode(name string, v any) (string, error) {
 	raw, err := json.Marshal(v)
 	if err != nil {
 		return "", err
@@ -40,13 +43,13 @@ func (c codec) encode(v any) (string, error) {
 
 	payload := base64.RawURLEncoding.EncodeToString(raw)
 
-	return payload + "." + c.sign(payload), nil
+	return payload + "." + c.sign(name, payload), nil
 }
 
-// decode verifies the signature and unmarshals the payload.
-func (c codec) decode(s string, v any) error {
+// decode verifies the signature for the named cookie and unmarshals the payload.
+func (c codec) decode(name, s string, v any) error {
 	payload, mac, ok := strings.Cut(s, ".")
-	if !ok || !hmac.Equal([]byte(mac), []byte(c.sign(payload))) {
+	if !ok || !hmac.Equal([]byte(mac), []byte(c.sign(name, payload))) {
 		return errBadSession
 	}
 
@@ -62,8 +65,10 @@ func (c codec) decode(s string, v any) error {
 	return nil
 }
 
-func (c codec) sign(payload string) string {
+func (c codec) sign(name, payload string) string {
 	h := hmac.New(sha256.New, c.key)
+	h.Write([]byte(name))
+	h.Write([]byte{'.'})
 	h.Write([]byte(payload))
 
 	return base64.RawURLEncoding.EncodeToString(h.Sum(nil))
@@ -81,16 +86,10 @@ func randomToken() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(b[:]), nil
 }
 
-// secure reports whether the request arrived over TLS, directly or through
-// a proxy that says so.
-func secure(r *http.Request) bool {
-	return r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
-}
-
 func setCookie(w http.ResponseWriter, r *http.Request, name, value string, maxAge int) {
 	//nolint:gosec // Secure follows the request scheme so local plain-http runs still work; production is TLS.
 	http.SetCookie(w, &http.Cookie{
 		Name: name, Value: value, Path: "/", MaxAge: maxAge,
-		HttpOnly: true, Secure: secure(r), SameSite: http.SameSiteLaxMode,
+		HttpOnly: true, Secure: api.Secure(r), SameSite: http.SameSiteLaxMode,
 	})
 }

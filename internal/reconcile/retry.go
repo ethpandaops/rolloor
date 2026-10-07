@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/ethpandaops/rolloor/internal/config"
-	"github.com/ethpandaops/rolloor/internal/targets"
 )
 
 func retryBackoff(b config.Backoff, attempt int) time.Duration {
@@ -48,13 +47,13 @@ func updateDeadlineReason(now time.Time, rt *RolloutTarget, st *config.Strategy,
 	return fmt.Sprintf("did not reach %s within %s", shortDigest(desired), st.ProgressDeadline)
 }
 
-func (c *Controller) updateJob(now time.Time, r *Rollout, rt *RolloutTarget, set *targets.Set, t *targets.Target) job {
-	j := job{rollout: r.ID, target: rt.ID, hook: config.HookUpdate, program: c.programFor(t, config.HookUpdate), input: c.hookInput(set, t), retryAt: rt.RetryAt}
+// updateJob plans an update; dispatch counts the attempt once it is sure to run.
+func (c *Controller) updateJob(now time.Time, r *Rollout, rt *RolloutTarget) job {
+	j := job{rollout: r.ID, target: rt.ID, hook: config.HookUpdate, retryAt: rt.RetryAt, batch: rt.Batch, attempts: rt.UpdateAttempts}
 	if rt.UpdateAttempts == 0 {
 		rt.UpdatedAt = now
 	}
 
-	rt.UpdateAttempts++
 	rt.RetryAt = time.Time{}
 	rt.Reason = "update running"
 

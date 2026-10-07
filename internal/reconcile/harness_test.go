@@ -47,9 +47,11 @@ const (
 	soakA = "soak-a"
 	soakB = "soak-b"
 
-	groupLabel = "client"
-	careful    = "careful"
-	boom       = "boom"
+	groupLabel        = "client"
+	careful           = "careful"
+	boom              = "boom"
+	debugReason       = "debugging"
+	maintenanceReason = "maintenance"
 )
 
 const testConfig = `
@@ -337,7 +339,7 @@ type harness struct {
 	notes         *notes
 	c             *Controller
 	ids           int
-	admission     map[string]bool
+	admission     map[string]float64
 	admissionUsed float64
 	// setMu guards set for tests that swap it while programs are running.
 	setMu sync.Mutex
@@ -493,19 +495,20 @@ func (h *harness) phases(r RolloutView) map[string]TargetPhase {
 	return out
 }
 
-// unavailable sums the independent oracle's unavailable nodes and the weight
-// the configured budget allows.
+// unavailable sums the independent oracle's unavailable nodes, each at least
+// the weight its rollout targets recorded at admission, and the weight the
+// configured budget allows.
 func (h *harness) unavailable() (used, allowed float64) {
 	set := h.current()
 
-	for node := range h.oracleUnavailable() {
-		used += set.NodeWeight(node)
+	for node, least := range h.oracleUnavailable() {
+		used += max(set.NodeWeight(node), least)
 	}
 
 	return used, h.cfg.DisruptionBudget.MaxUnavailable.OfWeight(set.TotalWeight())
 }
 
-func (h *harness) oracleUnavailable() map[string]bool {
+func (h *harness) oracleUnavailable() map[string]float64 {
 	set, now := h.current(), h.clock.Now()
 
 	h.c.mu.RLock()
@@ -514,13 +517,13 @@ func (h *harness) oracleUnavailable() map[string]bool {
 	return h.oracleUnavailableLocked(set, now, "", nil)
 }
 
-func (h *harness) oracleUnavailableLocked(set *targets.Set, now time.Time, changed string, before *Rollout) map[string]bool {
-	nodes := map[string]bool{}
+func (h *harness) oracleUnavailableLocked(set *targets.Set, now time.Time, changed string, before *Rollout) map[string]float64 {
+	nodes := map[string]float64{}
 
 	for _, t := range set.Targets {
 		probe := h.c.live[t.ID].Readiness
 		if !probe.Ready || probe.ProbedAt.IsZero() {
-			nodes[t.Node] = true
+			nodes[t.Node] = 0
 		}
 	}
 
@@ -539,17 +542,18 @@ func (h *harness) oracleUnavailableLocked(set *targets.Set, now time.Time, chang
 	return nodes
 }
 
-func (h *harness) oracleRolloutUnavailableLocked(set *targets.Set, now time.Time, r *Rollout, nodes map[string]bool) {
+func (h *harness) oracleRolloutUnavailableLocked(set *targets.Set, now time.Time, r *Rollout, nodes map[string]float64) {
 	for _, rt := range r.Targets {
 		t, present := set.Get(rt.ID)
 		live := h.c.live[rt.ID]
 		probe := live.Readiness
 		known := !live.SeenAt.IsZero() && live.Failures < h.cfg.Inspect.FailureThreshold
-		observedReady := present && known && live.Digest == r.Desired[t.Image] && probe.Ready && probe.LastSuccessAt.After(live.DigestSince) && probe.LastSuccessAt.After(rt.UpdatedAt)
-		forced := present && r.Force && rt.Updated && (rt.Phase == PhaseReady || rt.Phase == PhasePassed) && (!probe.Ready || !probe.LastSuccessAt.After(rt.DigestSeenAt))
+		sameTarget := present && t.Node == rt.Node && t.Image == rt.Image
+		observedReady := sameTarget && known && live.Digest == r.Desired[rt.Image] && probe.Ready && probe.LastSuccessAt.After(live.DigestSince) && probe.LastSuccessAt.After(rt.UpdatedAt)
+		forced := sameTarget && r.Force && rt.Updated && (rt.Phase == PhaseReady || rt.Phase == PhasePassed) && (!probe.Ready || rt.DigestSeenAt.IsZero() || !probe.LastSuccessAt.After(rt.DigestSeenAt))
 
 		if (now.Before(rt.HoldUntil) || forced) && !observedReady {
-			nodes[rt.Node] = true
+			nodes[rt.Node] = max(nodes[rt.Node], rt.NodeWeight)
 		}
 
 		b := r.CurrentBatch()
@@ -558,7 +562,7 @@ func (h *harness) oracleRolloutUnavailableLocked(set *targets.Set, now time.Time
 		}
 
 		if !present || !rt.Updated || !probe.Ready || !probe.LastSuccessAt.After(rt.DigestSeenAt) {
-			nodes[rt.Node] = true
+			nodes[rt.Node] = max(nodes[rt.Node], rt.NodeWeight)
 		}
 	}
 }

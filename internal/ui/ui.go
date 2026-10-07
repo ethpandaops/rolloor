@@ -463,7 +463,7 @@ func (s *Server) action(w http.ResponseWriter, r *http.Request) {
 
 	// A form post rides on the session cookie, so it must come from this
 	// site: a page elsewhere cannot make the browser act for the viewer.
-	if !sameOrigin(r) {
+	if !api.SameOrigin(r) {
 		http.Error(w, "cross-site request refused", http.StatusForbidden)
 
 		return
@@ -509,35 +509,12 @@ func returnPath(next string) *url.URL {
 	return u
 }
 
-// sameOrigin reports whether a request was sent by a page on this host.
-// Browsers set Sec-Fetch-Site on every request and Origin on form posts;
-// a request with neither (an old client, or a script) falls back to Referer.
-func sameOrigin(r *http.Request) bool {
-	switch r.Header.Get("Sec-Fetch-Site") {
-	case "same-origin", "none":
-		return true
-	case "cross-site", "same-site":
-		return false
-	}
-
-	for _, h := range []string{headerOrigin, "Referer"} {
-		if v := r.Header.Get(h); v != "" {
-			u, err := url.Parse(v)
-
-			return err == nil && u.Host == r.Host
-		}
-	}
-
-	return false
-}
-
 var errForbidden = errors.New("not allowed")
 
 // checked is what a browser sends for a ticked checkbox.
 const (
-	checked      = "on"
-	headerOrigin = "Origin"
-	verbSync     = "sync"
+	checked  = "on"
+	verbSync = "sync"
 )
 
 func (s *Server) perform(r *http.Request, id *api.Identity) (string, error) {

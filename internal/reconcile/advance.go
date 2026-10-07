@@ -25,6 +25,10 @@ type job struct {
 	retryAt time.Time
 	// soakIDs are the batch targets a soak job speaks for.
 	soakIDs []string
+	// batch and attempts identify the update the plan wanted, so dispatch can
+	// tell whether it is still wanted.
+	batch    int
+	attempts int
 }
 
 // soakInput is what the soak hook receives on stdin.
@@ -41,12 +45,14 @@ type soakRollout struct {
 	Wave  int    `json:"wave"`
 }
 
-// outcome is a job with its result and when it started.
+// outcome is a job with its result and when it started. A withdrawn job never
+// ran.
 type outcome struct {
 	job
-	res     hooks.Result
-	err     error
-	started time.Time
+	res       hooks.Result
+	err       error
+	started   time.Time
+	withdrawn bool
 }
 
 // planRollouts decides, under the lock, which hooks to run for every active
@@ -64,6 +70,10 @@ func (c *Controller) planRollouts(ctx context.Context, now time.Time) []job {
 	sort.Strings(ids)
 
 	for _, id := range ids {
+		if c.dirty {
+			break
+		}
+
 		r := c.rollouts[id]
 		if !r.State.Active() {
 			continue
@@ -85,7 +95,7 @@ func (c *Controller) planRollout(ctx context.Context, now time.Time, r *Rollout,
 		if r.CurrentBatch() == nil {
 			c.startBatch(ctx, now, r, set)
 
-			if r.CurrentBatch() == nil {
+			if c.dirty || r.CurrentBatch() == nil {
 				return nil
 			}
 		}
@@ -96,8 +106,8 @@ func (c *Controller) planRollout(ctx context.Context, now time.Time, r *Rollout,
 	}
 }
 
-// planBatch dispatches updates and reads the independent observations.
-// Ineligible targets are skipped where they are.
+// planBatch plans updates and reads the independent observations. Ineligible
+// targets leave the batch where they are.
 func (c *Controller) planBatch(ctx context.Context, now time.Time, r *Rollout, set *targets.Set) []job {
 	b := r.CurrentBatch()
 	st := c.strategy(r.Strategy)
@@ -112,7 +122,8 @@ func (c *Controller) planBatch(ctx context.Context, now time.Time, r *Rollout, s
 
 		t, ok := set.Get(id)
 		if reason, skip := c.skipReason(r, set, &t, ok); skip && (rt.Phase == PhasePending || rt.Phase == PhaseUpdating) {
-			rt.Phase, rt.Reason = PhaseSkipped, reason
+			c.leave(now, r, rt, PhaseSkipped, reason)
+
 			skipped = true
 
 			continue
@@ -150,7 +161,7 @@ func (c *Controller) planBatch(ctx context.Context, now time.Time, r *Rollout, s
 				return nil
 			}
 
-			jobs = append(jobs, c.updateJob(now, r, rt, set, &t))
+			jobs = append(jobs, c.updateJob(now, r, rt))
 		case PhaseUpdating:
 			live, known := c.liveKnown(id)
 			if known && live == r.Desired[t.Image] && rt.UpdateDone {
@@ -187,7 +198,7 @@ func (c *Controller) planBatch(ctx context.Context, now time.Time, r *Rollout, s
 				if now.Before(rt.RetryAt) {
 					rt.Reason = fmt.Sprintf("%s; retrying in %s", updateFailure(rt, &st), rt.RetryAt.Sub(now).Round(time.Second))
 				} else {
-					jobs = append(jobs, c.updateJob(now, r, rt, set, &t))
+					jobs = append(jobs, c.updateJob(now, r, rt))
 				}
 
 				continue
@@ -225,11 +236,12 @@ func (c *Controller) skipReason(r *Rollout, set *targets.Set, t *targets.Target,
 		return "moved to group " + set.Group(t), true
 	}
 
-	if rt := r.target(t.ID); rt != nil && rt.Node != t.Node {
+	rt := r.target(t.ID)
+	if rt != nil && rt.Node != t.Node {
 		return "moved to node " + t.Node, true
 	}
 
-	if _, known := r.Desired[t.Image]; !known {
+	if _, known := r.Desired[t.Image]; !known || (rt != nil && rt.Image != t.Image) {
 		return "image changed to " + t.Image, true
 	}
 
@@ -240,10 +252,8 @@ func (c *Controller) skipReason(r *Rollout, set *targets.Set, t *targets.Target,
 	return "", false
 }
 
-// saveSkips writes a rollout whose open batch just skipped targets. A skip
-// frees its node for batches cut later in the same tick, so it must reach the
-// store before they do, or a crash between the two writes would restart with
-// both counted.
+// saveSkips stores changed reservations before later batch admissions.
+// Dispatched targets retain holds; undispatched skips may release weight.
 func (c *Controller) saveSkips(ctx context.Context, r *Rollout, skipped bool) {
 	if skipped {
 		_ = c.saveRollout(ctx, r)
@@ -325,7 +335,8 @@ func (c *Controller) planSoak(ctx context.Context, now time.Time, r *Rollout, se
 
 		t, ok := set.Get(id)
 		if reason, skip := c.skipReason(r, set, &t, ok); skip {
-			rt.Phase, rt.Reason = PhaseSkipped, reason
+			c.leave(now, r, rt, PhaseSkipped, reason)
+
 			skipped = true
 
 			continue
@@ -406,7 +417,7 @@ func (c *Controller) passBatch(ctx context.Context, now time.Time, r *Rollout, w
 	for _, id := range b.Targets {
 		rt := r.target(id)
 		if rt.Phase == PhaseReady {
-			rt.Phase, rt.Reason = PhasePassed, why
+			c.leave(now, r, rt, PhasePassed, why)
 		}
 
 		if _, was := c.degraded[id]; was && rt.Phase == PhasePassed {
@@ -468,10 +479,7 @@ func (c *Controller) halt(ctx context.Context, now time.Time, r *Rollout, culpri
 			reason = "in the halted batch"
 		}
 
-		rt.Phase, rt.Reason = PhaseFailed, reason
-		if !c.readyOnBuild(rt) {
-			rt.HoldUntil = now.Add(c.strategy(r.Strategy).ProgressDeadline)
-		}
+		c.leave(now, r, rt, PhaseFailed, reason)
 
 		c.degraded[id] = reason
 		_ = c.persist(ctx, c.store.SaveDegraded(ctx, id, reason))
@@ -485,28 +493,109 @@ func (c *Controller) halt(ctx context.Context, now time.Time, r *Rollout, culpri
 	c.setState(ctx, now, r, Halted, msg)
 }
 
-// withdraw takes back jobs that will not run: a target whose update was
-// about to be dispatched waits for it again, as after a restart.
+// storeWait is why an update waits after the store refused a decision.
+const storeWait = "waiting for the store before running the update"
+
+// withdraw takes back the updates of jobs that will not run.
 func (c *Controller) withdraw(jobs []job) {
 	for i := range jobs {
-		j := &jobs[i]
-		if j.hook != config.HookUpdate {
-			continue
-		}
-
-		if rt := c.rollouts[j.rollout].target(j.target); rt.Phase == PhaseUpdating && !rt.UpdateDone {
-			rt.Phase, rt.Reason = PhasePending, "waiting for the store before running the update"
-			rt.UpdateAttempts--
-			rt.RetryAt = j.retryAt
-
-			if rt.UpdateAttempts == 0 {
-				rt.UpdatedAt = time.Time{}
-			}
+		if jobs[i].hook == config.HookUpdate {
+			c.withdrawUpdate(&jobs[i], storeWait)
 		}
 	}
 }
 
-// execute runs jobs concurrently outside the lock.
+// withdrawUpdate puts a target whose planned update will not run back to
+// waiting for it, as after a restart; attempts already dispatched still count.
+// It returns the rollout it changed, if any.
+func (c *Controller) withdrawUpdate(j *job, why string) *Rollout {
+	r := c.rollouts[j.rollout]
+
+	rt := r.target(j.target)
+	if rt.Phase != PhaseUpdating || rt.UpdateDone || rt.UpdateAttempts != j.attempts {
+		return nil
+	}
+
+	rt.Phase, rt.Reason = PhasePending, why
+	rt.RetryAt = j.retryAt
+
+	if rt.UpdateAttempts == 0 {
+		rt.UpdatedAt = time.Time{}
+	}
+
+	return r
+}
+
+// dispatch decides under the lock, just before the program runs, whether a
+// planned update is still wanted, and stores the attempt first so a restart
+// knows it may have landed. An unwanted update is withdrawn instead.
+func (c *Controller) dispatch(ctx context.Context, j *job) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	set := c.targets()
+
+	why := c.staleUpdate(set, j)
+	if why == "" && c.dirty {
+		why = storeWait
+	}
+
+	if why == "" {
+		r := c.rollouts[j.rollout]
+		rt := r.target(j.target)
+		t, _ := set.Get(j.target)
+
+		rt.UpdateAttempts++
+
+		if c.saveRollout(ctx, r) == nil {
+			j.program, j.input = c.programFor(&t, config.HookUpdate), c.hookInput(set, &t)
+
+			return true
+		}
+
+		rt.UpdateAttempts--
+		why = storeWait
+	}
+
+	if r := c.withdrawUpdate(j, why); r != nil && !c.dirty {
+		_ = c.saveRollout(ctx, r)
+	}
+
+	return false
+}
+
+// staleUpdate says why a planned update no longer belongs to its rollout's
+// open batch, or "" while it does.
+func (c *Controller) staleUpdate(set *targets.Set, j *job) string {
+	r := c.rollouts[j.rollout]
+	if r.State != Running {
+		return "update withdrawn: the rollout stopped running"
+	}
+
+	// Only the attempt the plan made may run, and only while its batch is open.
+	b, rt := r.CurrentBatch(), r.target(j.target)
+	if b == nil || b.Number != j.batch || rt.Phase != PhaseUpdating || rt.UpdateDone || rt.UpdateAttempts != j.attempts {
+		return "update withdrawn: no longer waiting for it"
+	}
+
+	t, present := set.Get(j.target)
+	if reason, skip := c.skipReason(r, set, &t, present); skip {
+		return "update withdrawn: " + reason
+	}
+
+	if r.GroupDesiredKey != c.groupDesiredKey(r.Group, set) {
+		return "update withdrawn: group desired images changed"
+	}
+
+	if live, known := c.liveKnown(j.target); known && live == r.Desired[t.Image] {
+		return "update withdrawn: already observed on the desired digest"
+	}
+
+	return ""
+}
+
+// execute runs jobs concurrently outside the lock; an update runs only once
+// dispatch has validated and stored it.
 func (c *Controller) execute(ctx context.Context, jobs []job) []outcome {
 	out := make([]outcome, len(jobs))
 
@@ -519,6 +608,14 @@ func (c *Controller) execute(ctx context.Context, jobs []job) []outcome {
 		j := &jobs[i]
 
 		g.Go(func() error {
+			if j.hook == config.HookUpdate && !c.dispatch(gctx, j) {
+				mu.Lock()
+				out[i] = outcome{job: *j, withdrawn: true}
+				mu.Unlock()
+
+				return nil
+			}
+
 			started := c.clock.Now()
 			res, err := c.runner.Run(gctx, j.program, j.hook, j.target, j.input)
 
@@ -535,15 +632,18 @@ func (c *Controller) execute(ctx context.Context, jobs []job) []outcome {
 	return out
 }
 
-// applyResults folds hook outcomes back into rollout state. A result for a
-// rollout that has since closed, or a target that has since been skipped, is
-// dropped.
+// applyResults folds hook outcomes back into rollout state. A withdrawn job,
+// a result for a rollout that has since closed, or one for a target that has
+// since been skipped, is dropped.
 func (c *Controller) applyResults(ctx context.Context, now time.Time, results []outcome) {
 	touched := map[string]*Rollout{}
 	soaks := map[string][]outcome{}
 
 	for i := range results {
 		o := &results[i]
+		if o.withdrawn {
+			continue
+		}
 
 		r, ok := c.rollouts[o.rollout]
 		if !ok || !r.State.Active() {
@@ -592,7 +692,7 @@ func (c *Controller) applyTargetResult(ctx context.Context, now time.Time, r *Ro
 	// its result neither advances nor halts the batch.
 	t, present := c.targets().Get(o.target)
 	if reason, skip := c.skipReason(r, c.targets(), &t, present); skip {
-		rt.Phase, rt.Reason = PhaseSkipped, reason
+		c.leave(now, r, rt, PhaseSkipped, reason)
 
 		return
 	}
@@ -606,6 +706,10 @@ func (c *Controller) applyTargetResult(ctx context.Context, now time.Time, r *Ro
 	rt.UpdateDone, rt.Reason = true, "update started, waiting for the digest"
 	rt.RetryAt = time.Time{}
 	rt.UpdateError = ""
+
+	// The update may land at once, so it earns one observation that does not
+	// wait for the probe spacing.
+	c.probes.kick(rt.ID)
 }
 
 // applySoak folds one check's program results into the soak progress.

@@ -18,6 +18,10 @@ func (c *Controller) supersedeChangedRollouts(ctx context.Context, now time.Time
 	set := c.targets()
 
 	for _, r := range c.rollouts {
+		if c.dirty {
+			break
+		}
+
 		if !r.State.Active() {
 			continue
 		}
@@ -52,9 +56,8 @@ func (c *Controller) clearRolloutQuarantine(ctx context.Context, r *Rollout) {
 	}
 }
 
-// end is the in-memory part of finishing. A target whose update was
-// dispatched keeps its node counted against the budget for as long as that
-// update could still be landing.
+// end is the in-memory part of finishing. Targets still in the open batch
+// leave it, keeping their nodes held while an update could still be landing.
 func (c *Controller) end(now time.Time, r *Rollout, state RolloutState, reason string) {
 	r.State = state
 	r.Reason = reason
@@ -63,17 +66,27 @@ func (c *Controller) end(now time.Time, r *Rollout, state RolloutState, reason s
 
 	for i := range r.Targets {
 		rt := &r.Targets[i]
-		if rt.Phase != PhaseUpdating && rt.Phase != PhaseReady {
+		interrupted := rt.Phase == PhasePending && rt.UpdateAttempts > 0
+
+		if rt.Phase != PhaseUpdating && rt.Phase != PhaseReady && !interrupted {
 			continue
 		}
 
-		if !c.readyOnBuild(rt) {
-			rt.HoldUntil = now.Add(c.strategy(r.Strategy).ProgressDeadline)
-		}
-
-		rt.Phase = PhaseSkipped
-		rt.Reason = string(state)
+		c.leave(now, r, rt, PhaseSkipped, string(state))
 	}
+}
+
+// leave takes a target out of its batch. One sent an update, or counted ready
+// without being seen so, keeps its node held until it is seen ready on this
+// rollout's build or the rollout's progress deadline passes.
+func (c *Controller) leave(now time.Time, r *Rollout, rt *RolloutTarget, phase TargetPhase, reason string) {
+	if (rt.UpdateAttempts > 0 || rt.Phase == PhaseReady) && !c.heldReady(r, rt) {
+		if hold := now.Add(c.strategy(r.Strategy).ProgressDeadline); hold.After(rt.HoldUntil) {
+			rt.HoldUntil = hold
+		}
+	}
+
+	rt.Phase, rt.Reason = phase, reason
 }
 
 // openRollouts creates a rollout for every group with out-of-sync targets and
@@ -82,6 +95,10 @@ func (c *Controller) openRollouts(ctx context.Context, now time.Time) {
 	set := c.targets()
 
 	for _, group := range set.Groups() {
+		if c.dirty {
+			break
+		}
+
 		if c.activeRollout(group) != nil {
 			continue
 		}
@@ -112,7 +129,7 @@ func (c *Controller) openRollouts(ctx context.Context, now time.Time) {
 
 		c.rollouts[r.ID] = r
 		_ = c.saveRollout(ctx, r)
-		c.event(ctx, now, &Event{Actor: ControllerActor, Action: "rollout.created", Group: group, Rollout: r.ID,
+		c.event(ctx, now, &Event{Actor: ControllerActor, Action: eventRolloutCreated, Group: group, Rollout: r.ID,
 			Reason: fmt.Sprintf("%d targets to %s (%s)", len(eligible), r.DigestShort(), strategyLabel(policy.Strategy))})
 	}
 }
@@ -216,7 +233,7 @@ func (c *Controller) newRollout(now time.Time, group string, policy Policy, elig
 		}
 
 		r.Targets = append(r.Targets, RolloutTarget{
-			ID: t.ID, Node: t.Node, Wave: wave, Phase: PhasePending, NotReadyBefore: !c.targetReady(t.ID),
+			ID: t.ID, Node: t.Node, Image: t.Image, Wave: wave, Phase: PhasePending, NotReadyBefore: !c.targetReady(t.ID),
 		})
 	}
 
@@ -241,25 +258,30 @@ func (c *Controller) newRollout(now time.Time, group string, policy Policy, elig
 }
 
 // unavailableNodes includes observed outages, admitted updates awaiting readiness,
-// and updates that may still land after their operation stopped.
-func (c *Controller) unavailableNodes(now time.Time) map[string]struct{} {
-	nodes := map[string]struct{}{}
+// and dispatched updates that may still land after their target left its batch,
+// each at no less than the weight its rollout targets had at admission.
+func (c *Controller) unavailableNodes(now time.Time) map[string]float64 {
+	nodes := map[string]float64{}
 	set := c.targets()
 
 	for _, t := range set.Targets {
 		if !c.targetReady(t.ID) {
-			nodes[t.Node] = struct{}{}
+			markUnavailable(nodes, t.Node, 0)
 		}
 	}
 
 	for _, r := range c.rollouts {
 		for i := range r.Targets {
 			rt := &r.Targets[i]
-			_, present := set.Get(rt.ID)
-			forced := present && r.Force && rt.Updated && (rt.Phase == PhaseReady || rt.Phase == PhasePassed) && !c.readyOnBuild(rt)
+
+			forced := r.Force && rt.Updated && (rt.Phase == PhaseReady || rt.Phase == PhasePassed)
+			if forced {
+				t, present := set.Get(rt.ID)
+				forced = present && t.Node == rt.Node && t.Image == rt.Image && !c.readyOnBuild(rt)
+			}
 
 			if (now.Before(rt.HoldUntil) || forced) && !c.heldReady(r, rt) {
-				nodes[rt.Node] = struct{}{}
+				markUnavailable(nodes, rt.Node, rt.NodeWeight)
 			}
 		}
 
@@ -271,7 +293,7 @@ func (c *Controller) unavailableNodes(now time.Time) map[string]struct{} {
 		for _, id := range b.Targets {
 			rt := r.target(id)
 			if (rt.Phase == PhasePending || rt.Phase == PhaseUpdating || rt.Phase == PhaseReady) && !c.readyOnBuild(rt) {
-				nodes[rt.Node] = struct{}{}
+				markUnavailable(nodes, rt.Node, rt.NodeWeight)
 			}
 		}
 	}
@@ -279,11 +301,22 @@ func (c *Controller) unavailableNodes(now time.Time) map[string]struct{} {
 	return nodes
 }
 
+// markUnavailable records a node as unavailable, counting at least weight.
+func markUnavailable(nodes map[string]float64, node string, weight float64) {
+	nodes[node] = max(nodes[node], weight)
+}
+
 // unavailableWeight counts each unavailable node's weight once.
 func (c *Controller) unavailableWeight(set *targets.Set) float64 {
+	return weigh(set, c.unavailableNodes(c.clock.Now()))
+}
+
+// weigh sums the nodes' current weights, or the weight recorded for one when
+// that is more.
+func weigh(set *targets.Set, nodes map[string]float64) float64 {
 	var w float64
-	for n := range c.unavailableNodes(c.clock.Now()) {
-		w += set.NodeWeight(n)
+	for n, least := range nodes {
+		w += max(set.NodeWeight(n), least)
 	}
 
 	return w
@@ -329,7 +362,7 @@ func (c *Controller) startBatch(ctx context.Context, now time.Time, r *Rollout, 
 	wave := candidates[0].Wave
 	budget := c.cfg.DisruptionBudget.MaxUnavailable.OfWeight(set.TotalWeight())
 	busy := c.unavailableNodes(now)
-	inflight := c.unavailableWeight(set)
+	inflight := weigh(set, busy)
 
 	// Each admission records whether it added an unavailable node.
 	var (
@@ -381,7 +414,7 @@ func (c *Controller) startBatch(ctx context.Context, now time.Time, r *Rollout, 
 
 	b := Batch{Number: len(r.Batches) + 1, Wave: wave, StartedAt: now, Retried: retry}
 	for _, rt := range picked {
-		rt.Batch, rt.Free = b.Number, nodes[rt.Node]
+		rt.Batch, rt.Free, rt.NodeWeight = b.Number, nodes[rt.Node], set.NodeWeight(rt.Node)
 		b.Targets = append(b.Targets, rt.ID)
 	}
 

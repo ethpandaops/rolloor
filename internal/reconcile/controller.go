@@ -92,6 +92,10 @@ type Controller struct {
 	resolveErrors map[string]string
 	targetsError  string
 	nextEventID   int64
+	pendingEvents []Event
+	lastInspect   time.Time
+	lastProbe     time.Time
+	probes        probePacer
 
 	nudge chan struct{}
 }
@@ -262,6 +266,14 @@ func (c *Controller) Nudge() {
 func (c *Controller) Tick(ctx context.Context) error {
 	now := c.clock.Now()
 
+	c.mu.Lock()
+	stored := c.flush(ctx)
+	c.mu.Unlock()
+
+	if !stored {
+		return ctx.Err()
+	}
+
 	if err := c.resolveIfDue(ctx, now); err != nil {
 		return err
 	}
@@ -363,6 +375,10 @@ func (c *Controller) resolveAll(ctx context.Context, now time.Time) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if err := c.writeOwed(ctx); err != nil {
+		return err
+	}
+
 	c.lastResolve = now
 
 	for img, res := range resolved {
@@ -424,6 +440,10 @@ func (c *Controller) ReportTargetsError(ctx context.Context, err error) {
 
 func (c *Controller) expireSuspensions(ctx context.Context, now time.Time) {
 	for id, s := range c.suspensions {
+		if c.dirty {
+			break
+		}
+
 		if !now.Before(s.ExpiresAt) {
 			delete(c.suspensions, id)
 			_ = c.persist(ctx, c.store.DeleteSuspension(ctx, id))
@@ -432,17 +452,42 @@ func (c *Controller) expireSuspensions(ctx context.Context, now time.Time) {
 	}
 }
 
-// event records one line of history and tells listeners.
+// event queues history until its write succeeds; listeners see durable events.
 func (c *Controller) event(ctx context.Context, now time.Time, e *Event) {
 	e.ID = c.nextEventID
 	e.At = now
 	c.nextEventID++
 
-	_ = c.persist(ctx, c.store.AppendEvent(ctx, e))
+	if !c.dirty && len(c.pendingEvents) == 0 {
+		if err := c.persist(ctx, c.store.AppendEvent(ctx, e)); err == nil {
+			if c.notifier != nil {
+				c.notifier.Publish(e)
+			}
 
-	if c.notifier != nil {
-		c.notifier.Publish(e)
+			return
+		}
 	}
+
+	c.pendingEvents = append(c.pendingEvents, *e)
+}
+
+func (c *Controller) flushEvents(ctx context.Context) error {
+	for len(c.pendingEvents) > 0 {
+		e := &c.pendingEvents[0]
+		if err := c.persist(ctx, c.store.AppendEvent(ctx, e)); err != nil {
+			return err
+		}
+
+		if c.notifier != nil {
+			c.notifier.Publish(e)
+		}
+
+		c.pendingEvents = c.pendingEvents[1:]
+	}
+
+	c.pendingEvents = nil
+
+	return nil
 }
 
 // persist logs a store failure, marks the state dirty and returns it. A
@@ -468,6 +513,9 @@ func (c *Controller) flush(ctx context.Context) bool {
 	c.dirty = false
 
 	_ = c.persist(ctx, c.store.ReplaceDecisions(ctx, c.decisions()))
+	if !c.dirty {
+		_ = c.flushEvents(ctx)
+	}
 
 	if c.dirty {
 		c.log.WithContext(ctx).Warn("store still failing; no programs run this tick")
@@ -488,6 +536,10 @@ func (c *Controller) writeOwed(ctx context.Context) error {
 
 	if err := c.persist(ctx, c.store.ReplaceDecisions(ctx, c.decisions())); err != nil {
 		return fmt.Errorf("earlier decisions are still not stored, so nothing was changed: %w", err)
+	}
+
+	if err := c.flushEvents(ctx); err != nil {
+		return fmt.Errorf("earlier history is still not stored, so nothing was changed: %w", err)
 	}
 
 	return nil
@@ -573,12 +625,14 @@ func (c *Controller) setLiveLocked(ctx context.Context, now, observedAt time.Tim
 	return true
 }
 
-// InspectAll runs the inspect hook for every target and records the result.
+// InspectAll runs the inspect hook for every target now and records the result.
 func (c *Controller) InspectAll(ctx context.Context) {
-	c.observeTargets(ctx, c.targets().Targets, config.HookInspect)
+	c.observeTargets(ctx, c.targets().Targets, config.HookInspect, false)
 }
 
-func (c *Controller) observeTargets(ctx context.Context, ts []targets.Target, hook string) {
+// observeTargets runs hook for ts. Every observation counts toward the probe
+// spacing; a paced pass skips a target the hook began observing too recently.
+func (c *Controller) observeTargets(ctx context.Context, ts []targets.Target, hook string, paced bool) {
 	if hook == config.HookReady {
 		c.probeMu.Lock()
 		defer c.probeMu.Unlock()
@@ -602,7 +656,20 @@ func (c *Controller) observeTargets(ctx context.Context, ts []targets.Target, ho
 		in := inputs[i]
 
 		g.Go(func() error {
+			c.mu.Lock()
 			started := c.clock.Now()
+			run := !paced || c.probes.due(hook, t.ID, started)
+
+			if run {
+				c.probes.begin(hook, t.ID, started)
+			}
+
+			c.mu.Unlock()
+
+			if !run {
+				return nil
+			}
+
 			res, err := c.runner.Run(gctx, c.programFor(t, hook), hook, t.ID, in)
 
 			if hook == config.HookReady && gctx.Err() != nil {
@@ -633,13 +700,27 @@ func (c *Controller) observeTargets(ctx context.Context, ts []targets.Target, ho
 	}
 
 	_ = g.Wait()
+
+	c.mu.Lock()
+
+	if hook == config.HookInspect {
+		c.lastInspect = c.clock.Now()
+	} else {
+		c.lastProbe = c.clock.Now()
+	}
+
+	c.mu.Unlock()
 }
 
+// observeBatch looks again at targets waiting on an update between the
+// background passes, with each hook paced per target like those passes.
 func (c *Controller) observeBatch(ctx context.Context) {
 	set := c.targets()
 	c.mu.RLock()
 
-	var waiting []targets.Target
+	now := c.clock.Now()
+
+	var inspect, ready []targets.Target
 
 	seen := map[string]struct{}{}
 
@@ -656,30 +737,38 @@ func (c *Controller) observeBatch(ctx context.Context) {
 
 			t, present := set.Get(id)
 			_, duplicate := seen[id]
+			seen[id] = struct{}{}
 
-			if present && !duplicate {
-				waiting = append(waiting, t)
-				seen[id] = struct{}{}
+			if present && !duplicate && c.probes.due(config.HookInspect, id, now) {
+				inspect = append(inspect, t)
+			}
+
+			if present && !duplicate && c.probes.due(config.HookReady, id, now) {
+				ready = append(ready, t)
 			}
 		}
 	}
 
 	c.mu.RUnlock()
 
-	if len(waiting) > 0 {
-		c.observeTargets(ctx, waiting, config.HookInspect)
-		c.observeTargets(ctx, waiting, config.HookReady)
+	if len(inspect) > 0 {
+		c.observeTargets(ctx, inspect, config.HookInspect, true)
+	}
+
+	if len(ready) > 0 {
+		c.observeTargets(ctx, ready, config.HookReady, true)
 	}
 }
 
 // RunInspector observes every target on the inspect interval until ctx ends.
-// It blocks. The first pass runs before it returns control to the ticker.
+// It blocks. The first pass runs before it returns control to the ticker; a
+// target observed within earlyProbeSpacing waits for a later pass.
 func (c *Controller) RunInspector(ctx context.Context) error {
 	ticker := time.NewTicker(c.cfg.Inspect.Interval)
 	defer ticker.Stop()
 
 	for {
-		c.InspectAll(ctx)
+		c.observeTargets(ctx, c.targets().Targets, config.HookInspect, true)
 
 		select {
 		case <-ctx.Done():
@@ -698,6 +787,13 @@ func (c *Controller) Forget(ctx context.Context, ids []string) {
 		delete(c.live, id)
 		delete(c.degraded, id)
 		delete(c.hookRuns, id)
+
+		for _, hook := range []string{config.HookInspect, config.HookReady} {
+			key := probeKey{hook: hook, target: id}
+			delete(c.probes.began, key)
+			delete(c.probes.kicked, key)
+		}
+
 		_ = c.persist(ctx, c.store.DeleteLive(ctx, id))
 		_ = c.persist(ctx, c.store.ClearDegraded(ctx, id))
 		_ = c.persist(ctx, c.store.DeleteHookRuns(ctx, id))

@@ -202,14 +202,14 @@ func (p *process) AppendEvent(ctx context.Context, e *Event) error {
 }
 
 // onDisk reports whether the store holds an active rollout whose open batch
-// includes the target, moving it to this digest.
+// includes the target, moving it to this digest, with its dispatch counted.
 func onDisk(disk *MemoryStore, id, digest string) bool {
 	disk.mu.Lock()
 	defer disk.mu.Unlock()
 
 	for _, r := range disk.rollouts {
 		b := r.CurrentBatch()
-		if r.State.Active() && b != nil && slices.Contains(b.Targets, id) && slices.Contains(sortedValues(r.Desired), digest) {
+		if r.State.Active() && b != nil && slices.Contains(b.Targets, id) && slices.Contains(sortedValues(r.Desired), digest) && r.target(id).UpdateAttempts > 0 {
 			return true
 		}
 	}

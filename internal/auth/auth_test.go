@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -172,6 +174,7 @@ func TestBearerTokens(t *testing.T) {
 	require.Equal(t, sam, id.Name)
 	require.Equal(t, []string{alpha, operators}, id.Owners)
 	require.True(t, id.Admin)
+	require.False(t, id.Session, "a token is not a browser session")
 
 	req.Header.Set("Authorization", "Bearer "+is.token(t, "paul"))
 	id, err = o.Identity(req)
@@ -245,76 +248,94 @@ func TestLoginFlow(t *testing.T) {
 	require.Equal(t, http.StatusFound, resp.StatusCode)
 	require.Equal(t, LoginPath+"?next=%2Fgroups%2Fclient%2Fa", resp.Header.Get("Location"))
 
-	// Login: state cookie set, redirected to the issuer with that state.
-	resp, err = client.Get(app.URL + resp.Header.Get("Location"))
-	require.NoError(t, err)
-	resp.Body.Close()
-	require.Equal(t, http.StatusFound, resp.StatusCode)
-
-	loc, err := url.Parse(resp.Header.Get("Location"))
-	require.NoError(t, err)
+	// Login sends the issuer a fresh random state and nothing else of the
+	// login: the return path and the PKCE verifier stay in an HttpOnly cookie.
+	loc, stateCk := startLogin(t, client, app.URL, "/groups/client/a")
 	require.Equal(t, is.srv.URL+"/authorize", loc.Scheme+"://"+loc.Host+loc.Path)
 	require.Equal(t, clientID, loc.Query().Get("client_id"))
-
-	state := loc.Query().Get("state")
-	require.NotEmpty(t, state)
-	require.NotEmpty(t, loc.Query().Get("nonce"))
-
-	var stateCk *http.Cookie
-
-	for _, c := range resp.Cookies() {
-		if c.Name == stateCookie {
-			stateCk = c
-		}
-	}
-
-	require.NotNil(t, stateCk)
-	require.Equal(t, state, stateCk.Value)
 	require.True(t, stateCk.HttpOnly)
 	require.False(t, stateCk.Secure, "plain http in tests")
 
-	// Callback with a mismatched state is refused.
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, app.URL+CallbackPath+"?state=wrong&code=c", http.NoBody)
-	req.AddCookie(stateCk)
-	resp, err = client.Do(req)
-	require.NoError(t, err)
-	resp.Body.Close()
-	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	state, nonce := loc.Query().Get("state"), loc.Query().Get("nonce")
+	require.NotEmpty(t, state)
+	require.NotEmpty(t, nonce)
+	require.NotContains(t, loc.RawQuery, "groups", "the return path stays in the cookie")
+	require.NotContains(t, loc.RawQuery, stateCk.Value)
+
+	other, otherCk := startLogin(t, client, app.URL, "/")
+	require.NotEqual(t, state, other.Query().Get("state"))
+
+	// A state that is not this browser's login is refused before any code is
+	// exchanged: a wrong one, none, the cookie itself, another login's, and
+	// this state against another login's cookie or posing as a cookie itself.
+	for _, tc := range []struct {
+		query string
+		ck    *http.Cookie
+	}{
+		{codeQuery("wrong"), stateCk},
+		{"code=c", stateCk},
+		{codeQuery(url.QueryEscape(stateCk.Value)), stateCk},
+		{codeQuery(other.Query().Get("state")), stateCk},
+		{codeQuery(state), otherCk},
+		{codeQuery(state), &http.Cookie{Name: stateCookie, Value: state}},
+	} {
+		code, _, _ := callback(t, client, app.URL, tc.query, tc.ck)
+		require.Equal(t, http.StatusBadRequest, code, tc.query)
+	}
+
+	require.Empty(t, is.codes, "no refused callback reached the issuer")
 
 	// A token minted for another login's nonce is refused.
 	is.nonce = "someone-else"
-	req, _ = http.NewRequestWithContext(context.Background(), http.MethodGet, app.URL+CallbackPath+"?state="+url.QueryEscape(state)+"&code=replayed", http.NoBody)
-	req.AddCookie(stateCk)
-	resp, err = client.Do(req)
-	require.NoError(t, err)
-	resp.Body.Close()
-	require.Equal(t, http.StatusBadGateway, resp.StatusCode)
+	code, _, _ := callback(t, client, app.URL, "state="+state+"&code=replayed", stateCk)
+	require.Equal(t, http.StatusBadGateway, code)
 
-	is.nonce = loc.Query().Get("nonce")
+	is.nonce = nonce
 	is.codes = nil
 
-	// Callback with the right state exchanges the code and sets the session.
-	req, _ = http.NewRequestWithContext(context.Background(), http.MethodGet, app.URL+CallbackPath+"?state="+url.QueryEscape(state)+"&code=the-code", http.NoBody)
-	req.AddCookie(stateCk)
-	resp, err = client.Do(req)
-	require.NoError(t, err)
-	resp.Body.Close()
-	require.Equal(t, http.StatusFound, resp.StatusCode)
-	require.Equal(t, "/groups/client/a", resp.Header.Get("Location"))
+	// The right state exchanges the code and returns to the kept path, even on
+	// another instance sharing the key: the cookie alone carries the login.
+	peer := httptest.NewServer(newOIDC(t, is, nil).Middleware(protected))
+	t.Cleanup(peer.Close)
+
+	code, location, sessCk := callback(t, client, peer.URL, "state="+state+"&code=the-code", stateCk)
+	require.Equal(t, http.StatusFound, code)
+	require.Equal(t, "/groups/client/a", location)
 	require.Equal(t, []string{"the-code"}, is.codes)
-
-	var sessCk *http.Cookie
-
-	for _, c := range resp.Cookies() {
-		if c.Name == sessionCookie && c.Value != "" {
-			sessCk = c
-		}
-	}
-
 	require.NotNil(t, sessCk)
 
+	// Each cookie is signed for its own name: a login state is no session, and
+	// a session is no login state.
+	posing := httptest.NewRequest(http.MethodGet, "/", http.NoBody)
+	posing.AddCookie(&http.Cookie{Name: sessionCookie, Value: stateCk.Value})
+	_, err = o.Identity(posing)
+	require.ErrorIs(t, err, ErrNotSignedIn)
+
+	code, _, _ = callback(t, client, app.URL, "code=c", &http.Cookie{Name: stateCookie, Value: sessCk.Value})
+	require.Equal(t, http.StatusBadRequest, code)
+
+	// A cookie session is marked as one whatever else the request carries;
+	// only a bearer token that verifies stands in for the cookie.
+	apiReq := httptest.NewRequest(http.MethodPost, "/api/v1/actions/refresh", http.NoBody)
+	apiReq.AddCookie(sessCk)
+	apiReq.Header.Set("Authorization", "Basic c2FtOng=")
+
+	id, err := o.Identity(apiReq)
+	require.NoError(t, err)
+	require.Equal(t, sam, id.Name)
+	require.True(t, id.Session)
+
+	apiReq.Header.Set("Authorization", "Bearer not.a.token")
+	_, err = o.Identity(apiReq)
+	require.ErrorIs(t, err, ErrNotSignedIn)
+
+	apiReq.Header.Set("Authorization", "Bearer "+is.token(t, sam))
+	id, err = o.Identity(apiReq)
+	require.NoError(t, err)
+	require.False(t, id.Session)
+
 	// The session works on the protected route.
-	req, _ = http.NewRequestWithContext(context.Background(), http.MethodGet, app.URL+"/groups/client/a", http.NoBody)
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, app.URL+"/groups/client/a", http.NoBody)
 	req.AddCookie(sessCk)
 	resp, err = client.Do(req)
 	require.NoError(t, err)
@@ -348,6 +369,62 @@ func TestLoginFlow(t *testing.T) {
 	}
 }
 
+// startLogin begins a login that returns to next, and gives back where the
+// issuer was sent and the state cookie.
+func startLogin(t *testing.T, client *http.Client, app, next string) (*url.URL, *http.Cookie) {
+	t.Helper()
+
+	resp, err := client.Get(app + LoginURL(next))
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusFound, resp.StatusCode)
+
+	loc, err := url.Parse(resp.Header.Get("Location"))
+	require.NoError(t, err)
+
+	var ck *http.Cookie
+
+	for _, c := range resp.Cookies() {
+		if c.Name == stateCookie {
+			ck = c
+		}
+	}
+
+	require.NotNil(t, ck)
+
+	return loc, ck
+}
+
+// codeQuery is the callback query an issuer sends back with a code.
+func codeQuery(state string) string {
+	return "state=" + state + "&code=c"
+}
+
+// callback calls the callback route with a query and a state cookie, if any,
+// and returns the status, the redirect, and the session cookie it set.
+func callback(t *testing.T, client *http.Client, app, query string, ck *http.Cookie) (code int, location string, sess *http.Cookie) {
+	t.Helper()
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, app+CallbackPath+"?"+query, http.NoBody)
+	require.NoError(t, err)
+
+	if ck != nil {
+		req.AddCookie(ck)
+	}
+
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+
+	for _, c := range resp.Cookies() {
+		if c.Name == sessionCookie && c.Value != "" {
+			sess = c
+		}
+	}
+
+	return resp.StatusCode, resp.Header.Get("Location"), sess
+}
+
 func TestCallbackFailures(t *testing.T) {
 	is := newIssuer(t)
 	o := newOIDC(t, is, nil)
@@ -356,72 +433,70 @@ func TestCallbackFailures(t *testing.T) {
 
 	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 
-	// A "next" that points off-site is replaced with /.
-	resp, err := client.Get(app.URL + LoginPath + "?next=//evil.example/x")
-	require.NoError(t, err)
-	resp.Body.Close()
+	// The login returns only to a path on this site; anything a browser would
+	// read as another host, or as no path, returns to the root.
+	for next, want := range map[string]string{
+		"/groups/client/a?x=1": "/groups/client/a?x=1",
+		"":                     "/",
+		"groups":               "/",
+		"//evil.example/x":     "/",
+		"https://evil.example": "/",
+		"/\\evil.example":      "/%5Cevil.example",
+		"/\t/evil.example":     "/",
+	} {
+		loc, ck := startLogin(t, client, app.URL, next)
+		is.nonce = loc.Query().Get("nonce")
 
-	var st *http.Cookie
-
-	for _, c := range resp.Cookies() {
-		if c.Name == stateCookie {
-			st = c
-		}
+		code, location, _ := callback(t, client, app.URL, codeQuery(loc.Query().Get("state")), ck)
+		require.Equal(t, http.StatusFound, code, next)
+		require.Equal(t, want, location, next)
 	}
 
-	require.NotNil(t, st)
-
-	var decoded struct {
-		Next string `json:"next"`
-	}
-
-	require.NoError(t, o.sessions.decode(st.Value, &decoded))
-	require.Equal(t, "/", decoded.Next)
+	loc, st := startLogin(t, client, app.URL, "/")
+	query := codeQuery(loc.Query().Get("state"))
 
 	// The issuer refusing the code is a 502.
 	is.fail = true
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, app.URL+CallbackPath+"?state="+url.QueryEscape(st.Value)+"&code=c", http.NoBody)
-	req.AddCookie(st)
-	resp, err = client.Do(req)
-	require.NoError(t, err)
-	resp.Body.Close()
-	require.Equal(t, http.StatusBadGateway, resp.StatusCode)
+	code, _, _ := callback(t, client, app.URL, query, st)
+	require.Equal(t, http.StatusBadGateway, code)
 
 	// An ID token without the claim is a 502 too.
 	is.fail = false
 	is.name = ""
-	req, _ = http.NewRequestWithContext(context.Background(), http.MethodGet, app.URL+CallbackPath+"?state="+url.QueryEscape(st.Value)+"&code=c", http.NoBody)
-	req.AddCookie(st)
-	resp, err = client.Do(req)
-	require.NoError(t, err)
-	resp.Body.Close()
-	require.Equal(t, http.StatusBadGateway, resp.StatusCode)
+	code, _, _ = callback(t, client, app.URL, query, st)
+	require.Equal(t, http.StatusBadGateway, code)
 
-	// An expired state is refused.
-	o.now = func() time.Time { return time.Now().Add(time.Hour) }
-	req, _ = http.NewRequestWithContext(context.Background(), http.MethodGet, app.URL+CallbackPath+"?state="+url.QueryEscape(st.Value)+"&code=c", http.NoBody)
-	req.AddCookie(st)
-	resp, err = client.Do(req)
+	// A tampered, missing, stateless or expired login state is refused before
+	// any code reaches the issuer.
+	is.codes = nil
+
+	stateless, err := o.sessions.encode(stateCookie, loginState{Nonce: is.nonce, Verifier: "v", Next: "/", Expires: time.Now().Add(time.Hour)})
 	require.NoError(t, err)
-	resp.Body.Close()
-	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+	code, _, _ = callback(t, client, app.URL, query, &http.Cookie{Name: stateCookie, Value: st.Value + "x"})
+	require.Equal(t, http.StatusBadRequest, code)
+
+	code, _, _ = callback(t, client, app.URL, query, nil)
+	require.Equal(t, http.StatusBadRequest, code)
+
+	code, _, _ = callback(t, client, app.URL, "code=c", &http.Cookie{Name: stateCookie, Value: stateless})
+	require.Equal(t, http.StatusBadRequest, code)
+
+	o.now = func() time.Time { return time.Now().Add(time.Hour) }
+	code, _, _ = callback(t, client, app.URL, query, st)
+	require.Equal(t, http.StatusBadRequest, code)
+	require.Empty(t, is.codes)
 
 	// An expired session is not signed in.
 	o.now = time.Now
 
-	value, err := o.sessions.encode(session{Name: sam, Expires: time.Now().Add(-time.Minute)})
+	value, err := o.sessions.encode(sessionCookie, session{Name: sam, Expires: time.Now().Add(-time.Minute)})
 	require.NoError(t, err)
 
 	r := httptest.NewRequest(http.MethodGet, "/", http.NoBody)
 	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: value})
 	_, err = o.Identity(r)
 	require.ErrorIs(t, err, ErrNotSignedIn)
-
-	// Missing state cookie.
-	resp, err = client.Get(app.URL + CallbackPath + "?state=x")
-	require.NoError(t, err)
-	resp.Body.Close()
-	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 
 	// Secure cookies behind a TLS-terminating proxy.
 	rec := httptest.NewRecorder()
@@ -439,41 +514,44 @@ func TestInjectedFailures(t *testing.T) {
 
 	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 
-	// Random source failing at login.
+	// Random source failing at login, for the state and for the nonce.
 	o.random = func() (string, error) { return "", errFake }
 	resp, err := client.Get(app.URL + LoginPath)
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusInternalServerError, resp.StatusCode)
 
+	calls := 0
+	o.random = func() (string, error) {
+		calls++
+		if calls == 2 {
+			return "", errFake
+		}
+
+		return randomToken()
+	}
+
+	resp, err = client.Get(app.URL + LoginPath)
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusInternalServerError, resp.StatusCode)
+	require.Equal(t, 2, calls)
+
 	o.random = randomToken
 
-	// Encoding failing at login.
-	o.encode = func(any) (string, error) { return "", errFake }
+	// Encoding failing at login, and for the session after a good exchange.
+	o.encode = func(string, any) (string, error) { return "", errFake }
 	resp, err = client.Get(app.URL + LoginPath)
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusInternalServerError, resp.StatusCode)
 
-	// Encoding failing only for the session, after a good exchange.
 	is.nonce = "x"
-	state, err := o.sessions.encode(map[string]any{"n": "x", "next": "/", "e": time.Now().Add(time.Hour)})
+	value, err := o.sessions.encode(stateCookie, loginState{State: "s", Nonce: "x", Next: "/", Expires: time.Now().Add(time.Hour)})
 	require.NoError(t, err)
 
-	o.encode = func(v any) (string, error) {
-		if _, ok := v.(session); ok {
-			return "", errFake
-		}
-
-		return o.sessions.encode(v)
-	}
-
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, app.URL+CallbackPath+"?state="+url.QueryEscape(state)+"&code=c", http.NoBody)
-	req.AddCookie(&http.Cookie{Name: stateCookie, Value: state})
-	resp, err = client.Do(req)
-	require.NoError(t, err)
-	resp.Body.Close()
-	require.Equal(t, http.StatusInternalServerError, resp.StatusCode)
+	code, _, _ := callback(t, client, app.URL, codeQuery("s"), &http.Cookie{Name: stateCookie, Value: value})
+	require.Equal(t, http.StatusInternalServerError, code)
 
 	// The random source itself.
 	orig := randRead
@@ -506,14 +584,20 @@ var errFake = errors.New("fake")
 func TestCodec(t *testing.T) {
 	c := codec{key: []byte(sessionKey)}
 
-	_, err := c.encode(make(chan int))
+	_, err := c.encode(sessionCookie, make(chan int))
 	require.Error(t, err)
 
 	var out map[string]any
 
-	require.ErrorIs(t, c.decode("no-dot", &out), errBadSession)
-	require.ErrorIs(t, c.decode("!!!."+c.sign("!!!"), &out), errBadSession)
-	require.ErrorIs(t, c.decode("bm90IGpzb24."+c.sign("bm90IGpzb24"), &out), errBadSession)
+	require.ErrorIs(t, c.decode(sessionCookie, "no-dot", &out), errBadSession)
+	require.ErrorIs(t, c.decode(sessionCookie, "!!!."+c.sign(sessionCookie, "!!!"), &out), errBadSession)
+	require.ErrorIs(t, c.decode(sessionCookie, "bm90IGpzb24."+c.sign(sessionCookie, "bm90IGpzb24"), &out), errBadSession)
+
+	// A value decodes only under the name it was signed for.
+	value, err := c.encode(sessionCookie, session{Name: sam})
+	require.NoError(t, err)
+	require.NoError(t, c.decode(sessionCookie, value, &out))
+	require.ErrorIs(t, c.decode(stateCookie, value, &out), errBadSession)
 
 	tok, err := randomToken()
 	require.NoError(t, err)
@@ -630,35 +714,21 @@ func TestLoginUsesPKCEAndPublicClientsSendNoSecret(t *testing.T) {
 
 	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 
-	resp, err := client.Get(app.URL + LoginPath)
-	require.NoError(t, err)
-	resp.Body.Close()
-
-	loc, err := url.Parse(resp.Header.Get("Location"))
-	require.NoError(t, err)
+	loc, stateCk := startLogin(t, client, app.URL, "/")
 	require.Equal(t, "S256", loc.Query().Get("code_challenge_method"))
-	require.NotEmpty(t, loc.Query().Get("code_challenge"))
-
-	var stateCk *http.Cookie
-
-	for _, c := range resp.Cookies() {
-		if c.Name == stateCookie {
-			stateCk = c
-		}
-	}
-
-	require.NotNil(t, stateCk)
 
 	is.nonce = loc.Query().Get("nonce")
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, app.URL+CallbackPath+"?state="+url.QueryEscape(stateCk.Value)+"&code=c", http.NoBody)
-	req.AddCookie(stateCk)
-	resp, err = client.Do(req)
-	require.NoError(t, err)
-	resp.Body.Close()
-	require.Equal(t, http.StatusFound, resp.StatusCode)
+	code, _, _ := callback(t, client, app.URL, codeQuery(loc.Query().Get("state")), stateCk)
+	require.Equal(t, http.StatusFound, code)
 
+	// The token request proves the challenge with a verifier the login URL
+	// never carried.
 	require.Len(t, is.forms, 1)
-	require.NotEmpty(t, is.forms[0].Get("code_verifier"), "the token request proves the challenge")
+
+	verifier := is.forms[0].Get("code_verifier")
+	sum := sha256.Sum256([]byte(verifier))
+	require.Equal(t, base64.RawURLEncoding.EncodeToString(sum[:]), loc.Query().Get("code_challenge"))
+	require.NotContains(t, loc.String(), verifier)
 	require.Equal(t, clientID, is.forms[0].Get("client_id"), "a public client names itself in the form")
 	require.Empty(t, is.forms[0].Get("client_secret"))
 	require.Empty(t, is.basic[0])

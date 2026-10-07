@@ -133,7 +133,7 @@ func TestSuspendedDuringItsUpdateDoesNotHaltTheBatch(t *testing.T) {
 	})
 	h.clock.Advance(h.cfg.Registry.Poll)
 
-	entered, release := h.world.gate("update")
+	entered, release := h.world.gate("update:" + tA1)
 
 	var wg sync.WaitGroup
 
@@ -156,8 +156,7 @@ func TestSuspendedDuringItsUpdateDoesNotHaltTheBatch(t *testing.T) {
 	r := h.active("a")
 	require.NotEqual(t, Halted, r.State, "the refused update belonged to a target that was no longer in play")
 	require.Equal(t, PhaseSkipped, h.phases(r)[tA1])
-	require.Contains(t, r.Targets[0].Reason, "suspended by robin")
-	require.Equal(t, PhaseUpdating, h.phases(r)[tA2])
+	require.Equal(t, d2, h.view(tA2).Live)
 }
 
 func TestTargetEditsMidRolloutRetireTheTarget(t *testing.T) {

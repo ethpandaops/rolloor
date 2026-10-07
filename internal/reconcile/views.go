@@ -72,12 +72,18 @@ type FleetView struct {
 	Nodes       int         `json:"nodes"`
 	Weight      float64     `json:"weight"`
 	// Unavailable is the share of weight unavailable from observation or updates.
-	MaxUnavailable string            `json:"maxUnavailable"`
-	Unavailable    string            `json:"unavailable"`
-	Sync           SyncState         `json:"sync"`
-	Health         Health            `json:"health"`
-	Resolve        map[string]string `json:"registryErrors,omitempty"`
-	At             time.Time         `json:"at"`
+	MaxUnavailable       string            `json:"maxUnavailable"`
+	Unavailable          string            `json:"unavailable"`
+	Sync                 SyncState         `json:"sync"`
+	Health               Health            `json:"health"`
+	Resolve              map[string]string `json:"registryErrors,omitempty"`
+	At                   time.Time         `json:"at"`
+	UnavailableWeight    float64           `json:"unavailableWeight"`
+	MaxUnavailableWeight float64           `json:"maxUnavailableWeight"`
+	StoreWritesOwed      bool              `json:"storeWritesOwed"`
+	TargetsLoadFailed    bool              `json:"targetsLoadFailed"`
+	LastInspect          time.Time         `json:"lastInspect,omitzero"`
+	LastProbe            time.Time         `json:"lastProbe,omitzero"`
 }
 
 // NodeView is one machine.
@@ -317,21 +323,11 @@ func groupReason(g *GroupView, views []TargetView) string {
 // Fleet returns every group's roll-up.
 func (c *Controller) Fleet() FleetView {
 	set := c.targets()
-	now := c.clock.Now()
 
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	f := FleetView{Environment: c.cfg.Environment, Targets: set.Len(), Nodes: len(set.Nodes()), Weight: set.TotalWeight(),
-		MaxUnavailable: c.cfg.DisruptionBudget.MaxUnavailable.String(), Sync: Synced, Health: Healthy, At: now}
-	f.Unavailable = pct(c.unavailableWeight(set), set.TotalWeight())
-
-	if len(c.resolveErrors) > 0 {
-		f.Resolve = map[string]string{}
-		for k, v := range c.resolveErrors {
-			f.Resolve[k] = v
-		}
-	}
+	f := c.fleetStatusLocked(set)
 
 	for _, name := range set.Groups() {
 		members := set.InGroup(name)
@@ -344,6 +340,38 @@ func (c *Controller) Fleet() FleetView {
 		f.Groups = append(f.Groups, c.groupLocked(set, name, views))
 		f.Sync = worseSync(f.Sync, f.Groups[len(f.Groups)-1].Sync)
 		f.Health = worseHealth(f.Health, f.Groups[len(f.Groups)-1].Health)
+	}
+
+	return f
+}
+
+// FleetStatus returns fleet-wide observations without building group views.
+func (c *Controller) FleetStatus() FleetView {
+	set := c.targets()
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return c.fleetStatusLocked(set)
+}
+
+func (c *Controller) fleetStatusLocked(set *targets.Set) FleetView {
+	now := c.clock.Now()
+
+	f := FleetView{Environment: c.cfg.Environment, Targets: set.Len(), Nodes: len(set.Nodes()), Weight: set.TotalWeight(),
+		MaxUnavailable: c.cfg.DisruptionBudget.MaxUnavailable.String(), Sync: Synced, Health: Healthy, At: now}
+	f.UnavailableWeight = c.unavailableWeight(set)
+	f.MaxUnavailableWeight = c.cfg.DisruptionBudget.MaxUnavailable.OfWeight(set.TotalWeight())
+	f.Unavailable = pct(f.UnavailableWeight, set.TotalWeight())
+	f.StoreWritesOwed = c.dirty
+	f.TargetsLoadFailed = c.targetsError != ""
+	f.LastInspect, f.LastProbe = c.lastInspect, c.lastProbe
+
+	if len(c.resolveErrors) > 0 {
+		f.Resolve = map[string]string{}
+		for k, v := range c.resolveErrors {
+			f.Resolve[k] = v
+		}
 	}
 
 	return f

@@ -17,7 +17,7 @@ import (
 // rollout was free to move when the step began.
 func (s *sim) dispatched(disk *MemoryStore, id, digest string) {
 	if !onDisk(disk, id, digest) {
-		s.violation("update %s to %s ran before its batch reached the store", id, shortDigest(digest))
+		s.violation("update %s to %s ran before its batch and dispatch reached the store", id, shortDigest(digest))
 	}
 
 	t, ok := s.fleet.get(id)
@@ -86,13 +86,13 @@ func (s *sim) admissionProblem(r, before *Rollout) error {
 
 	var used, cost float64
 
-	for node := range busy {
-		used += set.NodeWeight(node)
+	for node, least := range busy {
+		used += max(set.NodeWeight(node), least)
 	}
 
 	for node := range nodes {
 		weight := set.NodeWeight(node)
-		if busy[node] || weight == 0 {
+		if _, held := busy[node]; held || weight == 0 {
 			delete(nodes, node)
 
 			continue

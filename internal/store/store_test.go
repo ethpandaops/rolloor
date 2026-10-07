@@ -35,6 +35,15 @@ func open(t *testing.T) (*SQLite, string) {
 	return s, dir
 }
 
+func TestCommittedUpdatesUseFullDurability(t *testing.T) {
+	s, _ := open(t)
+
+	var synchronous int
+
+	require.NoError(t, s.db.QueryRowContext(context.Background(), "PRAGMA synchronous").Scan(&synchronous))
+	require.Equal(t, 2, synchronous)
+}
+
 func TestRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	s, dir := open(t)

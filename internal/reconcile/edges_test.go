@@ -240,7 +240,13 @@ func TestRunWithCancelledContextAndTickerPaths(t *testing.T) {
 	go func() { done <- h2.c.RunInspector(ctx2) }()
 	go func() { done <- h2.c.Run(ctx2, 5*time.Millisecond) }()
 
-	require.Eventually(t, func() bool { return len(h2.world.callsFor("inspect")) >= 27 }, 3*time.Second, 5*time.Millisecond)
+	// The inspector is paced on the fake clock, so each check makes another
+	// pass due.
+	require.Eventually(t, func() bool {
+		h2.clock.Advance(earlyProbeSpacing)
+
+		return len(h2.world.callsFor("inspect")) >= 27
+	}, 3*time.Second, 5*time.Millisecond)
 	time.Sleep(30 * time.Millisecond)
 	cancel2()
 	<-done
