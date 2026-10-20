@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # The generic end-to-end run. Six nginx containers on a local registry move
-# from build A to build B in waves and batches under the disruption budget; a broken
-# build C halts and quarantines; build D supersedes and converges with the
-# quarantined targets first. Needs docker, curl and jq.
+# from build A to build B in waves and batches under the disruption budget,
+# with rolloor killed mid-batch and restarted; a broken build C halts and
+# quarantines; build D supersedes and converges with the quarantined targets
+# first. Needs docker, curl and jq.
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
@@ -72,13 +73,18 @@ for port in 18081 18082 18083 18084 18085 18086; do
   for _ in $(seq 1 30); do curl -fsS "http://127.0.0.1:$port/" >/dev/null 2>&1 && break; sleep 1; done
 done
 
+# start_rolloor serves on the example's data directory and waits for the API.
+start_rolloor() {
+  /tmp/rolloor-example/rolloor serve --config examples/generic/config.yaml >>/tmp/rolloor-example/rolloor.log 2>&1 &
+  rolloor_pid=$!
+  for _ in $(seq 1 30); do curl -fsS "$api/fleet" >/dev/null 2>&1 && break; sleep 1; done
+}
+
 log "rolloor"
 mkdir -p /tmp/rolloor-example
 go build -o /tmp/rolloor-example/rolloor ./cmd/rolloor
 /tmp/rolloor-example/rolloor validate --config examples/generic/config.yaml
-/tmp/rolloor-example/rolloor serve --config examples/generic/config.yaml >/tmp/rolloor-example/rolloor.log 2>&1 &
-rolloor_pid=$!
-for _ in $(seq 1 30); do curl -fsS "$api/fleet" >/dev/null 2>&1 && break; sleep 1; done
+start_rolloor
 
 # Everything on A reads Synced before anything happens.
 for _ in $(seq 1 30); do
@@ -93,6 +99,23 @@ log "build B: waves and batches under the disruption budget"
 build B "build B"
 for _ in $(seq 1 30); do r1=$(active_rollout); [ -n "$r1" ] && break; sleep 1; done
 [ -n "$r1" ] || { echo "no rollout opened for B" >&2; exit 1; }
+
+log "rolloor is killed mid-batch and restarted"
+for _ in $(seq 1 60); do
+  curl -fsS "$api/rollouts/$r1" | jq -e '[.batches[] | select(.endedAt == null)] | length > 0' >/dev/null && break
+  sleep 1
+done
+curl -fsS "$api/rollouts/$r1" | jq -r '"killed with batch \(.batches | length) open: \(.reason)"'
+# A crash takes the controller's programs with it, as a container or a
+# systemd unit would; each program runs in a process group of its own.
+for child in $(pgrep -P "$rolloor_pid" || true); do kill -9 -- "-$child" 2>/dev/null || true; done
+kill -9 "$rolloor_pid"
+wait "$rolloor_pid" 2>/dev/null || true
+start_rolloor
+[ "$(curl -fsS "$api/rollouts" | jq '[.[] | select(.state != "Complete" and .state != "Aborted" and .state != "Superseded")] | length')" = "1" ] ||
+  { echo "the restart left more than one active rollout" >&2; curl -fsS "$api/rollouts" | jq . >&2; exit 1; }
+[ "$(active_rollout)" = "$r1" ] || { echo "the restart did not resume $r1" >&2; exit 1; }
+
 wait_state "$r1" Complete 300
 curl -fsS "$api/rollouts/$r1" | jq -r '.batches[] | "batch \(.number) wave \(.wave): \(.targets | join(", "))"'
 

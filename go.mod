@@ -1,6 +1,6 @@
 module github.com/ethpandaops/rolloor
 
-go 1.25.13
+go 1.26.9
 
 require (
 	github.com/coreos/go-oidc/v3 v3.14.1

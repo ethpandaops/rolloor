@@ -29,7 +29,7 @@ func ParseFraction(s string) (Fraction, error) {
 
 	if pct, ok := strings.CutSuffix(s, "%"); ok {
 		p, err := strconv.ParseFloat(pct, 64)
-		if err != nil || p < 0 || p > 100 {
+		if err != nil || math.IsNaN(p) || p < 0 || p > 100 {
 			return Fraction{}, fmt.Errorf("fraction %q: want 0-100%%", s)
 		}
 

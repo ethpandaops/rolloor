@@ -56,6 +56,10 @@ func (c *Controller) Sync(ctx context.Context, req SyncRequest) ([]string, error
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if err := c.writeOwed(ctx); err != nil {
+		return nil, err
+	}
+
 	c.supersedeChangedRollouts(ctx, now)
 
 	var started []string
@@ -173,6 +177,10 @@ func (c *Controller) Suspend(ctx context.Context, req SuspendRequest) (Suspensio
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if err := c.writeOwed(ctx); err != nil {
+		return Suspension{}, err
+	}
+
 	if err := c.persist(ctx, c.store.SaveSuspension(ctx, &s)); err != nil {
 		return Suspension{}, err
 	}
@@ -191,6 +199,10 @@ func (c *Controller) Resume(ctx context.Context, actor string, sel targets.Selec
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	if err := c.writeOwed(ctx); err != nil {
+		return 0, err
+	}
 
 	n := 0
 
@@ -237,6 +249,10 @@ func (c *Controller) Pause(ctx context.Context, actor, rolloutID string) error {
 		return fmt.Errorf("rollout is %s: %w", r.State, ErrState)
 	}
 
+	if err := c.writeOwed(ctx); err != nil {
+		return err
+	}
+
 	err := c.commit(ctx, r, func() {
 		r.PausePending = true
 
@@ -268,6 +284,10 @@ func (c *Controller) Promote(ctx context.Context, actor, rolloutID string) error
 
 	if r.State != Paused && !r.PausePending {
 		return fmt.Errorf("rollout is %s and not pausing: %w", r.State, ErrState)
+	}
+
+	if err := c.writeOwed(ctx); err != nil {
+		return err
 	}
 
 	err := c.commit(ctx, r, func() {
@@ -303,6 +323,10 @@ func (c *Controller) Abort(ctx context.Context, actor, rolloutID string) error {
 
 	if !r.State.Active() {
 		return fmt.Errorf("rollout is %s: %w", r.State, ErrState)
+	}
+
+	if err := c.writeOwed(ctx); err != nil {
+		return err
 	}
 
 	// The marker goes first; if the rollout itself cannot be saved the marker
@@ -355,6 +379,10 @@ func (c *Controller) Retry(ctx context.Context, actor, rolloutID, reason string)
 		return fmt.Errorf("rollout is %s: %w", r.State, ErrState)
 	}
 
+	if err := c.writeOwed(ctx); err != nil {
+		return err
+	}
+
 	err := c.commit(ctx, r, func() {
 		r.RetryPending = true
 		r.Human = true
@@ -388,6 +416,10 @@ func (c *Controller) SetPolicy(ctx context.Context, actor, group string, p Polic
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	if err := c.writeOwed(ctx); err != nil {
+		return err
+	}
 
 	if err := c.persist(ctx, c.store.SavePolicy(ctx, group, p)); err != nil {
 		return err

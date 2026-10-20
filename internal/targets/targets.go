@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -141,8 +142,8 @@ func (s *Set) validate(t *Target) error {
 		return fmt.Errorf("targets: %s: node is required", t.ID)
 	}
 
-	if t.Weight < 0 {
-		return fmt.Errorf("targets: %s: weight must not be negative", t.ID)
+	if t.Weight < 0 || math.IsNaN(t.Weight) || math.IsInf(t.Weight, 0) {
+		return fmt.Errorf("targets: %s: weight must be a non-negative number", t.ID)
 	}
 
 	if err := checkImage(t.Image); err != nil {

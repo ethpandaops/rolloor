@@ -8,10 +8,33 @@ service=$(jq -r .extra.service <<<"$target")
 ref=$(jq -r '.desiredRef // empty' <<<"$target")
 compose="${ROLLOOR_EXAMPLE_COMPOSE:-examples/generic/docker-compose.yaml}"
 
-if [ -n "$ref" ]; then
-  APP_IMAGE="$ref" docker compose -f "$compose" up -d --no-deps --force-recreate "$service" >/dev/null 2>&1
-else
-  docker compose -f "$compose" up -d --pull always --no-deps --force-recreate "$service" >/dev/null 2>&1
-fi
+# A recreate cut short (the controller stopped mid-update) leaves the old
+# container renamed <id>_<name>, and the daemon may still be finishing it.
+# Running again must clear that and try once more.
+clear_leftovers() {
+  docker ps -a --filter "label=com.docker.compose.service=$service" --format '{{.Names}}' |
+    { grep -E '^[0-9a-f]{12}_' || true; } | while read -r name; do docker rm -f "$name" >/dev/null 2>&1 || true; done
+}
 
-echo "recreated $service from ${ref:-the tag}"
+recreate() {
+  if [ -n "$ref" ]; then
+    APP_IMAGE="$ref" docker compose -f "$compose" up -d --no-deps --force-recreate "$service" 2>&1
+  else
+    docker compose -f "$compose" up -d --pull always --no-deps --force-recreate "$service" 2>&1
+  fi
+}
+
+for attempt in 1 2; do
+  clear_leftovers
+
+  if out=$(recreate); then
+    echo "recreated $service from ${ref:-the tag}"
+    exit 0
+  fi
+
+  [ "$attempt" -lt 2 ] && sleep 1
+done
+
+# The first line of stdout is the reason people see.
+echo "recreate failed: $(tail -n 1 <<<"$out")"
+exit 1
