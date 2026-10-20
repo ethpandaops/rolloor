@@ -190,9 +190,9 @@ func (c *Controller) viewLocked(set *targets.Set, t *targets.Target) TargetView 
 		v.Health = Progressing
 	case !v.Readiness.ProbedAt.IsZero() && !v.Readiness.Ready:
 		v.Health, v.Reason = Degraded, v.Readiness.Reason
-	case !known || c.live[t.ID].Failures > 0 || v.Readiness.ProbedAt.IsZero():
+	case !known || v.Readiness.ProbedAt.IsZero():
 		v.Health = HealthUnknown
-		if c.live[t.ID].Failures > 0 {
+		if !known && c.live[t.ID].Failures > 0 {
 			v.Reason = c.live[t.ID].Reason
 		} else if known {
 			v.Reason = "readiness not observed yet"

@@ -191,11 +191,16 @@ func TestInspectionFailureDoesNotChangeDigestSync(t *testing.T) {
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
 	h.world.set(func(w *world) { w.inspectFail[tA1] = true })
+	require.Equal(t, Healthy, h.view(tA1).Health)
+
+	// Below the inspect failure threshold neither axis changes.
 	h.c.InspectAll(h.ctx)
 	require.Equal(t, Synced, h.view(tA1).Sync)
-	require.Equal(t, HealthUnknown, h.view(tA1).Health)
+	require.Equal(t, Healthy, h.view(tA1).Health)
 	h.c.InspectAll(h.ctx)
 	require.Equal(t, Unknown, h.view(tA1).Sync)
+	require.Equal(t, HealthUnknown, h.view(tA1).Health)
+	require.Contains(t, h.view(tA1).Reason, "connection refused")
 	h.world.set(func(w *world) { delete(w.inspectFail, tA1) })
 	h.c.InspectAll(h.ctx)
 	require.Equal(t, Synced, h.view(tA1).Sync)
