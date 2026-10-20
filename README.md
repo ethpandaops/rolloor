@@ -69,4 +69,4 @@ make lint     # golangci-lint and the word lint
 
 `internal/reconcile/property_test.go` runs the controller through random fleets, failures, verbs, restarts, crashes and store outages, checking the budget and the other rules after every step and that everything converges once the failures stop. A failing seed reproduces with `ROLLOOR_SIM_SEED=<n>`.
 
-Go 1.25. Nothing in this repository is specific to a workload; deployments bring their own hooks and targets. `scripts/lint-words.sh` fails the build if the first workload's words appear in any tracked file.
+Go 1.26. Nothing in this repository is specific to a workload; deployments bring their own hooks and targets. `scripts/lint-words.sh` fails the build if the first workload's words appear in any tracked file.
