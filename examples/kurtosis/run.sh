@@ -204,7 +204,7 @@ wait_until "C did not halt" 600 '.state == "Halted"' "$api/rollouts/$rC"
 curl -sf "$api/rollouts/$rC" | jq -e '[.batches[0].targets[] | split("/")[0]] | unique | length == 1' >/dev/null ||
   fail "the halted batch was not one node"
 
-log "build D supersedes C and converges, the quarantined node first"
+log "build D supersedes C and converges, the not-ready node first"
 D=$(publish d 'LABEL rolloor.example.build=d')
 echo "D = $D"
 wait_until "C was not superseded" 120 '.state == "Superseded"' "$api/rollouts/$rC"
@@ -213,7 +213,7 @@ for _ in $(seq 1 60); do rD=$(rollout_of "$D"); [ -n "$rD" ] && break; sleep 5; 
 wait_until "D did not complete" 1200 '.state == "Complete"' "$api/rollouts/$rD"
 curl -sf "$api/rollouts/$rD" | jq -e '[.targets[] | select(.phase != "passed")] | length == 0' >/dev/null ||
   fail "D completed without moving every target"
-curl -sf "$api/rollouts/$rD" | jq -e '.targets[0].degradedBefore == true' >/dev/null || fail "the quarantined node did not go first"
+curl -sf "$api/rollouts/$rD" | jq -e '.targets[0].notReadyBefore == true' >/dev/null || fail "the not-ready node did not go first"
 
 log "every target synced and healthy on D"
 wait_until "targets did not all end healthy on D" 300 "$(all_on "$D")" "$api/targets"

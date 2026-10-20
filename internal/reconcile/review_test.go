@@ -8,22 +8,21 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// These tests pin the behaviours the first review found missing.
-
 func TestUpdateHookReceivesTheDesiredDigest(t *testing.T) {
-	h := newHarness(t, testConfig, testTargets)
+	h := newHarness(t, replaceLine(testConfig, "registry: {poll: 60s}", "registry: {poll: 1h}"), testTargets)
 	h.prime()
-
-	// The tag moves to d2 but the group is pinned to d3: targets must end on d3.
-	require.NoError(t, h.c.SetPolicy(h.ctx, actor, "a", Policy{Mode: ModeAutomated, Pins: map[string]string{imgA: d3}}))
 	h.release(imgA, d2)
 
+	// The tag moves on before the next poll: updates still deploy the digest
+	// the rollout moves to, not whatever the tag points at when they run.
+	h.world.set(func(w *world) { w.registry[imgA] = d3 })
+
 	r := h.active("a")
-	require.Equal(t, "3333333", r.Digest)
+	require.Equal(t, "2222222", r.Digest)
 	require.Equal(t, Complete, h.drive(r.ID, 80, 20*time.Second).State)
 
 	for _, v := range h.c.Targets(mustSel("client=a")) {
-		require.Equal(t, d3, v.Live, v.ID)
+		require.Equal(t, d2, v.Live, v.ID)
 		require.Equal(t, Synced, v.Sync, v.ID)
 	}
 
@@ -35,6 +34,7 @@ func TestUpdateHookReceivesTheDesiredDigest(t *testing.T) {
 func TestSuspensionAndGroupMoveMidBatch(t *testing.T) {
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
+	h.world.set(func(w *world) { w.notReady[tA1], w.notReady[tA2] = true, true })
 	h.release(imgA, d2)
 	r := h.active("a")
 	h.tick()
@@ -104,10 +104,7 @@ func TestStoreFailuresSurfaceOnActions(t *testing.T) {
 	require.ErrorIs(t, err, errFake)
 	require.Empty(t, h.c.Suspensions(), "not kept in memory either")
 
-	require.ErrorIs(t, h.c.SetPolicy(h.ctx, actor, "b", Policy{Mode: ModeManual}), errFake)
-	require.Equal(t, ModeAutomated, h.c.Fleet().Groups[1].Policy.Mode)
-
-	require.ErrorIs(t, h.c.Pause(h.ctx, actor, r.ID), errFake)
+	require.ErrorIs(t, h.pause(r.ID, 0), errFake)
 	require.False(t, h.rollout(r.ID).PausePending, "a refused pause leaves nothing behind")
 	require.ErrorIs(t, h.c.Promote(h.ctx, actor, r.ID), ErrState, "so there is nothing to promote")
 	require.ErrorIs(t, h.c.Retry(h.ctx, actor, r.ID, "x"), ErrState)
@@ -115,7 +112,7 @@ func TestStoreFailuresSurfaceOnActions(t *testing.T) {
 	require.True(t, h.rollout(r.ID).State.Active(), "abort did not happen")
 
 	h.store.Fail = nil
-	require.NoError(t, h.c.Pause(h.ctx, actor, r.ID))
+	require.NoError(t, h.pause(r.ID, 0))
 	require.True(t, h.rollout(r.ID).PausePending)
 
 	h.store.Fail = errFake
@@ -260,27 +257,28 @@ func TestWavesAreContiguousAfterDegradedTargets(t *testing.T) {
 	// wave-1 targets are not pulled in beside it.
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
-	h.world.set(func(w *world) { w.registry[imgA] = d2 })
 
 	for _, id := range []string{tA1, tA2, tA3, tA4, tA5} {
 		h.world.set(func(w *world) { w.running[id] = d2 })
 	}
 
 	h.c.InspectAll(h.ctx)
-	h.clock.Advance(h.cfg.Registry.Poll)
-	h.world.set(func(w *world) { w.updateFail[tA6] = refused })
-	h.tick()
-	h.tick()
-	require.Equal(t, Halted, h.active("a").State)
+	h.haltOnBadBuild("a", imgA, d2, tA6)
 
-	h.world.set(func(w *world) { delete(w.updateFail, tA6) })
+	h.world.set(func(w *world) { delete(w.breakOnUpdate, tA6) })
+
+	for range h.cfg.ReadinessProbe.FailureThreshold {
+		h.c.ProbeAll(h.ctx)
+	}
+
 	h.release(imgA, d3)
 
 	r := h.active("a")
-	require.True(t, r.Targets[0].DegradedBefore)
+	require.True(t, r.Targets[0].NotReadyBefore)
 	require.Equal(t, 2, r.Targets[0].Wave)
 	require.Equal(t, []string{tA6}, r.Batches[0].Targets, "the degraded wave-2 target goes alone")
-	require.Equal(t, "0.0% of 50%", r.Unavailable, "a degraded node costs nothing")
+	require.True(t, r.Targets[0].Free)
+	require.Equal(t, "20.0% of 50%", r.Unavailable)
 }
 
 func TestNodeDegradedCostsNothingForAllItsTargets(t *testing.T) {
@@ -288,24 +286,32 @@ func TestNodeDegradedCostsNothingForAllItsTargets(t *testing.T) {
 	h := newHarness(t, testConfig, doc)
 	h.prime()
 
-	// Quarantine only a-3/cl by making its update fail on its own in wave 1.
-	h.world.set(func(w *world) {
-		w.registry[imgA] = d2
-		w.running[tA1], w.running[tA2] = d2, d2
-		w.updateFail[tA3] = refused
-	})
+	// Quarantine only a-3/cl with a build that never becomes ready there.
+	h.world.set(func(w *world) { w.running[tA1], w.running[tA2] = d2, d2 })
 	h.c.InspectAll(h.ctx)
-	h.clock.Advance(h.cfg.Registry.Poll)
-	h.tick()
-	h.tick()
-	require.Equal(t, Halted, h.active("a").State)
+	h.haltOnBadBuild("a", imgA, d2, tA3)
 
-	h.world.set(func(w *world) { delete(w.updateFail, tA3) })
+	h.world.set(func(w *world) {
+		delete(w.breakOnUpdate, tA3)
+
+		for _, id := range []string{tA3, tA3VC, tA4} {
+			w.notReady[id] = true
+		}
+	})
+
+	for range h.cfg.ReadinessProbe.FailureThreshold {
+		h.c.ProbeAll(h.ctx)
+	}
+
 	h.release(imgA, d3)
 
 	r := h.active("a")
-	require.Equal(t, []string{tA3, "a-3/vc", tA4}, r.Batches[0].Targets)
-	require.Equal(t, "0.0% of 50%", r.Unavailable, "both nodes were quarantined in the halted batch, so both are free")
+	require.Equal(t, []string{tA3, tA3VC, tA4}, r.Batches[0].Targets)
+	require.Equal(t, "40.0% of 50%", r.Unavailable)
+
+	for _, rt := range r.Targets[:3] {
+		require.True(t, rt.Free)
+	}
 }
 
 func TestRestartRerunsInterruptedUpdates(t *testing.T) {
@@ -398,7 +404,6 @@ func TestViewHooksAreACopy(t *testing.T) {
 func TestSyncResolvesBeforeDeciding(t *testing.T) {
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
-	require.NoError(t, h.c.SetPolicy(h.ctx, actor, "a", Policy{Mode: ModeManual}))
 
 	// The tag has just moved but no poll has noticed. One sync is enough.
 	h.world.set(func(w *world) { w.registry[imgA] = d2 })
@@ -423,13 +428,17 @@ func TestSyncResolvesBeforeDeciding(t *testing.T) {
 func TestOnNewBuildCountsObservedDigestsOnly(t *testing.T) {
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
-	h.world.set(func(w *world) { w.updateFail[tA2] = refused })
+	h.world.set(func(w *world) { w.updateStuck[tA1], w.updateStuck[tA2] = true, true })
 	h.release(imgA, d2)
 	h.tick()
 
 	r := h.active("a")
-	require.Equal(t, Halted, r.State)
-	require.Equal(t, 0, r.OnNewBuild, "a failed update never reached the digest")
+	require.Equal(t, PhaseUpdating, h.phases(r)[tA2])
+	require.Equal(t, 0, r.OnNewBuild, "an update that has not landed is not on the build")
+
+	h.world.set(func(w *world) { w.running[tA1] = d2 })
+	h.tick()
+	require.Equal(t, 1, h.active("a").OnNewBuild)
 }
 
 func count(list []string, want string) int {
@@ -447,17 +456,15 @@ func count(list []string, want string) int {
 func TestRetryAndSyncReportStoreAndContextErrors(t *testing.T) {
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
-	h.world.set(func(w *world) { w.updateFail[tA1] = refused })
-	h.release(imgA, d2)
-
-	r := h.active("a")
-	require.Equal(t, Halted, r.State)
+	r := h.haltOnBadBuild("a", imgA, d2, tA1)
 
 	h.store.Fail = errFake
 	require.ErrorIs(t, h.c.Retry(h.ctx, actor, r.ID, "again"), errFake)
-	require.False(t, h.rollout(r.ID).RetryPending)
+	require.Equal(t, r.Rollout, h.rollout(r.ID).Rollout, "a refused retry leaves the halted rollout as it was")
 
 	h.store.Fail = nil
+	require.NoError(t, h.c.Retry(h.ctx, actor, r.ID, "store back"))
+	require.Equal(t, Running, h.rollout(r.ID).State)
 
 	// A sync resolves the registry first, so a cancelled context stops it there.
 	cancelled, cancel := context.WithCancel(h.ctx)

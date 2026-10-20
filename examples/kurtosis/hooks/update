@@ -1,34 +1,28 @@
 #!/usr/bin/env bash
-# Asks the node's updater to move the container to the tag's head, but only
-# when that head is the digest rolloor asked for: the updater can deploy
-# nothing else. If the tag has moved on, it leaves the container alone and
-# rolloor replaces the rollout on its next registry poll.
+# Asks the updater to deploy the tag's head only if it matches the requested
+# digest. A moving tag leaves the container alone until the next registry poll
+# replaces the rollout.
 set -euo pipefail
-source "$(dirname "$0")/lib.sh"
+source "$(dirname "$0")/lib.sh" || exit 3
 
 target=$(cat)
 name=$(jq -r .extra.container <<<"$target")
 desired=$(jq -r .desired <<<"$target")
 
-current=$(container_field "$(updater_get "/v1/containers?name=${name}")" digest)
-if [ "$current" = "$desired" ]; then
-  echo "already running $(short "$desired")"
-  exit 0
-fi
+list=$(updater_get "/v1/containers?name=${name}") || answer 3 "updater unreachable"
+current=$(container_field "$list" digest)
+[ "$current" != "$desired" ] || answer 0 "already running $(short "$desired")"
 
-check=$(updater_post "/v1/check?container=${name}")
-if err=$(container_field "$check" error) && [ -n "$err" ] && [ "$err" != null ]; then
-  echo "updater could not read the registry: $err"
-  exit 1
+check=$(updater_post "/v1/check?container=${name}") || answer 3 "updater unreachable"
+err=$(container_field "$check" error)
+if [ -n "$err" ] && [ "$err" != null ]; then
+  answer 3 "updater could not read the registry: $err"
 fi
 
 head=$(container_field "$check" latest_digest)
-if [ "$head" != "$desired" ]; then
-  echo "tag head is $(short "$head"), not $(short "$desired"); left as is"
-  exit 0
-fi
+[ "$head" = "$desired" ] || answer 0 "tag head is $(short "$head"), not $(short "$desired"); left as is"
 
 # Async: the updater takes it and restarts the container in the background;
 # rolloor then watches inspect for the digest.
-updater_post "/v1/update?container=${name}&async=true" >/dev/null
+updater_post "/v1/update?container=${name}&async=true" >/dev/null || answer 3 "updater unreachable"
 echo "update to $(short "$desired") started"

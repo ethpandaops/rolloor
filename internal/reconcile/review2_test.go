@@ -10,12 +10,9 @@ import (
 	"github.com/ethpandaops/rolloor/internal/targets"
 )
 
-// These tests pin the second review round.
-
 func TestSyncLeavesNothingBehindWhenTheStoreRefuses(t *testing.T) {
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
-	require.NoError(t, h.c.SetPolicy(h.ctx, actor, "a", Policy{Mode: ModeManual}))
 	h.world.set(func(w *world) { w.registry[imgA] = d2 })
 
 	h.store.Fail = errFake
@@ -29,15 +26,15 @@ func TestSyncLeavesNothingBehindWhenTheStoreRefuses(t *testing.T) {
 	h.clock.Advance(h.cfg.Registry.Poll)
 	h.tick()
 
-	r := h.active("a")
-	require.Equal(t, WaitingForSync, r.State)
+	before := h.active("a")
 
 	h.store.Fail = errFake
 	_, err = h.c.Sync(h.ctx, SyncRequest{Actor: actor, Selector: mustSel("client=a"), Force: true})
 	require.ErrorIs(t, err, errFake)
 
-	r = h.active("a")
-	require.Equal(t, WaitingForSync, r.State)
+	r := h.active("a")
+	require.Equal(t, before.State, r.State)
+	require.Equal(t, before.Batches, r.Batches)
 	require.False(t, r.Force)
 	require.False(t, r.Human)
 }
@@ -45,6 +42,7 @@ func TestSyncLeavesNothingBehindWhenTheStoreRefuses(t *testing.T) {
 func TestAbortIsAtomicWithItsMarker(t *testing.T) {
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
+	h.world.set(func(w *world) { w.updateStuck[tA1] = true })
 	h.release(imgA, d2)
 	r := h.active("a")
 
@@ -60,20 +58,45 @@ func TestAbortIsAtomicWithItsMarker(t *testing.T) {
 	require.Empty(t, snap.Aborted)
 
 	// A store that lost the rollout save but kept the marker: on restart the
-	// marker wins and the rollout is closed.
+	// marker wins, and the recovered end is stored at once.
+	unsaved := storedRollout(h, r.ID)
 	require.NoError(t, h.c.Abort(h.ctx, actor, r.ID))
 	require.Equal(t, Aborted, h.rollout(r.ID).State)
+	loseRolloutSave(h, unsaved)
 
-	h.store.mu.Lock()
-	h.store.rollouts[r.ID].State = Running
-	h.store.rollouts[r.ID].EndedAt = time.Time{}
-	h.store.mu.Unlock()
-
-	restarted := h.newController()
-	got, ok := restarted.Rollout(r.ID)
+	h.clock.Advance(time.Second)
+	got, ok := h.newController().Rollout(r.ID)
 	require.True(t, ok)
 	require.Equal(t, Aborted, got.State)
 	require.Contains(t, got.Reason, "before the last restart")
+	require.Equal(t, Aborted, durableState(h.store, r.ID))
+
+	hold := got.target(tA1).HoldUntil
+	require.Equal(t, h.clock.Now().Add(h.cfg.Strategy.ProgressDeadline), hold, "the update still landing keeps its node")
+
+	// A later restart finds the end on disk and keeps the same reservation.
+	h.clock.Advance(10 * time.Second)
+	again, ok := h.newController().Rollout(r.ID)
+	require.True(t, ok)
+	require.Equal(t, Aborted, again.State)
+	require.Equal(t, hold, again.target(tA1).HoldUntil)
+}
+
+// storedRollout copies a rollout as the store holds it.
+func storedRollout(h *harness, id string) *Rollout {
+	h.store.mu.Lock()
+	defer h.store.mu.Unlock()
+
+	return cloneRollout(h.store.rollouts[id])
+}
+
+// loseRolloutSave puts an earlier copy of a rollout back in the store, as if
+// a later save never landed.
+func loseRolloutSave(h *harness, earlier *Rollout) {
+	h.store.mu.Lock()
+	defer h.store.mu.Unlock()
+
+	h.store.rollouts[earlier.ID] = earlier
 }
 
 func TestBudgetStaysHeldWhileAnEndedRolloutMayStillBeLanding(t *testing.T) {
@@ -117,10 +140,10 @@ func TestBudgetStaysHeldWhileAnEndedRolloutMayStillBeLanding(t *testing.T) {
 	require.Equal(t, []string{tA3el}, rb.Batches[0].Targets)
 
 	// Once the update could no longer be landing, the hold lifts.
-	h.clock.Advance(h.cfg.Hooks.Timeout*5 + time.Second)
+	h.clock.Advance(h.cfg.Strategy.ProgressDeadline + time.Second)
 
 	h.c.mu.Lock()
-	busy := h.c.inFlightNodes(h.clock.Now())
+	busy := h.c.unavailableNodes(h.clock.Now())
 	h.c.mu.Unlock()
 	require.NotContains(t, busy, tA4[:3], "a-4 is no longer held")
 	require.Contains(t, busy, "a-3", "still in group b's open batch")
@@ -135,7 +158,7 @@ func TestSuspendedDuringItsUpdateDoesNotHaltTheBatch(t *testing.T) {
 	})
 	h.clock.Advance(h.cfg.Registry.Poll)
 
-	entered, release := h.world.gate("update")
+	entered, release := h.world.gate("update:" + tA1)
 
 	var wg sync.WaitGroup
 
@@ -158,8 +181,7 @@ func TestSuspendedDuringItsUpdateDoesNotHaltTheBatch(t *testing.T) {
 	r := h.active("a")
 	require.NotEqual(t, Halted, r.State, "the refused update belonged to a target that was no longer in play")
 	require.Equal(t, PhaseSkipped, h.phases(r)[tA1])
-	require.Contains(t, r.Targets[0].Reason, "suspended by robin")
-	require.Equal(t, PhaseUpdating, h.phases(r)[tA2])
+	require.Equal(t, d2, h.view(tA2).Live)
 }
 
 func TestTargetEditsMidRolloutRetireTheTarget(t *testing.T) {
@@ -240,27 +262,25 @@ func TestSoakEvidenceIsTheCompletedCheck(t *testing.T) {
 }
 
 func TestDegradedNodeCostsNothingForAnotherGroup(t *testing.T) {
-	// a-3 carries a-3/cl (group a) and a-3/el (group b). Quarantine a-3/cl,
-	// then group b's rollout must not pay for a-3 either.
+	// One node carries both groups. Its observed outage is already charged,
+	// so repairing the other group adds no unavailable weight for that node.
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
-	h.world.set(func(w *world) {
-		w.registry[imgA] = d2
-		w.running[tA1], w.running[tA2] = d2, d2
-		w.updateFail[tA3] = refused
-	})
+	h.world.set(func(w *world) { w.running[tA1], w.running[tA2] = d2, d2 })
 	h.c.InspectAll(h.ctx)
-	h.clock.Advance(h.cfg.Registry.Poll)
-	h.tick()
-	h.tick()
-	require.Equal(t, Halted, h.active("a").State)
-	require.Equal(t, Degraded, h.view(tA3).Health)
+	h.haltOnBadBuild("a", imgA, d2, tA3)
+	require.NotNil(t, h.view(tA3).Quarantine)
+
+	for range h.cfg.ReadinessProbe.FailureThreshold {
+		h.c.ProbeAll(h.ctx)
+	}
 
 	h.release(imgB, d2)
 	rb := h.active("b")
 	require.Equal(t, Running, rb.State)
 	require.Equal(t, []string{tA3el, "b-1/el"}, rb.Batches[0].Targets, "a-3 is free, so both weighted nodes fit")
-	require.Equal(t, "20.0% of 50%", rb.Unavailable)
+	require.True(t, rb.Targets[0].Free)
+	require.Equal(t, "40.0% of 50%", rb.Unavailable)
 }
 
 func TestLateInspectionOfAForgottenTargetIsDropped(t *testing.T) {
@@ -304,7 +324,6 @@ func TestHookRunsSurviveARestart(t *testing.T) {
 	h.prime()
 	h.world.set(func(w *world) { w.updateFail[tA1] = refused })
 	h.release(imgA, d2)
-	require.Equal(t, Halted, h.active("a").State)
 
 	restarted := h.newController()
 	v := mustView(t, restarted, tA1)
@@ -315,9 +334,7 @@ func TestHookRunsSurviveARestart(t *testing.T) {
 func TestEventsAboutTargets(t *testing.T) {
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
-	h.world.set(func(w *world) { w.updateFail[tA3el] = refused })
-	h.release(imgB, d2)
-	require.Equal(t, Halted, h.active("b").State)
+	h.haltOnBadBuild("b", imgB, d2, tA3el)
 
 	_, err := h.c.Suspend(h.ctx, SuspendRequest{Actor: actor, Selector: mustSel("node=a-3"), Reason: "x"})
 	require.NoError(t, err)
@@ -325,7 +342,7 @@ func TestEventsAboutTargets(t *testing.T) {
 	// Everything about node a-3: the halt (a group event), the suspension
 	// (a selector event) and its own target events; nothing about group a's
 	// image alone.
-	events, err := h.c.EventsAbout(h.ctx, h.set.Node("a-3"), EventQuery{Limit: 50})
+	events, err := h.c.EventsAbout(h.ctx, h.set.Node("a-3"), &EventQuery{Limit: 50})
 	require.NoError(t, err)
 
 	acts := map[string]bool{}
@@ -338,7 +355,7 @@ func TestEventsAboutTargets(t *testing.T) {
 	require.True(t, acts["rollout.created"], "%v", acts)
 
 	// Node b-1 is only in group b: the digest change for org/a is not its business.
-	events, err = h.c.EventsAbout(h.ctx, h.set.Node("b-1"), EventQuery{Limit: 2})
+	events, err = h.c.EventsAbout(h.ctx, h.set.Node("b-1"), &EventQuery{Limit: 2})
 	require.NoError(t, err)
 	require.Len(t, events, 2, "the limit applies after filtering")
 
@@ -352,7 +369,7 @@ func TestEventsAboutTargets(t *testing.T) {
 	require.True(t, eventConcerns(&Event{Rollout: "r"}, nil, nil, map[string]struct{}{"g": {}}, map[string]string{"r": "g"}))
 
 	h.store.Fail = errFake
-	_, err = h.c.EventsAbout(h.ctx, nil, EventQuery{})
+	_, err = h.c.EventsAbout(h.ctx, nil, &EventQuery{})
 	require.ErrorIs(t, err, errFake)
 }
 
@@ -390,8 +407,9 @@ func TestRefreshAskedForDuringAScanIsKept(t *testing.T) {
 }
 
 func TestInterruptedUpdateRunsAgainAfterRestart(t *testing.T) {
-	h := newHarness(t, testConfig, testTargets)
+	h := newHarness(t, replaceLine(testConfig, "retry: {limit: 1}", "retry: {limit: 5}"), testTargets)
 	h.prime()
+	h.world.set(func(w *world) { w.updateStuck[tA1] = true })
 	h.release(imgA, d2)
 
 	id := h.active("a").ID
@@ -404,6 +422,7 @@ func TestInterruptedUpdateRunsAgainAfterRestart(t *testing.T) {
 
 	updates := len(h.world.callsFor("update"))
 	restarted := h.newController()
+	h.world.set(func(w *world) { delete(w.updateStuck, tA1) })
 	require.NoError(t, restarted.Tick(h.ctx))
 
 	calls := h.world.callsFor("update")
@@ -423,13 +442,10 @@ func TestDesiredRef(t *testing.T) {
 func TestFlushRewritesQuarantineAndAbortMarkers(t *testing.T) {
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
-	h.world.set(func(w *world) { w.updateFail[tA1] = refused })
-	h.release(imgA, d2)
-	require.Equal(t, Halted, h.active("a").State)
+	h.haltOnBadBuild("a", imgA, d2, tA1)
 	require.NoError(t, h.c.Abort(h.ctx, actor, h.active("a").ID))
 
-	// A failing tick marks the state dirty; the recovering tick writes the
-	// quarantine and the abort marker again along with the rollouts.
+	// Recovery must preserve deletions as well as the abort marker.
 	h.store.Fail = errFake
 	h.world.set(func(w *world) { w.registry[imgB] = d2 })
 	h.clock.Advance(h.cfg.Registry.Poll)
@@ -445,6 +461,6 @@ func TestFlushRewritesQuarantineAndAbortMarkers(t *testing.T) {
 
 	snap, err := h.store.Load(h.ctx)
 	require.NoError(t, err)
-	require.Contains(t, snap.Degraded, tA1)
+	require.NotContains(t, snap.Degraded, tA1)
 	require.Contains(t, snap.Aborted, "a")
 }

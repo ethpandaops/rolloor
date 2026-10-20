@@ -1,12 +1,7 @@
 {{define "fleet"}}
 <div id="fleet" hx-get="/{{if .ShowHidden}}?hidden=1{{end}}" hx-trigger="every 5s" hx-swap="outerHTML">
 <div class="bar">
-  <div class="env-check {{if .Fleet.EnvOK}}ok{{else}}bad{{end}}">
-    {{if .Fleet.EnvCheck}}
-      {{if .Fleet.EnvOK}}Environment check passing.{{if .Fleet.EnvReason}} {{.Fleet.EnvReason}}{{end}} Automated rollouts may run.
-      {{else}}Environment check failing: {{.Fleet.EnvReason}}. Automated rollouts are paused; a person may still sync.{{end}}
-    {{else}}No environment check configured.{{end}}
-  </div>
+  <div class="badges">{{template "sync-badge" .Fleet.Sync}} {{template "health-badge" .Fleet.Health}}</div>
   <div class="budget">Disruption budget: {{.Fleet.Unavailable}} of {{.Fleet.MaxUnavailable}} unavailable</div>
 </div>
 
@@ -16,7 +11,7 @@
 {{range .Groups}}
   <a class="tile health-{{lower (printf "%s" .Health)}}" href="/groups/{{$.GroupLabel}}/{{.Name}}">
     <div class="tile-head"><span class="name">{{.Name}}</span><span class="count">{{.Targets}} targets</span></div>
-    <div class="badges">{{template "sync-badge" .Sync}} {{template "health-badge" .Health}}</div>
+    <div class="badges">{{template "sync-badge" .Sync}} {{template "health-badge" .Health}}{{if .Paused}} <span class="badge paused">Paused by config</span>{{end}}</div>
     {{if .Rollout}}<div class="progress"><b>{{.Rollout.OnNewBuild}} of {{.Rollout.Total}}</b> on {{.Rollout.Digest}}{{if .Rollout.Revision}} ({{.Rollout.Revision}}){{end}}</div>{{end}}
     <div class="reason">{{.Reason}}</div>
   </a>
@@ -31,7 +26,7 @@
 {{end}}
 
 {{if .Fleet.Resolve}}
-<div class="flash bad">Registry errors: {{range $img, $err := .Fleet.Resolve}}<span>{{$img}}: {{$err}}</span> {{end}}</div>
+<div class="flash bad">Registry errors, retried on every poll: {{range $img, $err := .Fleet.Resolve}}<span>{{$img}}: {{$err}}</span> {{end}}</div>
 {{end}}
 </div>
 {{end}}

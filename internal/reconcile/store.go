@@ -2,6 +2,7 @@ package reconcile
 
 import (
 	"context"
+	"crypto/rand"
 	"maps"
 	"sort"
 	"sync"
@@ -10,7 +11,6 @@ import (
 // Snapshot is everything the controller needs back after a restart.
 type Snapshot struct {
 	Rollouts    []*Rollout
-	Policies    map[string]Policy
 	Suspensions []Suspension
 	Live        map[string]Live
 	Degraded    map[string]string
@@ -18,6 +18,22 @@ type Snapshot struct {
 	Aborted     map[string]string
 	HookRuns    map[string]map[string]HookRun
 	NextEventID int64
+	HistoryID   string
+	Events      []Event
+}
+
+// Decision groups changed records with the history they cause.
+type Decision struct {
+	Rollouts          []*Rollout
+	Suspensions       []Suspension
+	DeleteSuspensions []string
+	DeleteTargets     []string
+	Degraded          map[string]string
+	Desired           map[string]Desired
+	Aborted           map[string]string
+	ClearAborted      []string
+	ClearDegraded     []string
+	Events            []Event
 }
 
 // Store persists the controller's decisions. The controller is the only
@@ -25,7 +41,7 @@ type Snapshot struct {
 type Store interface {
 	Load(ctx context.Context) (*Snapshot, error)
 	SaveRollout(ctx context.Context, r *Rollout) error
-	SavePolicy(ctx context.Context, group string, p Policy) error
+	SaveDecision(ctx context.Context, d *Decision) error
 	SaveSuspension(ctx context.Context, s *Suspension) error
 	DeleteSuspension(ctx context.Context, id string) error
 	SaveLive(ctx context.Context, id string, l *Live) error
@@ -37,11 +53,11 @@ type Store interface {
 	ClearAborted(ctx context.Context, group string) error
 	SaveHookRun(ctx context.Context, id string, run *HookRun) error
 	DeleteHookRuns(ctx context.Context, id string) error
-	// ReplaceDecisions rewrites rollouts, quarantines, abort markers,
-	// suspensions and desired digests to exactly the snapshot's, in one step.
+	// ReplaceDecisions replays pending decisions and observations, including
+	// deletions, in one step after a store failure.
 	ReplaceDecisions(ctx context.Context, snap *Snapshot) error
 	AppendEvent(ctx context.Context, e *Event) error
-	Events(ctx context.Context, q EventQuery) ([]Event, error)
+	Events(ctx context.Context, q *EventQuery) ([]Event, error)
 }
 
 // EventQuery filters history.
@@ -51,6 +67,9 @@ type EventQuery struct {
 	Target  string
 	// After returns only events with a greater id, oldest first, for replay.
 	After int64
+	// Oldest returns events oldest first even when After is zero, so a
+	// follower can read a history from its very first event.
+	Oldest bool
 	// Before returns only events with a smaller id, for paging back.
 	Before int64
 	Limit  int
@@ -66,13 +85,13 @@ type Notifier interface {
 type MemoryStore struct {
 	mu          sync.Mutex
 	rollouts    map[string]*Rollout
-	policies    map[string]Policy
 	suspensions map[string]Suspension
 	live        map[string]Live
 	degraded    map[string]string
 	desired     map[string]Desired
 	aborted     map[string]string
 	events      []Event
+	historyID   string
 	// Fail, when set, is returned by every write; FailRollouts by rollout
 	// saves only. Tests use them.
 	Fail         error
@@ -84,13 +103,13 @@ type MemoryStore struct {
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
 		rollouts:    map[string]*Rollout{},
-		policies:    map[string]Policy{},
 		suspensions: map[string]Suspension{},
 		live:        map[string]Live{},
 		degraded:    map[string]string{},
 		desired:     map[string]Desired{},
 		aborted:     map[string]string{},
 		hookRuns:    map[string]map[string]HookRun{},
+		historyID:   rand.Text(),
 	}
 }
 
@@ -106,13 +125,13 @@ func (m *MemoryStore) Load(context.Context) (*Snapshot, error) {
 	}
 
 	s := &Snapshot{
-		Policies:    map[string]Policy{},
 		Live:        map[string]Live{},
 		Degraded:    map[string]string{},
 		Desired:     map[string]Desired{},
 		Aborted:     map[string]string{},
 		HookRuns:    map[string]map[string]HookRun{},
 		NextEventID: int64(len(m.events)) + 1,
+		HistoryID:   m.historyID,
 	}
 
 	for id, runs := range m.hookRuns {
@@ -125,18 +144,14 @@ func (m *MemoryStore) Load(context.Context) (*Snapshot, error) {
 
 	sort.Slice(s.Rollouts, func(i, j int) bool { return s.Rollouts[i].ID < s.Rollouts[j].ID })
 
-	for k, v := range m.policies {
-		s.Policies[k] = v
-	}
-
 	for _, v := range m.suspensions {
 		s.Suspensions = append(s.Suspensions, v)
 	}
 
 	sort.Slice(s.Suspensions, func(i, j int) bool { return s.Suspensions[i].ID < s.Suspensions[j].ID })
 
-	for k, v := range m.live {
-		s.Live[k] = v
+	for k := range m.live {
+		s.Live[k] = m.live[k]
 	}
 
 	for k, v := range m.degraded {
@@ -176,6 +191,54 @@ func cloneRollout(r *Rollout) *Rollout {
 	return &cp
 }
 
+// SaveDecision stores records and their events under one lock.
+func (m *MemoryStore) SaveDecision(_ context.Context, d *Decision) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.Fail != nil {
+		return m.Fail
+	}
+
+	if len(d.Rollouts) > 0 && m.FailRollouts != nil {
+		return m.FailRollouts
+	}
+
+	for _, r := range d.Rollouts {
+		m.rollouts[r.ID] = cloneRollout(r)
+	}
+
+	for _, s := range d.Suspensions {
+		m.suspensions[s.ID] = s
+	}
+
+	for _, id := range d.DeleteSuspensions {
+		delete(m.suspensions, id)
+	}
+
+	for _, id := range d.DeleteTargets {
+		delete(m.live, id)
+		delete(m.degraded, id)
+		delete(m.hookRuns, id)
+	}
+
+	maps.Copy(m.desired, d.Desired)
+	maps.Copy(m.aborted, d.Aborted)
+	maps.Copy(m.degraded, d.Degraded)
+
+	for _, group := range d.ClearAborted {
+		delete(m.aborted, group)
+	}
+
+	for _, id := range d.ClearDegraded {
+		delete(m.degraded, id)
+	}
+
+	m.events = append(m.events, d.Events...)
+
+	return nil
+}
+
 // SaveRollout stores a copy.
 func (m *MemoryStore) SaveRollout(_ context.Context, r *Rollout) error {
 	m.mu.Lock()
@@ -190,20 +253,6 @@ func (m *MemoryStore) SaveRollout(_ context.Context, r *Rollout) error {
 	}
 
 	m.rollouts[r.ID] = cloneRollout(r)
-
-	return nil
-}
-
-// SavePolicy stores a policy.
-func (m *MemoryStore) SavePolicy(_ context.Context, group string, p Policy) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if m.Fail != nil {
-		return m.Fail
-	}
-
-	m.policies[group] = p
 
 	return nil
 }
@@ -381,6 +430,13 @@ func (m *MemoryStore) ReplaceDecisions(_ context.Context, snap *Snapshot) error 
 
 	m.degraded = maps.Clone(snap.Degraded)
 	m.aborted = maps.Clone(snap.Aborted)
+	m.live = maps.Clone(snap.Live)
+	m.hookRuns = make(map[string]map[string]HookRun, len(snap.HookRuns))
+
+	for id, runs := range snap.HookRuns {
+		m.hookRuns[id] = maps.Clone(runs)
+	}
+
 	m.suspensions = map[string]Suspension{}
 
 	for _, sp := range snap.Suspensions {
@@ -388,6 +444,7 @@ func (m *MemoryStore) ReplaceDecisions(_ context.Context, snap *Snapshot) error 
 	}
 
 	maps.Copy(m.desired, snap.Desired)
+	m.events = append(m.events, snap.Events...)
 
 	return nil
 }
@@ -407,7 +464,7 @@ func (m *MemoryStore) AppendEvent(_ context.Context, e *Event) error {
 }
 
 // Events returns history newest first.
-func (m *MemoryStore) Events(_ context.Context, q EventQuery) ([]Event, error) {
+func (m *MemoryStore) Events(_ context.Context, q *EventQuery) ([]Event, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -417,10 +474,14 @@ func (m *MemoryStore) Events(_ context.Context, q EventQuery) ([]Event, error) {
 
 	var out []Event
 
-	if q.After > 0 {
+	if q.After > 0 || q.Oldest {
 		for i := range m.events {
 			if m.events[i].ID > q.After {
 				out = append(out, m.events[i])
+			}
+
+			if q.Limit > 0 && len(out) == q.Limit {
+				break
 			}
 		}
 

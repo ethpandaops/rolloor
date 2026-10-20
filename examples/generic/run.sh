@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
-# The generic end-to-end run. Six nginx containers on a local registry move
-# from build A to build B in waves and batches under the disruption budget,
-# with rolloor killed mid-batch and restarted; a broken build C halts and
-# quarantines; build D supersedes and converges with the quarantined targets
-# first. Needs docker, curl and jq.
+# Six nginx containers move A to B under the disruption budget, with a
+# controller restart mid-batch. Broken C halts; D converges with not-ready
+# targets first. Needs docker, curl and jq.
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
@@ -135,12 +133,12 @@ untouched=$(curl -fsS "$api/targets" | jq '[.[] | select(.live | endswith("'"$(c
 echo "degraded: $degraded, still on B: $untouched"
 [ "$degraded" -ge 1 ] && [ "$untouched" -ge 1 ]
 
-log "build D supersedes and converges, quarantined targets first"
+log "build D supersedes and converges, not-ready targets first"
 build D "build D"
 for _ in $(seq 1 30); do r3=$(active_rollout); [ -n "$r3" ] && [ "$r3" != "$r2" ] && break; sleep 1; done
 wait_state "$r2" Superseded 30
-first_target=$(curl -fsS "$api/rollouts/$r3" | jq -r '.targets[0].degradedBefore')
-[ "$first_target" = "true" ] || { echo "degraded targets did not go first" >&2; exit 1; }
+first_target=$(curl -fsS "$api/rollouts/$r3" | jq -r '.targets[0].notReadyBefore')
+[ "$first_target" = "true" ] || { echo "not-ready targets did not go first" >&2; exit 1; }
 wait_state "$r3" Complete 300
 [ "$(curl -fsS "$api/targets" | jq '[.[] | select(.health == "Healthy" and .sync == "Synced")] | length')" = "6" ]
 

@@ -14,6 +14,9 @@ type Identity struct {
 	Owners []string `json:"owners"`
 	// Admin identities may act on anything.
 	Admin bool `json:"admin"`
+	// Session is set when a browser session cookie, not a token, established
+	// the identity, so a state change must also prove it came from this site.
+	Session bool `json:"-"`
 }
 
 // Authorizer resolves a request to an identity and decides what it may do.

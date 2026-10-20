@@ -23,14 +23,22 @@ const (
 type Collector struct {
 	c *reconcile.Controller
 
-	targetInfo   *prometheus.Desc
-	targetSync   *prometheus.Desc
-	targetHealth *prometheus.Desc
-	rolloutState *prometheus.Desc
-	budgetRatio  *prometheus.Desc
-	envPassing   *prometheus.Desc
-	envCheckedAt *prometheus.Desc
-	lastTick     *prometheus.Desc
+	targetInfo         *prometheus.Desc
+	targetSync         *prometheus.Desc
+	targetHealth       *prometheus.Desc
+	rolloutState       *prometheus.Desc
+	budgetRatio        *prometheus.Desc
+	lastTick           *prometheus.Desc
+	unavailableRatio   *prometheus.Desc
+	storeWritesOwed    *prometheus.Desc
+	targetsLoadFailed  *prometheus.Desc
+	lastInspect        *prometheus.Desc
+	lastProbe          *prometheus.Desc
+	resolveFailures    *prometheus.Desc
+	soakBlocked        *prometheus.Desc
+	configReloadFailed *prometheus.Desc
+	configPaused       *prometheus.Desc
+	groupPaused        *prometheus.Desc
 }
 
 var _ prometheus.Collector = (*Collector)(nil)
@@ -38,21 +46,31 @@ var _ prometheus.Collector = (*Collector)(nil)
 // NewCollector builds the descriptors.
 func NewCollector(c *reconcile.Controller) *Collector {
 	return &Collector{
-		c:            c,
-		targetInfo:   prometheus.NewDesc(namespace+"_target_info", "One series per target with its current digests.", []string{labelID, "node", labelGroup, "owner", "image", "desired", "live"}, nil),
-		targetSync:   prometheus.NewDesc(namespace+"_target_sync", "0 synced, 1 out of sync, 2 unknown.", []string{labelID, labelGroup}, nil),
-		targetHealth: prometheus.NewDesc(namespace+"_target_health", "0 healthy, 1 progressing, 2 degraded, 3 suspended.", []string{labelID, labelGroup}, nil),
-		rolloutState: prometheus.NewDesc(namespace+"_rollout_state", "1 for the state a rollout is in.", []string{"rollout", labelGroup, "state"}, nil),
-		budgetRatio:  prometheus.NewDesc(namespace+"_disruption_budget_ratio", "Weight mid-update over what the disruption budget allows.", nil, nil),
-		envPassing:   prometheus.NewDesc(namespace+"_environment_check_passing", "1 when the environment check passes.", nil, nil),
-		envCheckedAt: prometheus.NewDesc(namespace+"_environment_checked_at_seconds", "When the environment check last ran.", nil, nil),
-		lastTick:     prometheus.NewDesc(namespace+"_last_tick_timestamp_seconds", "When the reconcile loop last completed a pass.", nil, nil),
+		c:                  c,
+		targetInfo:         prometheus.NewDesc(namespace+"_target_info", "One series per target with its current digests.", []string{labelID, "node", labelGroup, "owner", "image", "desired", "live"}, nil),
+		targetSync:         prometheus.NewDesc(namespace+"_target_sync", "0 synced, 1 out of sync, 2 unknown.", []string{labelID, labelGroup}, nil),
+		targetHealth:       prometheus.NewDesc(namespace+"_target_health", "0 healthy, 1 progressing, 2 degraded, 3 suspended, 4 unknown.", []string{labelID, labelGroup}, nil),
+		rolloutState:       prometheus.NewDesc(namespace+"_rollout_state", "1 for the state a rollout is in.", []string{"rollout", labelGroup, "state"}, nil),
+		budgetRatio:        prometheus.NewDesc(namespace+"_disruption_budget_ratio", "Unavailable weight over what the disruption budget allows.", nil, nil),
+		lastTick:           prometheus.NewDesc(namespace+"_last_tick_timestamp_seconds", "When the reconcile loop last completed a pass.", nil, nil),
+		unavailableRatio:   prometheus.NewDesc(namespace+"_fleet_unavailable_weight_ratio", "Unavailable node weight divided by total fleet weight.", nil, nil),
+		storeWritesOwed:    prometheus.NewDesc(namespace+"_store_writes_owed", "1 while decisions or history await durable storage.", nil, nil),
+		targetsLoadFailed:  prometheus.NewDesc(namespace+"_targets_load_failed", "1 while targets files fail to load.", nil, nil),
+		lastInspect:        prometheus.NewDesc(namespace+"_last_inspect_timestamp_seconds", "When the last inspect pass completed, or 0 before the first pass.", nil, nil),
+		lastProbe:          prometheus.NewDesc(namespace+"_last_probe_timestamp_seconds", "When the last readiness probe pass completed, or 0 before the first pass.", nil, nil),
+		resolveFailures:    prometheus.NewDesc(namespace+"_registry_resolve_failed", "1 for each image whose most recent registry resolution failed.", []string{"image"}, nil),
+		soakBlocked:        prometheus.NewDesc(namespace+"_soak_check_blocked", "1 while an active rollout waits for indeterminate soak checks to recover.", []string{labelGroup}, nil),
+		configReloadFailed: prometheus.NewDesc(namespace+"_config_reload_failed", "1 while the latest config reload attempt failed.", nil, nil),
+		configPaused:       prometheus.NewDesc(namespace+"_config_paused", "1 while the effective top-level config pauses updates.", nil, nil),
+		groupPaused:        prometheus.NewDesc(namespace+"_group_paused", "1 while the effective config pauses a group.", []string{labelGroup}, nil),
 	}
 }
 
 // Describe sends every descriptor.
 func (m *Collector) Describe(ch chan<- *prometheus.Desc) {
-	for _, d := range []*prometheus.Desc{m.targetInfo, m.targetSync, m.targetHealth, m.rolloutState, m.budgetRatio, m.envPassing, m.envCheckedAt, m.lastTick} {
+	for _, d := range []*prometheus.Desc{m.targetInfo, m.targetSync, m.targetHealth, m.rolloutState, m.budgetRatio, m.lastTick,
+		m.unavailableRatio, m.storeWritesOwed, m.targetsLoadFailed, m.lastInspect, m.lastProbe, m.resolveFailures, m.soakBlocked,
+		m.configReloadFailed, m.configPaused, m.groupPaused} {
 		ch <- d
 	}
 }
@@ -73,7 +91,17 @@ func (m *Collector) Collect(ch chan<- prometheus.Metric) {
 		}
 	}
 
-	var ratio float64
+	fleet := m.c.FleetStatus()
+
+	var ratio, unavailableRatio float64
+
+	if fleet.MaxUnavailableWeight > 0 {
+		ratio = fleet.UnavailableWeight / fleet.MaxUnavailableWeight
+	}
+
+	if fleet.Weight > 0 {
+		unavailableRatio = fleet.UnavailableWeight / fleet.Weight
+	}
 
 	rollouts := m.c.Rollouts()
 
@@ -82,23 +110,53 @@ func (m *Collector) Collect(ch chan<- prometheus.Metric) {
 		if r.State.Active() {
 			ch <- prometheus.MustNewConstMetric(m.rolloutState, prometheus.GaugeValue, 1, r.ID, r.Group, string(r.State))
 
-			if r.MaxUnavailableWeight > 0 {
-				ratio = r.UnavailableWeight / r.MaxUnavailableWeight
-			}
+			blocked := r.State == reconcile.Soaking && r.Soak.ConsecutiveErrors > 0
+			ch <- prometheus.MustNewConstMetric(m.soakBlocked, prometheus.GaugeValue, boolValue(blocked), r.Group)
 		}
 	}
 
 	ch <- prometheus.MustNewConstMetric(m.budgetRatio, prometheus.GaugeValue, ratio)
 
-	ok, _, at := m.c.EnvironmentStatus()
+	ch <- prometheus.MustNewConstMetric(m.lastTick, prometheus.GaugeValue, timestamp(m.c.LastTick()))
 
-	for _, metric := range []prometheus.Metric{
-		prometheus.MustNewConstMetric(m.envPassing, prometheus.GaugeValue, boolValue(ok)),
-		prometheus.MustNewConstMetric(m.envCheckedAt, prometheus.GaugeValue, float64(at.Unix())),
-		prometheus.MustNewConstMetric(m.lastTick, prometheus.GaugeValue, float64(m.c.LastTick().Unix())),
-	} {
-		ch <- metric
+	ch <- prometheus.MustNewConstMetric(m.unavailableRatio, prometheus.GaugeValue, unavailableRatio)
+
+	ch <- prometheus.MustNewConstMetric(m.storeWritesOwed, prometheus.GaugeValue, boolValue(fleet.StoreWritesOwed))
+
+	ch <- prometheus.MustNewConstMetric(m.targetsLoadFailed, prometheus.GaugeValue, boolValue(fleet.TargetsLoadFailed))
+
+	ch <- prometheus.MustNewConstMetric(m.lastInspect, prometheus.GaugeValue, timestamp(fleet.LastInspect))
+
+	ch <- prometheus.MustNewConstMetric(m.lastProbe, prometheus.GaugeValue, timestamp(fleet.LastProbe))
+
+	paused, failed, groups := m.c.AutomationStatus()
+	ch <- prometheus.MustNewConstMetric(m.configPaused, prometheus.GaugeValue, boolValue(paused))
+
+	ch <- prometheus.MustNewConstMetric(m.configReloadFailed, prometheus.GaugeValue, boolValue(failed))
+
+	for group, held := range groups {
+		ch <- prometheus.MustNewConstMetric(m.groupPaused, prometheus.GaugeValue, boolValue(held), group)
 	}
+
+	for image := range fleet.Resolve {
+		ch <- prometheus.MustNewConstMetric(m.resolveFailures, prometheus.GaugeValue, 1, image)
+	}
+}
+
+func timestamp(at time.Time) float64 {
+	if at.IsZero() {
+		return 0
+	}
+
+	return float64(at.Unix())
+}
+
+func boolValue(value bool) float64 {
+	if value {
+		return 1
+	}
+
+	return 0
 }
 
 func syncValue(s reconcile.SyncState) float64 {
@@ -124,17 +182,9 @@ func healthValue(h reconcile.Health) float64 {
 		return 2
 	case reconcile.Suspended:
 		return 3
+	default:
+		return 4
 	}
-
-	return 0
-}
-
-func boolValue(b bool) float64 {
-	if b {
-		return 1
-	}
-
-	return 0
 }
 
 // HookRunner wraps a runner and records how each hook does.
@@ -178,7 +228,7 @@ func (h *HookRunner) Run(ctx context.Context, program, hook, targetID string, in
 	outcome := "ok"
 
 	switch {
-	case err != nil:
+	case err != nil || res.CouldNotCheck():
 		outcome = "error"
 	case !res.OK:
 		outcome = "failed"

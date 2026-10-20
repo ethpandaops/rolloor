@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"net/http"
@@ -47,7 +48,7 @@ type OIDC struct {
 	log        observability.ContextualLogger
 	now        func() time.Time
 	// encode and random are the codec's and crypto/rand's, replaceable in tests.
-	encode func(any) (string, error)
+	encode func(name string, v any) (string, error)
 	random func() (string, error)
 }
 
@@ -130,11 +131,14 @@ func (o *OIDC) Identity(r *http.Request) (api.Identity, error) {
 	}
 
 	var s session
-	if err := o.sessions.decode(c.Value, &s); err != nil || o.now().After(s.Expires) || s.Name == "" {
+	if err := o.sessions.decode(sessionCookie, c.Value, &s); err != nil || o.now().After(s.Expires) || s.Name == "" {
 		return api.Identity{}, ErrNotSignedIn
 	}
 
-	return o.identityFor(s.Name), nil
+	id := o.identityFor(s.Name)
+	id.Session = true
+
+	return id, nil
 }
 
 // identityFor builds the identity: owners from the teams file, or the name
@@ -203,7 +207,24 @@ func (o *OIDC) Middleware(next http.Handler) http.Handler {
 	return mux
 }
 
+// loginState is what the state cookie carries from login to callback. Only
+// State goes through the issuer; it is random, so the URL reveals nothing.
+type loginState struct {
+	State    string    `json:"s"`
+	Nonce    string    `json:"n"`
+	Verifier string    `json:"v"`
+	Next     string    `json:"next"`
+	Expires  time.Time `json:"e"`
+}
+
 func (o *OIDC) login(w http.ResponseWriter, r *http.Request) {
+	state, err := o.random()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+
+		return
+	}
+
 	nonce, err := o.random()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -211,41 +232,44 @@ func (o *OIDC) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	next := r.URL.Query().Get("next")
-	if !strings.HasPrefix(next, "/") || strings.HasPrefix(next, "//") {
-		next = "/"
-	}
-
+	next := returnTo(r.URL.Query().Get("next"))
 	verifier := oauth2.GenerateVerifier()
 
-	state, err := o.encode(map[string]any{"n": nonce, "v": verifier, "next": next, "e": o.now().Add(stateTTL)})
+	value, err := o.encode(stateCookie, loginState{State: state, Nonce: nonce, Verifier: verifier, Next: next, Expires: o.now().Add(stateTTL)})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 
 		return
 	}
 
-	setCookie(w, r, stateCookie, state, int(stateTTL.Seconds()))
+	setCookie(w, r, stateCookie, value, int(stateTTL.Seconds()))
 	http.Redirect(w, r, o.oauth.AuthCodeURL(state, oidc.Nonce(nonce), oauth2.S256ChallengeOption(verifier)), http.StatusFound)
 }
 
+// returnTo turns a requested return path into a path on this site, or the
+// root. Re-encoding it escapes what browsers would read as another host.
+func returnTo(next string) string {
+	u, err := url.Parse(next)
+	if err != nil || !strings.HasPrefix(next, "/") || strings.HasPrefix(next, "//") {
+		return "/"
+	}
+
+	return u.String()
+}
+
 func (o *OIDC) callback(w http.ResponseWriter, r *http.Request) {
+	var st loginState
+
+	// The browser drops the cookie when it lapses, so missing reads as expired.
 	c, err := r.Cookie(stateCookie)
-	if err != nil || c.Value != r.URL.Query().Get("state") {
-		http.Error(w, "login state mismatch; start again", http.StatusBadRequest)
+	if err != nil || o.sessions.decode(stateCookie, c.Value, &st) != nil || o.now().After(st.Expires) {
+		http.Error(w, "login state expired; start again", http.StatusBadRequest)
 
 		return
 	}
 
-	var st struct {
-		Nonce    string    `json:"n"`
-		Verifier string    `json:"v"`
-		Next     string    `json:"next"`
-		Expires  time.Time `json:"e"`
-	}
-
-	if decodeErr := o.sessions.decode(c.Value, &st); decodeErr != nil || o.now().After(st.Expires) {
-		http.Error(w, "login state expired; start again", http.StatusBadRequest)
+	if st.State == "" || subtle.ConstantTimeCompare([]byte(st.State), []byte(r.URL.Query().Get("state"))) != 1 {
+		http.Error(w, "login state mismatch; start again", http.StatusBadRequest)
 
 		return
 	}
@@ -274,7 +298,7 @@ func (o *OIDC) callback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	value, err := o.encode(session{Name: name, Expires: o.now().Add(sessionTTL)})
+	value, err := o.encode(sessionCookie, session{Name: name, Expires: o.now().Add(sessionTTL)})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 

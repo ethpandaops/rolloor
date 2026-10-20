@@ -73,15 +73,48 @@ func (p *process) SaveRollout(ctx context.Context, r *Rollout) error {
 		return nil
 	}
 
-	return p.MemoryStore.SaveRollout(ctx, r)
+	p.MemoryStore.mu.Lock()
+	before := p.rollouts[r.ID]
+	p.MemoryStore.mu.Unlock()
+
+	problem := p.sim.admissionProblem(r, before)
+	if err := p.MemoryStore.SaveRollout(ctx, r); err != nil {
+		return err
+	}
+
+	if problem != nil {
+		p.sim.violation("%v", problem)
+	}
+
+	return nil
 }
 
-func (p *process) SavePolicy(ctx context.Context, group string, pol Policy) error {
+func (p *process) SaveDecision(ctx context.Context, d *Decision) error {
 	if !p.lands() {
 		return nil
 	}
 
-	return p.MemoryStore.SavePolicy(ctx, group, pol)
+	var problems []error
+
+	for _, r := range d.Rollouts {
+		p.MemoryStore.mu.Lock()
+		before := p.rollouts[r.ID]
+		p.MemoryStore.mu.Unlock()
+
+		if problem := p.sim.admissionProblem(r, before); problem != nil {
+			problems = append(problems, problem)
+		}
+	}
+
+	if err := p.MemoryStore.SaveDecision(ctx, d); err != nil {
+		return err
+	}
+
+	for _, problem := range problems {
+		p.sim.violation("%v", problem)
+	}
+
+	return nil
 }
 
 func (p *process) SaveSuspension(ctx context.Context, s *Suspension) error {
@@ -189,14 +222,14 @@ func (p *process) AppendEvent(ctx context.Context, e *Event) error {
 }
 
 // onDisk reports whether the store holds an active rollout whose open batch
-// includes the target, moving it to this digest.
+// includes the target, moving it to this digest, with its dispatch counted.
 func onDisk(disk *MemoryStore, id, digest string) bool {
 	disk.mu.Lock()
 	defer disk.mu.Unlock()
 
 	for _, r := range disk.rollouts {
 		b := r.CurrentBatch()
-		if r.State.Active() && b != nil && slices.Contains(b.Targets, id) && slices.Contains(sortedValues(r.Desired), digest) {
+		if r.State.Active() && b != nil && slices.Contains(b.Targets, id) && slices.Contains(sortedValues(r.Desired), digest) && r.target(id).UpdateAttempts > 0 {
 			return true
 		}
 	}

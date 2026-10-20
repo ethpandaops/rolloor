@@ -23,7 +23,7 @@ func writeFixture(t *testing.T) (string, string) {
 	require.NoError(t, os.MkdirAll(hooksDir, 0o755))
 	require.NoError(t, os.MkdirAll(targetsDir, 0o755))
 
-	for _, name := range []string{"inspect", "update", "ready", "env"} {
+	for _, name := range []string{"inspect", "update", "ready"} {
 		body := "#!/bin/sh\ncat >/dev/null; echo sha256:abc\n"
 		if name == "ready" {
 			body = "#!/bin/sh\nexit 1\n"
@@ -45,7 +45,7 @@ targetsDir: `+targetsDir+`
 teamsFile: `+filepath.Join(dir, "teams.yaml")+`
 labels: {group: client, owner: owner}
 registry: {plainHttp: ["127.0.0.1:1"], poll: 1s}
-hooks: {dir: `+hooksDir+`, environment: {program: env}}
+hooks: {dir: `+hooksDir+`}
 `), 0o644))
 
 	return dir, cfg
@@ -80,7 +80,6 @@ func TestValidateAndHook(t *testing.T) {
 	require.Contains(t, out.String(), "sha256:abc")
 	require.Contains(t, out.String(), "sha256:abc")
 
-	require.NoError(t, runHook(ctx, &out, cfg, "environment", "", "", ""))
 	require.ErrorContains(t, runHook(ctx, &out, cfg, "ready", "a/x", "", "sha256:abc"), "did not pass")
 	require.ErrorContains(t, runHook(ctx, &out, cfg, "soak", "a/x", "", ""), "no program configured")
 	require.ErrorContains(t, runHook(ctx, &out, cfg, "inspect", "nope", "", ""), "not in the targets files")

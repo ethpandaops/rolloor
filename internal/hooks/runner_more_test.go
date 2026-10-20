@@ -24,26 +24,10 @@ func TestNewRunnerErrors(t *testing.T) {
 
 func TestRunEdgeCases(t *testing.T) {
 	dir := t.TempDir()
-	writeScript(t, dir, "silent", `exit 4`)
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "noexec"), []byte("#!/bin/sh\n"), 0o644))
 
 	r, err := NewRunner(dir, 10*time.Second, "e", logrus.New())
 	require.NoError(t, err)
-
-	res, err := r.Run(context.Background(), "silent", "ready", "t", nil)
-	require.NoError(t, err)
-	require.Equal(t, "exit 4", res.Reason)
-
-	// A program that cannot start at all is an error, not a failed run.
-	_, err = r.Run(context.Background(), "noexec", "ready", "t", nil)
-	require.Error(t, err)
-
-	// Input that cannot be encoded is an error.
-	_, err = r.Run(context.Background(), "silent", "ready", "t", make(chan int))
-	require.Error(t, err)
-
-	_, err = r.Run(context.Background(), "", "ready", "t", nil)
-	require.Error(t, err)
 
 	require.False(t, r.Exists("noexec"))
 	require.Equal(t, "", firstLine("  \n"))

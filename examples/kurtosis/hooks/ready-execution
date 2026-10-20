@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # Ready when the execution client has finished syncing.
 set -euo pipefail
+source "$(dirname "$0")/lib.sh" || exit 3
 
 target=$(cat)
 rpc=$(jq -r .extra.rpc <<<"$target")
 
 r=$(curl -fsS --max-time 10 -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"eth_syncing","params":[]}' "$rpc") || { echo "execution API unreachable"; exit 1; }
+  -d '{"jsonrpc":"2.0","id":1,"method":"eth_syncing","params":[]}' "$rpc") || unreachable "execution API"
+result=$(jq -c .result <<<"$r")
 
-[ "$(jq -c .result <<<"$r")" = false ] || { echo "syncing"; exit 1; }
-
-echo "synced"
+case $result in
+  false) answer 0 "synced" ;;
+  "{"*) answer 1 "syncing" ;;
+  *) answer 3 "execution API gave no sync status" ;;
+esac

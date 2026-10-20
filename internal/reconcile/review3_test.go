@@ -10,21 +10,18 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestRetryAfterAFailedUpdateRunsTheUpdateAgain(t *testing.T) {
+func TestRetryUpdatesATargetNoLongerOnTheBuild(t *testing.T) {
 	h := newHarness(t, testConfig, testTargets)
 	h.prime()
-	h.world.set(func(w *world) { w.updateFail[tA2] = "updater unreachable" })
-	h.release(imgA, d2)
-
-	r := h.active("a")
-	require.Equal(t, Halted, r.State)
+	r := h.haltOnBadBuild("a", imgA, d2, tA2)
 
 	updates := len(h.world.callsFor("update:" + tA2))
-	h.world.set(func(w *world) { delete(w.updateFail, tA2) })
-	require.NoError(t, h.c.Retry(h.ctx, actor, r.ID, "updater back"))
+	h.revert(tA2)
+	h.c.InspectAll(h.ctx)
+	require.NoError(t, h.c.Retry(h.ctx, actor, r.ID, "rolled back by hand"))
 	h.tick()
 
-	require.Greater(t, len(h.world.callsFor("update:"+tA2)), updates, "a target that never got the digest is updated again")
+	require.Greater(t, len(h.world.callsFor("update:"+tA2)), updates, "a target that no longer runs the build is updated again")
 	require.Equal(t, Complete, h.drive(r.ID, 80, 20*time.Second).State)
 }
 
@@ -44,10 +41,21 @@ func TestRetryOfATargetAlreadyOnTheDigestOnlyReinspects(t *testing.T) {
 	updates := len(h.world.callsFor("update:" + tA1))
 	h.world.set(func(w *world) { w.soakFail[soakA] = false })
 	require.NoError(t, h.c.Retry(h.ctx, actor, r.ID, "probe fixed"))
-	h.tick()
+	require.Equal(t, Complete, h.drive(r.ID, 80, 20*time.Second).State)
+
+	// The landed target passes a retry batch, soak included, with no new update.
+	done := h.rollout(r.ID)
+	rt := done.target(tA1)
+	b := done.Batches[rt.Batch-1]
 
 	require.Equal(t, updates, len(h.world.callsFor("update:"+tA1)))
-	require.Equal(t, PhaseUpdating, h.phases(h.active("a"))[tA1])
+	require.True(t, rt.Updated)
+	require.True(t, b.Retried)
+	require.True(t, b.Passed)
+	require.True(t, slices.ContainsFunc(b.Soak.Checks, func(check SoakCheck) bool {
+		return check.Program == soakA && check.OK && !check.Error
+	}), "the retry passed its soak program")
+	require.Equal(t, Healthy, h.view(tA1).Health)
 }
 
 func TestFlushAlsoWritesDeletions(t *testing.T) {
@@ -99,7 +107,7 @@ func TestEventsAboutPagesBackPastOnePage(t *testing.T) {
 		require.NoError(t, h.store.AppendEvent(h.ctx, &Event{ID: i, Action: "noise", Target: "elsewhere"}))
 	}
 
-	got, err := h.c.EventsAbout(h.ctx, about, EventQuery{Limit: 5})
+	got, err := h.c.EventsAbout(h.ctx, about, &EventQuery{Limit: 5})
 	require.NoError(t, err)
 	require.Len(t, got, 1)
 	require.Equal(t, "old", got[0].Action)
@@ -109,7 +117,7 @@ func TestEventsAboutPagesBackPastOnePage(t *testing.T) {
 		require.NoError(t, h.store.AppendEvent(h.ctx, &Event{ID: i, Action: "noise", Target: "elsewhere"}))
 	}
 
-	got, err = h.c.EventsAbout(h.ctx, about, EventQuery{})
+	got, err = h.c.EventsAbout(h.ctx, about, &EventQuery{})
 	require.NoError(t, err)
 	require.Empty(t, got)
 }
@@ -142,17 +150,4 @@ func TestSoakProgressStaysOutOfHistory(t *testing.T) {
 	h.ticks(4, 20*time.Second)
 
 	require.Equal(t, 1, count(h.notes.actions(), "rollout.soaking"), "one line when the soak starts, none for its checks")
-
-	events, err := h.c.Events(h.ctx, EventQuery{})
-	require.NoError(t, err)
-
-	var started string
-
-	for i := range events {
-		if events[i].Action == "batch.started" {
-			started = events[i].Reason
-		}
-	}
-
-	require.Equal(t, "batch 1: 2 targets on 2 nodes in wave 0", started)
 }

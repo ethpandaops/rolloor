@@ -21,6 +21,7 @@ import (
 type fake struct {
 	digest string
 	fail   bool
+	code   int
 	err    error
 }
 
@@ -30,14 +31,19 @@ func (f *fake) Resolve(context.Context, string) (registry.Resolved, error) {
 
 func (f *fake) Run(_ context.Context, program, hook, _ string, _ any) (hooks.Result, error) {
 	if f.err != nil {
-		return hooks.Result{}, f.err
+		return hooks.Result{ExitCode: -1}, f.err
 	}
 
 	if hook == config.HookInspect {
 		return hooks.Result{Program: program, OK: true, Reason: "sha256:1"}, nil
 	}
 
-	return hooks.Result{Program: program, OK: !f.fail}, nil
+	code := f.code
+	if f.fail && code == 0 {
+		code = 1
+	}
+
+	return hooks.Result{Program: program, OK: code == 0, ExitCode: code}, nil
 }
 
 func TestCollector(t *testing.T) {
@@ -59,6 +65,7 @@ func TestCollector(t *testing.T) {
 	require.NoError(t, err)
 
 	c.InspectAll(ctx)
+	c.ProbeAll(ctx)
 	require.NoError(t, c.Tick(ctx))
 
 	reg := prometheus.NewRegistry()
@@ -75,21 +82,15 @@ func TestCollector(t *testing.T) {
 	require.Contains(t, names, "rolloor_target_info")
 	require.Contains(t, names, "rolloor_rollout_state")
 	require.Contains(t, names, "rolloor_disruption_budget_ratio")
-	require.Contains(t, names, "rolloor_environment_check_passing")
-
-	out, err := testutil.GatherAndCount(reg)
-	require.NoError(t, err)
-	require.Positive(t, out)
 
 	require.InDelta(t, 0, syncValue(reconcile.Synced), 0)
 	require.InDelta(t, 1, syncValue(reconcile.OutOfSync), 0)
 	require.InDelta(t, 2, syncValue(reconcile.Unknown), 0)
-	require.InDelta(t, 2, syncValue(reconcile.SyncState("x")), 0)
 	require.InDelta(t, 0, healthValue(reconcile.Healthy), 0)
 	require.InDelta(t, 1, healthValue(reconcile.Progressing), 0)
 	require.InDelta(t, 2, healthValue(reconcile.Degraded), 0)
 	require.InDelta(t, 3, healthValue(reconcile.Suspended), 0)
-	require.InDelta(t, 0, healthValue(reconcile.Health("x")), 0)
+	require.InDelta(t, 4, healthValue(reconcile.HealthUnknown), 0)
 }
 
 func TestHookRunner(t *testing.T) {
@@ -110,20 +111,21 @@ func TestHookRunner(t *testing.T) {
 	_, err = r.Run(context.Background(), "p", "ready", "t", nil)
 	require.Error(t, err)
 
-	families, err := reg.Gather()
-	require.NoError(t, err)
-
-	var text strings.Builder
-
-	for _, f := range families {
-		for _, m := range f.GetMetric() {
-			if f.GetName() == "rolloor_hook_runs_total" {
-				text.WriteString(m.String())
-			}
-		}
+	world.err, world.fail = nil, false
+	for _, code := range []int{3, -1} {
+		world.code = code
+		_, err = r.Run(context.Background(), "p", "ready", "t", nil)
+		require.NoError(t, err)
 	}
 
-	require.Contains(t, text.String(), `value:"ok"`)
-	require.Contains(t, text.String(), `value:"failed"`)
-	require.Contains(t, text.String(), `value:"error"`)
+	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
+# HELP rolloor_hook_runs_total Hook runs by outcome: ok, failed, error.
+# TYPE rolloor_hook_runs_total counter
+rolloor_hook_runs_total{hook="ready",outcome="error"} 3
+rolloor_hook_runs_total{hook="ready",outcome="failed"} 1
+rolloor_hook_runs_total{hook="ready",outcome="ok"} 1
+# HELP rolloor_hook_failures_total Hook runs that did not pass, including ones that could not run.
+# TYPE rolloor_hook_failures_total counter
+rolloor_hook_failures_total{hook="ready"} 4
+`), "rolloor_hook_runs_total", "rolloor_hook_failures_total"))
 }
