@@ -180,4 +180,4 @@ make cover
 make lint
 ```
 
-Go 1.25; use `GOTOOLCHAIN=go1.25.13`.
+Go 1.26; use `GOTOOLCHAIN=go1.26.9`.
