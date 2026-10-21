@@ -67,4 +67,4 @@ make cover    # coverage floors per package (100% where decisions are made)
 make lint     # golangci-lint and the word lint
 ```
 
-Go 1.25. Nothing in this repository is specific to a workload; deployments bring their own hooks and targets. `scripts/lint-words.sh` fails the build if the first workload's words appear in any tracked file.
+Go 1.26. Nothing in this repository is specific to a workload; deployments bring their own hooks and targets. `scripts/lint-words.sh` fails the build if the first workload's words appear in any tracked file.
